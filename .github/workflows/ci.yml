@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  # L1/L2 — без прав, на всех трёх ОС, на каждый PR (§8.4, матрица запуска).
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.24' }
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -count=1 ./...
+
+  # Линт §8.1: настоящее время живёт только в internal/clock.
+  realtimelint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.24' }
+      - run: go run ./cmd/realtimelint .
+
+  # Негативная задача §8: тест, зелёный при выключенной политике, — сломан.
+  # Её собственная исправность проверена мета-тестом TestMetaCheck.
+  negcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.24' }
+      - run: go test -count=1 -run TestMetaCheck ./internal/negcheck
+      - run: go run ./cmd/negcheck
+
+  # ЕДИНСТВЕННЫЙ порог, ломающий сборку: B1b на Windows ≥ 500 Мбит/с (D4).
+  b1-gate-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.24' }
+      - run: go run ./cmd/b1 -mode boundary -duration 5s
+      - run: go run ./cmd/b1 -mode boundary -duration 5s -json > b1-windows.json
+      - uses: actions/upload-artifact@v4
+        with: { name: b1-windows, path: b1-windows.json }
+
+  # Базовая линия без порога: на Unix границы в горячем пути нет, и порог
+  # гейтил бы скорость gvisor и syscall'ов, а не решение §5.3 (D4).
+  b1-baseline-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.24' }
+      - run: go run ./cmd/b1 -mode boundary -duration 5s -gate=false
+      # Реальный TUN-fd и контрольный замер GSO — только Linux, в своём netns.
+      # Не гейт: §4 вынес GSO за v1, число нужно ради цены его возврата.
+      - if: matrix.os == 'ubuntu-latest'
+        continue-on-error: true
+        run: |
+          go build -o b1 ./cmd/b1
+          unshare -Urn ./b1 -mode tun -duration 5s -gate=false
