@@ -3,7 +3,7 @@
 // инъектируемыми часами»). Правило поддерживается линтом cmd/realtimelint.
 package clock
 
-import "time" //xrayvpn:realtime
+import "time" //hop:realtime
 
 // Ticker — тикер за интерфейсом, чтобы фейковые часы могли его подменить.
 type Ticker interface {
@@ -21,12 +21,12 @@ type Clock interface {
 // System — настоящие часы.
 type System struct{}
 
-func (System) Now() time.Time { return time.Now() } //xrayvpn:realtime
+func (System) Now() time.Time { return time.Now() } //hop:realtime
 
-func (System) After(d time.Duration) <-chan time.Time { return time.After(d) } //xrayvpn:realtime
+func (System) After(d time.Duration) <-chan time.Time { return time.After(d) } //hop:realtime
 
 func (System) NewTicker(d time.Duration) Ticker {
-	return systemTicker{time.NewTicker(d)} //xrayvpn:realtime
+	return systemTicker{time.NewTicker(d)} //hop:realtime
 }
 
 type systemTicker struct{ t *time.Ticker }

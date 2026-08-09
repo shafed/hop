@@ -1,5 +1,5 @@
 // Команда realtimelint запрещает обращение к настоящему времени вне
-// internal/clock (§8.1). Исключение помечается комментарием //xrayvpn:realtime
+// internal/clock (§8.1). Исключение помечается комментарием //hop:realtime
 // на той же строке — иначе исключений нет.
 package main
 
@@ -26,7 +26,7 @@ var exempt = []string{
 	"cmd/realtimelint", // этот линтер
 }
 
-const marker = "//xrayvpn:realtime"
+const marker = "//hop:realtime"
 
 func main() {
 	root := "."

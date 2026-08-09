@@ -2,7 +2,7 @@ package clock
 
 import (
 	"testing"
-	"time" //xrayvpn:realtime
+	"time" //hop:realtime
 )
 
 var epoch = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)

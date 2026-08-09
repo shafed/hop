@@ -5,7 +5,7 @@ package health
 
 import (
 	"context"
-	"time" //xrayvpn:realtime
+	"time" //hop:realtime
 )
 
 // Result — исход одной пробы.

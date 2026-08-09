@@ -51,7 +51,7 @@ func Check(root string, policies []*policy.Policy) []Problem {
 func runGuard(root string, g policy.Guard, disable string) (bool, string) {
 	cmd := exec.Command("go", "test", "-count=1", "-run", g.Test, g.Pkg)
 	cmd.Dir = root
-	cmd.Env = append(os.Environ(), "XRAYVPN_DISABLE="+disable)
+	cmd.Env = append(os.Environ(), "HOP_DISABLE="+disable)
 	out, err := cmd.CombinedOutput()
 	return err == nil, string(out)
 }

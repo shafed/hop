@@ -3,7 +3,7 @@ package clock
 import (
 	"sort"
 	"sync"
-	"time" //xrayvpn:realtime
+	"time" //hop:realtime
 )
 
 // Fake — часы с ручной прокруткой. Advance двигает время и срабатывает всё,

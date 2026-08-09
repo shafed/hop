@@ -29,7 +29,7 @@ const pipeBufBytes = 1 << 20
 // NewPipeBoundary поднимает две named pipe в byte-режиме (MessageMode=false):
 // границы пакетов несёт length-prefix, а не режим трубы.
 func NewPipeBoundary() (*Boundary, error) {
-	base := fmt.Sprintf(`\\.\pipe\xrayvpn-b1-%d`, os.Getpid())
+	base := fmt.Sprintf(`\\.\pipe\hop-b1-%d`, os.Getpid())
 
 	s2a, err := dialPair(base + "-s2a")
 	if err != nil {

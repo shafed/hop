@@ -6,7 +6,7 @@
 // полон по построению: negcheck читает этот список напрямую, а не собирает его
 // из графа импортов.
 //
-// Флаг снимается из переменной окружения XRAYVPN_DISABLE (список имён через
+// Флаг снимается из переменной окружения HOP_DISABLE (список имён через
 // запятую) один раз при инициализации пакета. Call-site видит только
 // p.On() — конфиг никуда не протаскивается.
 package policy
@@ -35,7 +35,7 @@ type Guard struct {
 // On сообщает, включена ли политика.
 func (p *Policy) On() bool { return !disabled[p.Name] }
 
-var disabled = parseDisabled(os.Getenv("XRAYVPN_DISABLE"))
+var disabled = parseDisabled(os.Getenv("HOP_DISABLE"))
 
 func parseDisabled(v string) map[string]bool {
 	m := make(map[string]bool)
