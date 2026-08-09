@@ -6,6 +6,9 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/shafed/hop/internal/clock"
 )
 
 // FakeDevice — реализация packet.PacketDevice поверх двух очередей.
@@ -20,11 +23,43 @@ type FakeDevice struct {
 	inbound  [][]byte
 	outbound [][]byte
 	arrived  chan struct{} // ёмкость 1, сигнал «в inbound что-то есть»
+	written  chan struct{} // ёмкость 1, сигнал «в outbound что-то есть»
 }
 
 // NewFake создаёт устройство с заданным MTU.
 func NewFake(mtu int) *FakeDevice {
-	return &FakeDevice{mtu: mtu, arrived: make(chan struct{}, 1)}
+	return &FakeDevice{
+		mtu:     mtu,
+		arrived: make(chan struct{}, 1),
+		written: make(chan struct{}, 1),
+	}
+}
+
+// WaitTimeout — сколько WaitEmitted ждёт ответа, прежде чем признать молчание.
+// Тест на молчание должен падать быстро: он ждёт полный таймаут по построению.
+const WaitTimeout = 2 * time.Second
+
+// WaitEmitted ждёт, пока в устройство запишут n пакетов, и возвращает их.
+//
+// Отдельный метод, а не polling в тесте: проверяемое здесь свойство — «отказ
+// вместо молчания», и отличить одно от другого можно только ожиданием с
+// заведомым концом.
+func (f *FakeDevice) WaitEmitted(t testing.TB, n int) [][]byte {
+	t.Helper()
+	deadline := clock.System{}.After(WaitTimeout)
+	var got [][]byte
+	for len(got) < n {
+		got = append(got, f.Emitted()...)
+		if len(got) >= n {
+			break
+		}
+		select {
+		case <-f.written:
+		case <-deadline:
+			t.Fatalf("за %v записано %d пакетов, ожидалось %d", WaitTimeout, len(got), n)
+		}
+	}
+	return got
 }
 
 func (f *FakeDevice) MTU() int { return f.mtu }
@@ -56,9 +91,11 @@ func (f *FakeDevice) Close() {
 	f.mu.Lock()
 	f.closed = true
 	f.mu.Unlock()
-	select {
-	case f.arrived <- struct{}{}:
-	default:
+	for _, c := range []chan struct{}{f.arrived, f.written} {
+		select {
+		case c <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -96,6 +133,10 @@ func (f *FakeDevice) WritePackets(bufs [][]byte) error {
 	}
 	for _, b := range bufs {
 		f.outbound = append(f.outbound, append([]byte(nil), b...))
+	}
+	select {
+	case f.written <- struct{}{}:
+	default:
 	}
 	return nil
 }

@@ -5,6 +5,12 @@ on:
   push:
     branches: [main]
 
+# go.mod требует 1.26.3: столько просит gvisor.dev/gvisor, из которого берутся
+# заголовки для reject-респондера (§6.2, Apache-2.0). Версия здесь и версия в
+# go.mod обязаны совпадать — CI, который ставит меньше, не собирает продукт.
+env:
+  GO_VERSION: '1.26'
+
 jobs:
   # L1/L2 — без прав, на всех трёх ОС, на каждый PR (§8.4, матрица запуска).
   test:
@@ -16,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: '1.24' }
+        with: { go-version: '${{ env.GO_VERSION }}' }
       - run: go build ./...
       - run: go vet ./...
       - run: go test -count=1 ./...
@@ -27,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: '1.24' }
+        with: { go-version: '${{ env.GO_VERSION }}' }
       - run: go run ./cmd/realtimelint .
 
   # Негативная задача §8: тест, зелёный при выключенной политике, — сломан.
@@ -37,9 +43,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: '1.24' }
+        with: { go-version: '${{ env.GO_VERSION }}' }
       - run: go test -count=1 -run TestMetaCheck ./internal/negcheck
       - run: go run ./cmd/negcheck
+
+  # L3-Linux — на каждый PR (§8.4): единственная платформа, где полный e2e
+  # дёшев. Всё поднимается в отдельном netns, поэтому раннер не теряет сеть,
+  # что бы тест ни сломал.
+  l3-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '${{ env.GO_VERSION }}' }
+      # Бинари собираются до входа в namespace: под sudo `go build` пошёл бы в
+      # чужой кеш и полез бы в сеть за модулями.
+      - run: |
+          go build -o /tmp/hopd ./cmd/hopd
+          go build -o /tmp/hop ./cmd/hop
+          go test -c -o /tmp/l3.test ./internal/l3
+      - name: T21, T22, T23-fast, T23-slow, T23b, T24, T29
+        run: |
+          sudo -E env \
+            HOP_L3=1 \
+            HOP_L3_BIN_HOPD=/tmp/hopd \
+            HOP_L3_BIN_HOP=/tmp/hop \
+            unshare -n /tmp/l3.test -test.v -test.timeout 10m
 
   # ЕДИНСТВЕННЫЙ порог, ломающий сборку: B1b на Windows ≥ 500 Мбит/с (D4).
   b1-gate-windows:
@@ -47,7 +76,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: '1.24' }
+        with: { go-version: '${{ env.GO_VERSION }}' }
       - run: go run ./cmd/b1 -mode boundary -duration 5s
       - run: go run ./cmd/b1 -mode boundary -duration 5s -json > b1-windows.json
       - uses: actions/upload-artifact@v4
@@ -64,7 +93,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: '1.24' }
+        with: { go-version: '${{ env.GO_VERSION }}' }
       - run: go run ./cmd/b1 -mode boundary -duration 5s -gate=false
       # Реальный TUN-fd и контрольный замер GSO — только Linux, в своём netns.
       # Не гейт: §4 вынес GSO за v1, число нужно ради цены его возврата.

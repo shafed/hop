@@ -1,0 +1,36 @@
+name: l3-macos
+
+# §8.4: L3-macOS идёт по расписанию и обязательно перед релизом. Изоляции нет,
+# таблица маршрутизации общая с раннером.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 3 * * *'
+
+env:
+  GO_VERSION: '1.26'
+
+jobs:
+  l3-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '${{ env.GO_VERSION }}' }
+
+      # Скелет. Тела ещё нет: привилегированный слой macOS (utun через
+      # AF_SYSTEM, адрес через SIOCAIFADDR, маршруты через PF_ROUTE) — этап 8.
+      #
+      # Что здесь появится:
+      #   1. гейт-пара T22 + T23-slow первой (§8.4, D9);
+      #   2. набор T21, T23-slow, T24, T25, T26, T29;
+      #   3. проверки: имя интерфейса вида utunN; маршруты **восемью подсетями**,
+      #      а не одним 0.0.0.0/0 — иначе перебивается системный дефолт и раннер
+      #      теряет сеть (§5.10, этот тест защищает сам CI); LaunchDaemon
+      #      грузится через `launchctl bootstrap system`; после down маршруты
+      #      сняты и кэш DNS сброшен.
+      - name: L3-macOS (скелет)
+        run: |
+          go build ./...
+          go vet ./...
+          echo "L3-macOS не запущен: привилегированный слой macOS — этап 8"
