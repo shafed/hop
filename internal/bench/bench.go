@@ -171,14 +171,14 @@ func Latency(name string, fwd, back Pipe, cfg Config, samples int) (Result, erro
 	cpu0 := processCPU()
 	start := wall.Now()
 	for i := 0; i < samples; i++ {
-		t0 := wall.Now()
+		t0 := hiresNow()
 		if err := w.WriteBatch(one); err != nil {
 			return Result{}, err
 		}
 		if _, err := r.ReadBatch(in); err != nil {
 			return Result{}, err
 		}
-		rtts = append(rtts, wall.Now().Sub(t0))
+		rtts = append(rtts, hiresNow()-t0)
 	}
 	elapsed := wall.Now().Sub(start)
 	cpu := processCPU() - cpu0
@@ -193,7 +193,7 @@ func Latency(name string, fwd, back Pipe, cfg Config, samples int) (Result, erro
 		Packets: int64(samples), Bytes: int64(samples) * int64(cfg.PktSize),
 		Wall: elapsed, CPU: cpu,
 		P50: rtts[len(rtts)*50/100], P99: rtts[len(rtts)*99/100],
-		Note: "ping-pong, батч 1",
+		Note: fmt.Sprintf("ping-pong, батч 1; шаг часов %v", hiresResolution()),
 	}, nil
 }
 
@@ -242,7 +242,10 @@ func Table(rs []Result) string {
 	for _, r := range rs {
 		p50, p99 := "-", "-"
 		if r.P50 > 0 {
-			p50, p99 = r.P50.Round(time.Microsecond).String(), r.P99.Round(time.Microsecond).String()
+			p50 = r.P50.Round(100 * time.Nanosecond).String()
+		}
+		if r.P99 > 0 {
+			p99 = r.P99.Round(100 * time.Nanosecond).String()
 		}
 		fmt.Fprintf(&b, "%-34s %5d %6d %12.0f %10.1f %9.3f %8s %8s\n",
 			r.Name, r.Batch, r.PktSize, r.PPS(), r.Mbps(), r.CPUPerGbit(), p50, p99)
