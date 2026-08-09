@@ -116,7 +116,7 @@ func runBoundary(pkt int, batches []int, dur time.Duration, samples int) ([]benc
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, r)
+			out = append(out, progress(r))
 		}
 	}
 
@@ -147,7 +147,7 @@ func runBoundary(pkt int, batches []int, dur time.Duration, samples int) ([]benc
 			b.Close()
 			return nil, got.err
 		}
-		out = append(out, got.r)
+		out = append(out, progress(got.r))
 	}
 	b.Close()
 
@@ -163,7 +163,7 @@ func runBoundary(pkt int, batches []int, dur time.Duration, samples int) ([]benc
 	if err != nil {
 		return nil, err
 	}
-	return append(out, lat), nil
+	return append(out, progress(lat)), nil
 }
 
 func parseBatches(s string) []int {
@@ -179,4 +179,12 @@ func parseBatches(s string) []int {
 		out = []int{32}
 	}
 	return out
+}
+
+// progress печатает каждый готовый замер в stderr сразу. Без этого падение
+// посреди прогона уносит с собой всё, что уже было измерено: таблица идёт в
+// stdout только в самом конце.
+func progress(r bench.Result) bench.Result {
+	fmt.Fprintf(os.Stderr, "  %-34s батч %3d  %9.1f Мбит/с\n", r.Name, r.Batch, r.Mbps())
+	return r
 }

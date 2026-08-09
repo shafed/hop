@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/Microsoft/go-winio"
@@ -26,10 +27,16 @@ func (b *Boundary) Close() {
 // pipeBufBytes — буфер трубы в ядре. Крупный буфер снижает число пробуждений.
 const pipeBufBytes = 1 << 20
 
+// boundarySeq делает имя трубы уникальным на каждую границу. Одного pid мало:
+// ListenPipe создаёт первый экземпляр с FILE_FLAG_FIRST_PIPE_INSTANCE, и пока
+// хоть один экземпляр прежнего имени жив, повторный вызов даёт
+// ERROR_ACCESS_DENIED. Закрытие асинхронно, поэтому на имя не полагаемся.
+var boundarySeq atomic.Uint64
+
 // NewPipeBoundary поднимает две named pipe в byte-режиме (MessageMode=false):
 // границы пакетов несёт length-prefix, а не режим трубы.
 func NewPipeBoundary() (*Boundary, error) {
-	base := fmt.Sprintf(`\\.\pipe\hop-b1-%d`, os.Getpid())
+	base := fmt.Sprintf(`\\.\pipe\hop-b1-%d-%d`, os.Getpid(), boundarySeq.Add(1))
 
 	s2a, err := dialPair(base + "-s2a")
 	if err != nil {
@@ -43,8 +50,11 @@ func NewPipeBoundary() (*Boundary, error) {
 	return &Boundary{
 		ServiceToAgent: Pipe{W: s2a.server, R: s2a.client},
 		AgentToService: Pipe{W: a2s.client, R: a2s.server},
+		// Листенеры закрывать обязательно: каждый держит свободный экземпляр
+		// трубы, и без этого имя остаётся занятым до конца процесса.
 		closers: []interface{ Close() error }{
-			s2a.server, s2a.client, a2s.server, a2s.client,
+			s2a.server, s2a.client, s2a.listener,
+			a2s.server, a2s.client, a2s.listener,
 		},
 	}, nil
 }
