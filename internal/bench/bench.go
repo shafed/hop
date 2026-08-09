@@ -193,7 +193,7 @@ func Latency(name string, fwd, back Pipe, cfg Config, samples int) (Result, erro
 		Packets: int64(samples), Bytes: int64(samples) * int64(cfg.PktSize),
 		Wall: elapsed, CPU: cpu,
 		P50: rtts[len(rtts)*50/100], P99: rtts[len(rtts)*99/100],
-		Note: fmt.Sprintf("ping-pong, батч 1; шаг часов %v", hiresResolution()),
+		Note: latencyNote(rtts[len(rtts)*50/100]),
 	}, nil
 }
 
@@ -250,6 +250,13 @@ func Table(rs []Result) string {
 		fmt.Fprintf(&b, "%-34s %5d %6d %12.0f %10.1f %9.3f %8s %8s\n",
 			r.Name, r.Batch, r.PktSize, r.PPS(), r.Mbps(), r.CPUPerGbit(), p50, p99)
 	}
+	// Примечания печатаются всегда. Шаг часов лежал в Note и не попадал в
+	// вывод — из-за этого нельзя было отличить грубые часы от их отсутствия.
+	for _, r := range rs {
+		if r.Note != "" {
+			fmt.Fprintf(&b, "  прим. %s — %s\n", r.Name, r.Note)
+		}
+	}
 	return b.String()
 }
 
@@ -266,4 +273,14 @@ func JSON(rs []Result) string {
 	}
 	out, _ := json.MarshalIndent(rows, "", "  ")
 	return string(out)
+}
+
+// latencyNote объясняет нулевую медиану, если часы грубее измеряемого RTT.
+func latencyNote(p50 time.Duration) string {
+	res := hiresResolution()
+	note := fmt.Sprintf("ping-pong, батч 1; шаг часов %v", res)
+	if p50 == 0 {
+		return note + " — ГРУБЕЕ RTT, перцентили недостоверны"
+	}
+	return note
 }
