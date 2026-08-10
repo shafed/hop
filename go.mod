@@ -9,6 +9,7 @@ require (
 )
 
 require (
+	github.com/google/btree v1.1.2 // indirect
 	golang.org/x/exp v0.0.0-20260727155853-b88d891fe743 // indirect
 	golang.org/x/time v0.15.0 // indirect
 )

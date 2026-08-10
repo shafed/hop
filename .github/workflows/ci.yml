@@ -82,6 +82,40 @@ jobs:
       - uses: actions/upload-artifact@v4
         with: { name: b1-windows, path: b1-windows.json }
 
+  # B3 (§8.6): NAT-таблица full-cone под нагрузкой. Порог не в скорости —
+  # потерянный ответ роняет замер. Гоняется на трёх ОС: netstack поверх
+  # настоящей границы этой ОС, прав не требует.
+  b3-fullcone:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '${{ env.GO_VERSION }}' }
+      - run: go run ./cmd/b3 -mode fullcone
+
+  # Долг этапа 1: латентность поверх netstack, Linux против Windows. Порога
+  # нет — базовая линия. B1 показал, что стоимость границы тонет в пропускной
+  # способности на крупных пакетах; здесь видно, во что она обходится на
+  # интерактивном трафике.
+  netstack-rtt-baseline:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '${{ env.GO_VERSION }}' }
+      - run: go run ./cmd/b3 -mode rtt
+      - run: go run ./cmd/b3 -mode rtt -json > rtt-${{ matrix.os }}.json
+      - uses: actions/upload-artifact@v4
+        with: { name: 'netstack-rtt-${{ matrix.os }}', path: 'rtt-${{ matrix.os }}.json' }
+
   # Базовая линия без порога: на Unix границы в горячем пути нет, и порог
   # гейтил бы скорость gvisor и syscall'ов, а не решение §5.3 (D4).
   b1-baseline-unix:
