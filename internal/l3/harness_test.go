@@ -88,6 +88,9 @@ func startService(t *testing.T, deadline time.Duration) *service {
 		"-ready-file", ready,
 		"-orphan-deadline", deadline.String(),
 		"-heartbeat", "200ms",
+		// L3 гоняет и сервис, и агента под root в своём netns, группы hop на
+		// раннере нет и заводить её тест не вправе.
+		"-group", "",
 		"-debug",
 	)
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr

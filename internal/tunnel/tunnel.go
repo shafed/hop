@@ -244,12 +244,32 @@ func (m *Machine) Heartbeat() {
 	}
 }
 
-// Stop — StopTunnel: полный teardown из любого состояния.
+// Stop — полный teardown из любого состояния, без проверки владельца. Зовётся
+// изнутри сервиса (выключение hopd), где вызывающий — не пир.
 func (m *Machine) Stop() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.phase == Down {
 		return nil
+	}
+	return m.teardownLocked()
+}
+
+// StopBy — StopTunnel(), пришедший с управляющей границы (§3.1).
+//
+// Сверяется личность, а не соединение: `hop -down` — отдельный процесс, он
+// подключается заново и владельцем туннеля не является по построению. Проверка
+// здесь, а не в ipc, чтобы владелец читался под тем же замком, что и teardown:
+// иначе между «узнали владельца» и «сняли туннель» он успевает смениться.
+func (m *Machine) StopBy(owner string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.expireLocked()
+	if m.phase == Down {
+		return nil
+	}
+	if m.owner != owner {
+		return ErrWrongOwner
 	}
 	return m.teardownLocked()
 }

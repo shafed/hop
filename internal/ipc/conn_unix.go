@@ -12,12 +12,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Listen поднимает unix-сокет с правами владельца (§3.1, §6.1).
+// Listen поднимает unix-сокет, доступный владельцу и группе gid (§3.1, §6.1).
 //
-// Права ставятся до того, как сокет станет доступен: сначала umask, потом bind.
-// Chmod после bind оставил бы окно, в котором сокет уже есть, а прав на нём
-// ещё нет.
-func Listen(path string) (Listener, error) {
+// Группа нужна потому, что стороны границы живут под разными пользователями:
+// сервис под root (ему нужен /dev/net/tun и ip), агент — под обычным. Сокет
+// только для владельца означал бы EACCES у агента, а заодно ломал бы §6.8:
+// подключиться смог бы один root, и peerUID вернул бы 0, то есть правило с
+// UID-диапазоном вывело бы из туннеля весь root-трафик вместо агентского.
+//
+// gid < 0 — группу не трогать: сокет остаётся доступен одному владельцу.
+//
+// Порядок прав важен. Сначала umask даёт 0600, и только потом доступ
+// расширяется до группы: в промежутке сокет уже, чем задуман, а не шире.
+// Обратный порядок оставил бы окно, в котором он доступен лишним.
+func Listen(path string, gid int) (Listener, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
@@ -30,7 +38,25 @@ func Listen(path string) (Listener, error) {
 	if err != nil {
 		return nil, err
 	}
+	if gid >= 0 {
+		if err := chownGroup(path, gid); err != nil {
+			l.Close()
+			return nil, err
+		}
+	}
 	return &unixListener{l: l.(*net.UnixListener)}, nil
+}
+
+// chownGroup отдаёт сокет группе и открывает ей rw. Everyone-доступа не
+// появляется ни на миг: 0660, и ни битом больше (§6.1).
+func chownGroup(path string, gid int) error {
+	if err := os.Chown(path, -1, gid); err != nil {
+		return fmt.Errorf("ipc: группа сокета: %w", err)
+	}
+	if err := os.Chmod(path, 0o660); err != nil {
+		return fmt.Errorf("ipc: права сокета: %w", err)
+	}
+	return nil
 }
 
 type unixListener struct{ l *net.UnixListener }

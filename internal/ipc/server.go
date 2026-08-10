@@ -102,18 +102,34 @@ func (s *Server) dispatch(c Conn, req Request) (Response, int) {
 		return s.handleResponse(h)
 
 	case OpStop:
-		if err := s.m.Stop(); err != nil {
+		// По личности, а не по соединению: `hop -down` — отдельный процесс с
+		// новым соединением, владельцем оно не бывает никогда.
+		if err := s.m.StopBy(c.Peer()); err != nil {
 			return Response{Error: err.Error()}, -1
 		}
-		s.clearOwner(c)
+		// Туннеля больше нет, и прежнее соединение-владелец больше ничем не
+		// владеет: его обрыв не должен звать AgentGone.
+		s.dropOwner()
 		return Response{}, -1
 
 	case OpDetach:
+		// Detach и Heartbeat агент шлёт тем же соединением, которое получило
+		// туннель, поэтому здесь сверяется именно оно. Посторонний процесс того
+		// же пользователя иначе роняет чужой туннель в orphaned — а там §6.2
+		// поднимает респондер, и живой агент делит дескриптор с ним.
+		if !s.isOwner(c) {
+			return Response{Error: "Detach не от владельца туннеля"}, -1
+		}
 		s.m.Detach(req.Reason)
 		s.clearOwner(c)
 		return Response{}, -1
 
 	case OpHeartbeat:
+		// Тот же гейт: посторонний, обновляющий lastBeat, маскирует заклинивший
+		// агент и отменяет heartbeat_miss (§6.2).
+		if !s.isOwner(c) {
+			return Response{Error: "Heartbeat не от владельца туннеля"}, -1
+		}
 		s.m.Heartbeat()
 		return Response{}, -1
 
@@ -157,6 +173,21 @@ func (s *Server) clearOwner(c Conn) {
 		s.owner = nil
 	}
 	s.mu.Unlock()
+}
+
+// dropOwner снимает владельца, каким бы соединением он ни был: туннеля больше
+// нет, и владеть нечем.
+func (s *Server) dropOwner() {
+	s.mu.Lock()
+	s.owner = nil
+	s.mu.Unlock()
+}
+
+// isOwner — то ли это соединение, которому принадлежит туннель.
+func (s *Server) isOwner(c Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.owner == c
 }
 
 // ownerGone — то самое ребро. Обрыв постороннего соединения (например,

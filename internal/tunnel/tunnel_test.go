@@ -275,6 +275,31 @@ func TestStopFromOrphaned(t *testing.T) {
 	}
 }
 
+// StopBy сверяет владельца по личности: `hop -down` приходит новым процессом и
+// новым соединением, поэтому соединение сверить нечем, а UID/SID — можно. Без
+// этой проверки посторонний процесс снимает чужой привилегированный туннель.
+func TestStopByChecksOwner(t *testing.T) {
+	m, _, net := newMachine(t)
+	startUp(t, m)
+
+	if err := m.StopBy("uid:1001"); err != ErrWrongOwner {
+		t.Fatalf("ошибка = %v, ожидалась %v", err, ErrWrongOwner)
+	}
+	if got := m.State().Phase; got != Up {
+		t.Fatalf("после отказа phase = %s, ожидалось up", got)
+	}
+	if got := net.ops(); got != "up" {
+		t.Fatalf("операции = %q: отказанный StopBy тронул сеть", got)
+	}
+
+	if err := m.StopBy(owner); err != nil {
+		t.Fatalf("StopBy от владельца: %v", err)
+	}
+	if m.State().Phase != Down || net.ops() != "up,down" {
+		t.Fatalf("phase = %s, операции = %q", m.State().Phase, net.ops())
+	}
+}
+
 // §6.14: секрет не попадает в логи ни на уровне debug. Самый частый путь туда —
 // %v по структуре, случайно оказавшейся в аргументах логгера.
 func TestTokenNeverFormats(t *testing.T) {

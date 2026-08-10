@@ -29,6 +29,7 @@ func main() {
 		beat     = flag.Duration("heartbeat", time.Second, "интервал heartbeat")
 		miss     = flag.Int("heartbeat-miss", 3, "пропусков heartbeat до ребра")
 		ready    = flag.String("ready-file", "", "создать этот файл, когда сокет готов")
+		group    = flag.String("group", "hop", "группа, которой открыт сокет; пусто — только владелец (§6.1, Unix)")
 		debug    = flag.Bool("debug", false, "подробный лог")
 	)
 	flag.Parse()
@@ -39,14 +40,22 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
+	// Группа резолвится до всякой привилегированной работы: опечатка в имени
+	// должна валить старт, а не оставлять сокет, к которому агент не достучится.
+	gid, err := lookupGID(*group)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "hopd:", err)
+		os.Exit(1)
+	}
+
 	cfg := tunnel.Config{OrphanDeadline: *deadline, Heartbeat: *beat, HeartbeatMiss: *miss}
-	if err := run(log, *sock, *ready, cfg); err != nil {
+	if err := run(log, *sock, *ready, gid, cfg); err != nil {
 		fmt.Fprintln(os.Stderr, "hopd:", err)
 		os.Exit(1)
 	}
 }
 
-func run(log *slog.Logger, sock, readyFile string, cfg tunnel.Config) error {
+func run(log *slog.Logger, sock, readyFile string, gid int, cfg tunnel.Config) error {
 	clk := clock.System{}
 	src := netstate.System()
 
@@ -72,7 +81,7 @@ func run(log *slog.Logger, sock, readyFile string, cfg tunnel.Config) error {
 	defer cancel()
 	go tunnel.Run(ctx, clk, m, cfg.Heartbeat/5)
 
-	l, err := ipc.Listen(sock)
+	l, err := ipc.Listen(sock, gid)
 	if err != nil {
 		return fmt.Errorf("слушать %s: %w", sock, err)
 	}

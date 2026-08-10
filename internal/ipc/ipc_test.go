@@ -49,7 +49,9 @@ func serve(t *testing.T) (string, *tunnel.Machine, *fakeNet) {
 	m := tunnel.New(clock.System{}, net, tunnel.Config{OrphanDeadline: time.Hour})
 
 	path := endpoint(t)
-	l, err := Listen(path)
+	// gid < 0: сокет остаётся владельцу, а он же и подключается. Права сокета
+	// проверяет отдельный тест — здесь предмет другой.
+	l, err := Listen(path, -1)
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -127,6 +129,86 @@ func TestBystanderDisconnectIsNotTheEdge(t *testing.T) {
 	}
 	if got := net.rejected.Load(); got != 0 {
 		t.Fatalf("Reject вызван %d раз на посторонних обрывах", got)
+	}
+}
+
+// Посторонний смотрит Status, но не двигает туннель. Без этого гейта любой
+// процесс, дотянувшийся до сокета, роняет чужой туннель в orphaned — а там
+// §6.2 поднимает респондер, и живой агент делит с ним один дескриптор.
+func TestBystanderCannotMoveTunnel(t *testing.T) {
+	path, m, net := serve(t)
+
+	owner, err := Connect(path)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer owner.Close()
+	if _, err := owner.Start(params()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	bystander, err := Connect(path)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer bystander.Close()
+
+	if err := bystander.Detach(tunnel.ReasonRestart); err == nil {
+		t.Fatal("Detach от постороннего соединения прошёл")
+	}
+	if err := bystander.Heartbeat(); err == nil {
+		t.Fatal("Heartbeat от постороннего соединения прошёл")
+	}
+	if got := m.State().Phase; got != tunnel.Up {
+		t.Fatalf("phase = %s: посторонний сдвинул машину", got)
+	}
+	if got := net.rejected.Load(); got != 0 {
+		t.Fatalf("Reject вызван %d раз по требованию постороннего", got)
+	}
+
+	// Гейт не должен задеть владельца: те же глаголы от него работают.
+	if err := owner.Heartbeat(); err != nil {
+		t.Fatalf("Heartbeat владельца: %v", err)
+	}
+	if err := owner.Detach(tunnel.ReasonRestart); err != nil {
+		t.Fatalf("Detach владельца: %v", err)
+	}
+	waitPhase(t, m, tunnel.Orphaned)
+}
+
+// `hop -down` — отдельный процесс с новым соединением, владельцем оно не бывает
+// никогда. Поэтому Stop сверяется по личности, а не по соединению, и этот тест
+// держит контракт CLI: свой пользователь снимает туннель с любого соединения.
+func TestStopFromSeparateConnection(t *testing.T) {
+	path, m, _ := serve(t)
+
+	owner, err := Connect(path)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer owner.Close()
+	if _, err := owner.Start(params()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	down, err := Connect(path)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer down.Close()
+	if err := down.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if got := m.State().Phase; got != tunnel.Down {
+		t.Fatalf("phase = %s, ожидалось down", got)
+	}
+
+	// Соединение бывшего владельца больше ничем не владеет: его обрыв не должен
+	// звать AgentGone по снятому туннелю.
+	owner.Close()
+	<-clock.System{}.After(200 * time.Millisecond)
+	if got := m.State().Phase; got != tunnel.Down {
+		t.Fatalf("после обрыва бывшего владельца phase = %s", got)
 	}
 }
 
