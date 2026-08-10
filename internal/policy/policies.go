@@ -48,6 +48,41 @@ var (
 			{Pkg: "./internal/netstate", Test: "^TestRollbackReturnsToSnapshot$"},
 		},
 	}
+
+	// VerdictOrder — порядок вердиктов §3.4: hijack-dns стоит перед bypass
+	// (этап 3). Выключение меняет их местами, и DNS-запрос на локальный роутер
+	// уходит в локальную сеть при формально работающем перехвате: T16.
+	VerdictOrder = &Policy{
+		Name: "verdict_order",
+		Doc:  "hijack-dns прежде bypass (§3.4, T16)",
+		Guards: []Guard{
+			{Pkg: "./internal/netstack", Test: "^TestT16DNSToLocalRouterIsHijacked$"},
+		},
+	}
+
+	// RejectMode — fail-close отвечает отказом, а не молчанием (§5.6, этап 3).
+	// Выключение переводит отказ в молчаливый дроп, и приложение ждёт таймаута
+	// вместо RST/ICMP: T12, T13.
+	RejectMode = &Policy{
+		Name: "reject_mode",
+		Doc:  "fail-close через RST/ICMP, а не дроп (§5.6, T12, T13)",
+		Guards: []Guard{
+			{Pkg: "./internal/netstack", Test: "^TestT12FailCloseAnswersRST$"},
+			{Pkg: "./internal/netstack", Test: "^TestT13FailCloseAnswersICMP$"},
+		},
+	}
+
+	// NATKey — UDP full-cone: NAT по source addr:port (§5.3, этап 3).
+	// Выключение переводит ключ на пару src+dst: записей становится по одной на
+	// адрес назначения, а ответ с адреса, на который клиент не слал, теряется.
+	// T15 и рост таблицы в B3.
+	NATKey = &Policy{
+		Name: "nat_key",
+		Doc:  "NAT по source addr:port, full-cone (§5.3, T15, B3)",
+		Guards: []Guard{
+			{Pkg: "./internal/netstack", Test: "^TestT15FullConeKeepsOneEntry$"},
+		},
+	}
 )
 
 // All — полный список политик продукта.
@@ -57,6 +92,9 @@ func All() []*Policy {
 		OrphanReject,
 		OrphanDeadline,
 		SnapshotRestore,
+		VerdictOrder,
+		RejectMode,
+		NATKey,
 	}
 }
 
