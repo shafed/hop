@@ -265,7 +265,7 @@ func (f *fixture) interruptCalls() int {
 // waitFor ждёт условия под сторожевым таймером.
 func (f *fixture) waitFor(what string, cond func() bool) {
 	f.t.Helper()
-	deadline := time.After(watchdog) //hop:realtime
+	deadline := time.After(watchdog)               //hop:realtime
 	tick := time.NewTicker(200 * time.Microsecond) //hop:realtime
 	defer tick.Stop()
 	for {

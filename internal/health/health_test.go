@@ -921,11 +921,17 @@ func TestA32HangingURLDoesNotStretchRound(t *testing.T) {
 	defer cancel()
 	res := probeWithWatchdog(t, p, ctx, "A")
 
+	// Что раунд не растянулся, доказывает сам возврат: висящий URL отпускает
+	// только отмена контекста, а её делает уже `defer cancel()` внутри Probe.
+	// Дождись Probe этого URL — probeWithWatchdog свалил бы тест по сторожевому
+	// таймеру. Утверждать что-либо о состоянии таргета ПОСЛЕ возврата нельзя:
+	// он в этот момент как раз разблокируется отменой, и проверка состязалась
+	// бы с его горутиной.
 	if res.Err != nil {
 		t.Fatalf("проба не прошла: %v", res.Err)
 	}
-	if !hanging.stillBlocked() {
-		t.Error("проба дождалась висящего URL вместо того, чтобы вернуться по первому успеху")
+	if res.RTT != 80*ms {
+		t.Errorf("rtt = %v, ожидалось 80ms от ответившего URL", res.RTT)
 	}
 }
 
@@ -963,8 +969,8 @@ type testTarget struct {
 	err   error
 	block bool // отвечает только по отмене контекста
 
-	mu      sync.Mutex
-	blocked bool
+	mu    sync.Mutex
+	entry bool // защёлка: заблокировался хотя бы раз
 }
 
 func (t *testTarget) Name() string { return t.name }
@@ -972,21 +978,22 @@ func (t *testTarget) Name() string { return t.name }
 func (t *testTarget) Check(ctx context.Context, nodeID string) (time.Duration, error) {
 	if t.block {
 		t.mu.Lock()
-		t.blocked = true
+		t.entry = true
 		t.mu.Unlock()
 		<-ctx.Done()
-		t.mu.Lock()
-		t.blocked = false
-		t.mu.Unlock()
 		return 0, ctx.Err()
 	}
 	return t.rtt, t.err
 }
 
-func (t *testTarget) stillBlocked() bool {
+// everBlocked — защёлка, а не текущее состояние. Флаг «заблокирован сейчас»
+// пришлось бы читать после возврата из Probe, то есть ровно в тот момент,
+// когда отмена контекста этот таргет разблокирует: утверждение состязалось бы
+// с его горутиной и краснело бы через раз под -race.
+func (t *testTarget) everBlocked() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.blocked
+	return t.entry
 }
 
 // probeWithWatchdog не даёт красной проверке висеть до таймаута go test.
