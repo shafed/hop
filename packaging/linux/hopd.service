@@ -1,0 +1,29 @@
+[Unit]
+Description=hop — привилегированный сервис туннеля
+Documentation=https://github.com/shafed/hop
+# network.target, а не network-online.target: сокет поднимается без сети, а
+# ждать реальной связности значило бы задерживать загрузку ради сервиса,
+# который в этот момент всё равно ничего не делает.
+After=network.target
+
+[Service]
+Type=exec
+ExecStart=@SBINDIR@/hopd -group @GROUP@
+Restart=on-failure
+RestartSec=1s
+
+# §5.2: привилегии живут только здесь. Сервису хватает CAP_NET_ADMIN
+# (интерфейс, адреса, маршруты, ip rule) и CAP_CHOWN (отдать сокет группе
+# @GROUP@ — §6.1). §8.4 прямо требует, чтобы демону было достаточно
+# CAP_NET_ADMIN; всё, что шире, — привилегированная поверхность, которую ни
+# один тест не смотрит.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_CHOWN
+NoNewPrivileges=yes
+
+# Смерть сервиса — отдельный сценарий (T29), и уборку за предыдущим
+# воплощением делает сам hopd на старте. Юниту здесь добавить нечего:
+# ExecStopPost с «ip link del» дублировал бы уборку и однажды разошёлся бы с
+# ней.
+
+[Install]
+WantedBy=multi-user.target

@@ -61,6 +61,15 @@ func (t *flowTable) peek(f flow) Verdict {
 	return 0
 }
 
+// reset забывает вердикты. Зовётся только вместе с разрывом потоков (§5.5):
+// потоков, которым эти вердикты принадлежали, больше нет, а пакет, пришедший
+// следом, обязан получить вердикт по текущей живости.
+func (t *flowTable) reset() {
+	t.mu.Lock()
+	clear(t.m)
+	t.mu.Unlock()
+}
+
 func (t *flowTable) len() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()

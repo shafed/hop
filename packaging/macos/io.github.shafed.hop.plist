@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent агента (§5.10): без привилегий, в ~/Library/LaunchAgents,
+  владелец — сам пользователь.
+
+  Порядок аргументов не косметика: -socket стоит **до** команды. Разбор
+  аргументов агента останавливается на первом не-флаге, и `hop up -socket ...`
+  оставил бы флаг неразобранным, то есть агент искал бы сокет по умолчанию —
+  /run/hop.sock, которого на macOS нет.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.github.shafed.hop</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>@BINDIR@/hop</string>
+		<string>-socket</string>
+		<string>@SOCKET@</string>
+		<string>up</string>
+	</array>
+
+	<!-- §6.13: агент — при логине пользователя. -->
+	<key>RunAtLoad</key>
+	<true/>
+
+	<!-- Возвращать только после неудачи: агент, вышедший штатно (пользователь
+	     сказал down), возвращаться не должен — иначе туннель не снять. -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+</dict>
+</plist>

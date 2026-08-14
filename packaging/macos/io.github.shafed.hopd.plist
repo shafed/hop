@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchDaemon сервиса (§5.10). Грузится через `launchctl bootstrap system`,
+  владелец root:wheel, режим 644 — это выставляет install.sh.
+
+  -socket задан явно: по умолчанию сервис слушает /run/hop.sock (ipc.DefaultPath),
+  а на macOS каталога /run нет и корень только для чтения. Путь обязан совпадать
+  с -socket в plist агента.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.github.shafed.hopd</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>@LIBEXECDIR@/hopd</string>
+		<string>-socket</string>
+		<string>@SOCKET@</string>
+		<string>-group</string>
+		<string>@GROUP@</string>
+	</array>
+
+	<!-- §6.13: сервис — при старте ОС. RunAtLoad плюс KeepAlive: демон, упавший
+	     на живой машине, обязан вернуться сам, иначе туннель некому убрать. -->
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+
+	<key>StandardOutPath</key>
+	<string>@LOG@</string>
+	<key>StandardErrorPath</key>
+	<string>@LOG@</string>
+</dict>
+</plist>

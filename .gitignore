@@ -1,3 +1,9 @@
 refs/
 implementation-notes.md
 dist/
+
+# Собранные бинари продукта в корне: их оставляет ручная сборка и L3-стенд.
+/hop
+/hop.exe
+/hopd
+/hopd.exe

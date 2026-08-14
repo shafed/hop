@@ -136,12 +136,15 @@ func (s *service) cleanup() {
 }
 
 // dropHopRules снимает всё, что раскладывает hopd, по приоритету. Приоритеты
-// выбраны так, чтобы уборка не могла случайно снять чужое правило.
+// выбраны так, чтобы уборка не могла случайно снять чужое правило. Обе семьи:
+// блокировка IPv6 (§6.9) живёт в -6 и от `ip rule del` без семьи не уходит.
 func dropHopRules() {
-	for _, prio := range []string{"31000", "31500", "32000"} {
-		for i := 0; i < 32; i++ {
-			if exec.Command("ip", "rule", "del", "priority", prio).Run() != nil {
-				break
+	for _, fam := range []string{"-4", "-6"} {
+		for _, prio := range []string{"30000", "30500", "31000", "31700", "32000"} {
+			for i := 0; i < 32; i++ {
+				if exec.Command("ip", fam, "rule", "del", "priority", prio).Run() != nil {
+					break
+				}
 			}
 		}
 	}
@@ -341,3 +344,8 @@ func linkIndex(t *testing.T, name string) string {
 func tunnelRoutes() string { return sh("ip", "-o", "route", "show", "table", fmt.Sprint(table)) }
 
 func rules() string { return sh("ip", "-o", "rule", "show") }
+
+// rules6 — правила IPv6. Отдельным вызовом, потому что `ip rule show` без
+// семьи их не показывает, и блокировка §6.9 была бы невидима и для теста, и
+// для снапшота.
+func rules6() string { return sh("ip", "-6", "-o", "rule", "show") }

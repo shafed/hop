@@ -20,6 +20,10 @@ type linuxSource struct{}
 // System — источник состояния сети текущей ОС.
 func System() Source { return linuxSource{} }
 
+// Обе семьи адресов: `ip route show` и `ip rule show` без `-6` показывают
+// только IPv4, а блокировка IPv6 (§6.9) выражена правилом в -6. Снапшот без
+// него не заметил бы ни утечки блокировки после down, ни правила, пережившего
+// смерть сервиса (T22, T29).
 var sections = []struct {
 	name string
 	args []string
@@ -27,7 +31,9 @@ var sections = []struct {
 	{"links", []string{"-o", "link", "show"}},
 	{"addrs", []string{"-o", "addr", "show"}},
 	{"routes", []string{"-o", "route", "show", "table", "all"}},
+	{"routes6", []string{"-6", "-o", "route", "show", "table", "all"}},
 	{"rules", []string{"-o", "rule", "show"}},
+	{"rules6", []string{"-6", "-o", "rule", "show"}},
 }
 
 func (linuxSource) Capture() (Snapshot, error) {

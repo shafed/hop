@@ -36,6 +36,16 @@ jobs:
         with: { go-version: '${{ env.GO_VERSION }}' }
       - run: go run ./cmd/realtimelint .
 
+  # Линт D10: ReportFailure зовётся только из internal/engine/classify.go.
+  # Второй call-site — это начало расползания классификации §6.15.
+  reportlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '${{ env.GO_VERSION }}' }
+      - run: go run ./cmd/reportlint .
+
   # Негативная задача §8: тест, зелёный при выключенной политике, — сломан.
   # Её собственная исправность проверена мета-тестом TestMetaCheck.
   negcheck:

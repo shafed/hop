@@ -204,8 +204,8 @@ func TestT29ServiceDeath(t *testing.T) {
 	waitLink(t, ifname, false)
 
 	var leaked []string
-	for _, line := range strings.Split(rules(), "\n") {
-		for _, prio := range []string{"31000:", "31500:", "32000:"} {
+	for _, line := range strings.Split(rules()+"\n"+rules6(), "\n") {
+		for _, prio := range []string{"30000:", "30500:", "31000:", "31700:", "32000:"} {
 			if strings.HasPrefix(strings.TrimSpace(line), prio) {
 				leaked = append(leaked, strings.TrimSpace(line))
 			}

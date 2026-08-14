@@ -10,18 +10,20 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/shafed/hop/internal/loopguard"
 	"github.com/shafed/hop/internal/netstate"
 	"github.com/shafed/hop/internal/reject"
 	"github.com/shafed/hop/internal/tunnel"
 	"golang.org/x/sys/unix"
 )
 
-// Приоритеты правил. Порядок — часть контракта: исключения §5.6 и правило
-// защиты от петли §6.8 обязаны стоять выше правила туннеля, иначе туннельная
-// таблица заберёт их первой.
+// Приоритеты правил. Порядок — часть контракта: исключения §5.6 и перехват :53
+// обязаны стоять выше правила туннеля, иначе туннельная таблица заберёт их
+// первой. Защита от петли §6.8 стоит выше всех и живёт в internal/loopguard
+// вместе со своими приоритетами.
 const (
+	prioDNS        = 30500 // §3.4: перехват :53 выше списка исключений
 	prioExclusions = 31000 // §5.6: локальные сети, DHCP, NTP
-	prioLoopGuard  = 31500 // §6.8: трафик самого агента мимо туннеля
 	prioTunnel     = 32000 // всё остальное — в таблицу туннеля
 )
 
@@ -142,6 +144,21 @@ func (l *Linux) Up(p tunnel.Params) (tunnel.Device, error) {
 		// — нет.
 		{"route", l.tunnelRoute("add"), ip("route", "del", "default", "table", fmt.Sprint(p.Table))},
 	}
+	// §3.4: «перехват :53 стоит выше этого списка». На уровне вердиктов агента
+	// это уже так, но до вердикта пакет ещё надо довести: системный резолвер
+	// обычно и есть локальный роутер, а его адрес накрыт исключением §5.6 ниже,
+	// и запрос ушёл бы в локальную сеть, ни разу не заглянув в туннель.
+	// Правило выше исключений возвращает порядок §3.4 в маршрутизацию — T26.
+	for _, proto := range []string{"udp", "tcp"} {
+		steps = append(steps, struct {
+			name     string
+			add, del []string
+		}{
+			"hijack dns/" + proto,
+			ip("rule", "add", "ipproto", proto, "dport", "53", "lookup", fmt.Sprint(p.Table), "priority", fmt.Sprint(prioDNS)),
+			ip("rule", "del", "ipproto", proto, "dport", "53", "lookup", fmt.Sprint(p.Table), "priority", fmt.Sprint(prioDNS)),
+		})
+	}
 	for _, pfx := range LocalPrefixes {
 		steps = append(steps, struct {
 			name     string
@@ -166,18 +183,6 @@ func (l *Linux) Up(p tunnel.Params) (tunnel.Device, error) {
 			ip("rule", "del", "ipproto", "udp", "dport", port, "lookup", "main", "priority", fmt.Sprint(prioExclusions)),
 		})
 	}
-	// §6.8: агенту не требуется ничего — правило по UID-диапазону выводит его
-	// трафик мимо туннеля и переживает смену интерфейса. Оно же — единственное,
-	// что не привязано к интерфейсу и потому переживает смерть сервиса (T29).
-	uid := fmt.Sprintf("%d-%d", p.AgentUID, p.AgentUID)
-	steps = append(steps, struct {
-		name     string
-		add, del []string
-	}{
-		"loop guard uid " + uid,
-		ip("rule", "add", "uidrange", uid, "lookup", "main", "priority", fmt.Sprint(prioLoopGuard)),
-		ip("rule", "del", "uidrange", uid, "lookup", "main", "priority", fmt.Sprint(prioLoopGuard)),
-	})
 	steps = append(steps, struct {
 		name     string
 		add, del []string
@@ -196,7 +201,28 @@ func (l *Linux) Up(p tunnel.Params) (tunnel.Device, error) {
 			return nil, err
 		}
 	}
+
+	if err := l.applyGuard(p.AgentUID); err != nil {
+		_ = l.j.Rollback()
+		_ = dev.Close()
+		l.dev = nil
+		return nil, err
+	}
 	return dev, nil
+}
+
+// applyGuard кладёт в тот же журнал план §6.8 и §6.9.
+//
+// Отдельным пакетом, потому что механизм защиты разный по ОС, а решение одно, и
+// оно обязано проверяться без прав (internal/loopguard). Журнал тот же, потому
+// что правило защиты не привязано к интерфейсу и переживает смерть сервиса
+// (T29): убирать его надо тем же способом, что и всё остальное.
+func (l *Linux) applyGuard(uid int) error {
+	guard, err := loopguard.New(loopguard.Params{AgentUID: uid})
+	if err != nil {
+		return err
+	}
+	return loopguard.Apply(&l.j, guard, func(args []string) error { return run(args)() })
 }
 
 // Reject — ребро в orphaned (§6.2): сервис сам становится читателем устройства
@@ -268,15 +294,20 @@ func (l *Linux) tunnelRoute(verb string) []string {
 // появляется ещё одна обязанность — убрать за собой на старте, до того как
 // будет снят снапшот. Иначе «восстановление до снапшота» закрепит мусор.
 //
-// Опознаются правила по приоритетам, которые раскладывает только hopd.
+// Опознаются правила по приоритетам, которые раскладывает только hopd. Обе
+// семьи: `ip rule del` без `-6` снимает только IPv4-правила, и блокировка IPv6
+// (§6.9) пережила бы уборку молча.
 func Reclaim() (int, error) {
+	prios := append([]int{prioDNS, prioExclusions, prioTunnel}, loopguard.Priorities...)
 	dropped := 0
-	for _, prio := range []int{prioExclusions, prioLoopGuard, prioTunnel} {
-		for i := 0; i < 64; i++ {
-			if err := run(ip("rule", "del", "priority", fmt.Sprint(prio)))(); err != nil {
-				break // правил с этим приоритетом больше нет
+	for _, fam := range []string{"-4", "-6"} {
+		for _, prio := range prios {
+			for i := 0; i < 64; i++ {
+				if err := run(ip(fam, "rule", "del", "priority", fmt.Sprint(prio)))(); err != nil {
+					break // правил с этим приоритетом больше нет
+				}
+				dropped++
 			}
-			dropped++
 		}
 	}
 	return dropped, nil

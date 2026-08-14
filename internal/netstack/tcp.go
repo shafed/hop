@@ -30,6 +30,16 @@ type tcpStack struct {
 	s    *Stack
 	gv   *stack.Stack
 	link *linkEndpoint
+
+	mu   sync.Mutex
+	live map[*liveFlow]struct{}
+}
+
+// liveFlow — живой проксированный поток. Держим его только ради ResetFlows:
+// закрыть соединение может лишь тот, кто его держит, а §5.5 требует уметь
+// закрыть все разом.
+type liveFlow struct {
+	stop func()
 }
 
 func newTCPStack(s *Stack) (*tcpStack, error) {
@@ -38,7 +48,7 @@ func newTCPStack(s *Stack) (*tcpStack, error) {
 		mtu = 1500
 	}
 
-	t := &tcpStack{s: s}
+	t := &tcpStack{s: s, live: make(map[*liveFlow]struct{})}
 	t.link = &linkEndpoint{s: s, mtu: uint32(mtu)}
 	t.gv = stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
@@ -132,23 +142,56 @@ func (t *tcpStack) accept(r *tcp.ForwarderRequest) (net.Conn, bool) {
 // умолкла любая из них.
 func (t *tcpStack) pipe(a, b net.Conn) {
 	var once sync.Once
-	stop := func() {
+	f := &liveFlow{}
+	f.stop = func() {
 		once.Do(func() {
 			_ = a.Close()
 			_ = b.Close()
 		})
 	}
+
+	t.mu.Lock()
+	t.live[f] = struct{}{}
+	t.mu.Unlock()
+
+	// Поток, кончившийся сам, уходит из списка: иначе список растёт всё время
+	// работы агента и «сколько соединений разорвано» перестаёт быть правдой.
+	done := func() {
+		t.mu.Lock()
+		delete(t.live, f)
+		t.mu.Unlock()
+		f.stop()
+	}
+
 	t.s.wg.Add(2)
 	go func() {
 		defer t.s.wg.Done()
-		defer stop()
+		defer done()
 		_, _ = io.Copy(a, b)
 	}()
 	go func() {
 		defer t.s.wg.Done()
-		defer stop()
+		defer done()
 		_, _ = io.Copy(b, a)
 	}()
+}
+
+// reset закрывает живые потоки и возвращает их число (§5.5).
+func (t *tcpStack) reset() int {
+	t.mu.Lock()
+	live := make([]*liveFlow, 0, len(t.live))
+	for f := range t.live {
+		live = append(live, f)
+	}
+	clear(t.live)
+	t.mu.Unlock()
+
+	// Закрываем вне замка: stop будит копирующие горутины, а они лезут за тем
+	// же замком, чтобы вычеркнуть себя из списка.
+	for _, f := range live {
+		f.stop()
+	}
+	return len(live)
 }
 
 // dnsOverTCP — §3.4 говорит «dst-порт 53 (UDP или TCP)». Поток надо
