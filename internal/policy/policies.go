@@ -176,6 +176,21 @@ var (
 		},
 	}
 
+	// ParseCascade — каскад распознавателей §6.12: первый взявший забирает
+	// вход целиком (этап 7). Выключение переводит каскад в режим «ступени
+	// объединяют результаты»: base64-обёртка, разобравшаяся заодно и
+	// построчно, даёт узлы дважды, а тело Clash YAML вместо одной внятной
+	// ошибки уезжает в построчный разбор и превращается в шум. S22, S23, S24.
+	ParseCascade = &Policy{
+		Name: "parse_cascade",
+		Doc:  "первый взявший распознаватель забирает вход целиком (§6.12, S22–S24)",
+		Guards: []Guard{
+			{Pkg: "./internal/subscription", Test: "^TestS22Base64BodyTakenByFirstStage$"},
+			{Pkg: "./internal/subscription", Test: "^TestS23ClashBodyRejectedWithOneError$"},
+			{Pkg: "./internal/subscription", Test: "^TestS24Base64ContentIsNotParsedTwice$"},
+		},
+	}
+
 	// NATKey — UDP full-cone: NAT по source addr:port (§5.3, этап 3).
 	// Выключение переводит ключ на пару src+dst: записей становится по одной на
 	// адрес назначения, а ответ с адреса, на который клиент не слал, теряется.
@@ -207,6 +222,7 @@ func All() []*Policy {
 		ProbeTiers,
 		TrafficKills,
 		ErrorClassify,
+		ParseCascade,
 	}
 }
 

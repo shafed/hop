@@ -1,0 +1,2 @@
+trojan://parol-odin@a.example.com?type=ws&security=tls&host=a.example.com&path=%2Ftr#bez-porta
+trojan://parol-dva@b.example.com:8443?type=ws&security=tls&host=b.example.com&path=%2Ftr#s-portom
