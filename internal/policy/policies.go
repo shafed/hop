@@ -222,6 +222,32 @@ var (
 		},
 	}
 
+	// AtomicWrite — запись стора через временный файл рядом и rename (§2,
+	// этап 7). Выключение переводит запись на место, с O_TRUNC: обрыв посреди
+	// неё оставляет читаемым не прежнее состояние и не новое, а обрубок —
+	// ровно третье наблюдаемое состояние, которого У4 не допускает. S25, S26.
+	AtomicWrite = &Policy{
+		Name: "atomic_write",
+		Doc:  "запись стора временным файлом и rename, а не на месте (§2, S25, S26)",
+		Guards: []Guard{
+			{Pkg: "./internal/store", Test: "^TestS25FailureBetweenFsyncAndRenameKeepsOldState$"},
+			{Pkg: "./internal/store", Test: "^TestS26FailureWhileWritingTempKeepsMainFile$"},
+		},
+	}
+
+	// StoreLock — файловый замок каталога стора на время «прочитать —
+	// изменить — записать» (Р14, этап 7). Писателей двое по построению: агент
+	// пишет живость, процесс команды правит подписки (C12). Выключение не
+	// отсекает второго, и одновременные правки теряют одну из них — файлы
+	// пишутся целиком. S28.
+	StoreLock = &Policy{
+		Name: "store_lock",
+		Doc:  "второй писатель в стор ждёт замок и падает внятно, а не пишет поверх (Р14, S28)",
+		Guards: []Guard{
+			{Pkg: "./internal/store", Test: "^TestS28SecondWriterWaitsThenFails$"},
+		},
+	}
+
 	// NATKey — UDP full-cone: NAT по source addr:port (§5.3, этап 3).
 	// Выключение переводит ключ на пару src+dst: записей становится по одной на
 	// адрес назначения, а ответ с адреса, на который клиент не слал, теряется.
@@ -256,6 +282,8 @@ func All() []*Policy {
 		ParseCascade,
 		MergeKey,
 		MergeKeyUserID,
+		AtomicWrite,
+		StoreLock,
 	}
 }
 
