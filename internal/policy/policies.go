@@ -273,6 +273,58 @@ var (
 			{Pkg: "./internal/netstack", Test: "^TestT15FullConeKeepsOneEntry$"},
 		},
 	}
+
+	// XrayDrain — дренаж прежнего инстанса Xray при смене набора узлов
+	// (§5.8, Р32 регистра связки, этап С). Выключение убивает прежний инстанс
+	// сразу, и обновление подписки рвёт живые соединения — а §5.5 обещает
+	// рвать только по причине dead. Краснит W18, W20, W21.
+	XrayDrain = &Policy{
+		Name: "xray_drain",
+		Doc:  "дренаж прежнего инстанса Xray при смене набора узлов (§5.8, T30, W18)",
+		Guards: []Guard{
+			{Pkg: "./internal/agent", Test: "^TestW18SubscriptionUpdateKeepsConnection$"},
+			{Pkg: "./internal/agent", Test: "^TestW20DrainEndsWithLastConnection$"},
+		},
+	}
+
+	// SwitchOrder — зафиксированный порядок реакций на переключение
+	// (Р33 регистра связки). Выключение переставляет сброс кэша резолвера
+	// после рассылки события: клиент, реагирующий на событие повторным
+	// резолвом, получает адрес, добытый через мёртвый узел, и §5.7(в)
+	// оказывается выполнен формально. Краснит W11, W13, W14.
+	SwitchOrder = &Policy{
+		Name: "switch_order",
+		Doc:  "порядок реакций на переключение: кэш, разрыв, событие, диск (Р33, W11)",
+		Guards: []Guard{
+			{Pkg: "./internal/agent", Test: "^TestW11SwitchReactionsFollowOrder$"},
+			{Pkg: "./internal/agent", Test: "^TestW13CacheFlushPrecedesEvent$"},
+		},
+	}
+
+	// PhaseSplit — две фазы вместо одной (§2, D14). Выключение сводит их в
+	// одну, и «туннель поднят, живых узлов нет» перестаёт быть выразимым:
+	// снаружи видна половина правды. Краснит W24, W32.
+	PhaseSplit = &Policy{
+		Name: "phase_split",
+		Doc:  "фаза туннеля и фаза трафика — раздельно (§2, W24, W32)",
+		Guards: []Guard{
+			{Pkg: "./internal/agent", Test: "^TestW24TunnelUpWithNoLiveNodes$"},
+			{Pkg: "./internal/agent", Test: "^TestW32StartupBudgetIsWaiting$"},
+		},
+	}
+
+	// BypassTeardown — `hop bypass --on` снимает туннель (Р35 регистра связки).
+	// Выключение оставляет туннель поднятым, и «выпустить трафик напрямую»
+	// (§1/С6) перестаёт что-либо выпускать: маршруты по-прежнему ведут в
+	// туннель. Краснит W25, W26.
+	BypassTeardown = &Policy{
+		Name: "bypass_teardown",
+		Doc:  "обход снимает туннель, а не разворачивает трафик внутри (§5.6, W25)",
+		Guards: []Guard{
+			{Pkg: "./internal/agent", Test: "^TestW25BypassTakesTunnelDown$"},
+			{Pkg: "./internal/agent", Test: "^TestW26BypassOffRaisesTunnel$"},
+		},
+	}
 )
 
 // All — полный список политик продукта.
@@ -299,6 +351,10 @@ func All() []*Policy {
 		AtomicWrite,
 		StoreLock,
 		HealthSlice,
+		XrayDrain,
+		SwitchOrder,
+		PhaseSplit,
+		BypassTeardown,
 	}
 }
 

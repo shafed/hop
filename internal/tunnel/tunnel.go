@@ -22,7 +22,14 @@ import (
 	"github.com/shafed/hop/internal/policy"
 )
 
-// Phase — §2, TunnelState.phase.
+// Phase — §2, TunnelState.tunnel_phase: фаза, которой владеет сервис.
+//
+// Значений четыре, а не шесть. `failing` и `bypass` описывают судьбу трафика, а
+// её знает только агент: она зависит от живости узлов, о которой сервис не
+// осведомлён и по §5.2 осведомлён быть не должен. Они живут в
+// `agent.TrafficPhase`. До этапа С обе константы были объявлены здесь и не
+// использовались ни разу — это и был след того, что §2 держал в одном
+// перечислении двух владельцев.
 type Phase string
 
 const (
@@ -30,8 +37,6 @@ const (
 	Starting Phase = "starting"
 	Up       Phase = "up"
 	Orphaned Phase = "orphaned"
-	Failing  Phase = "failing"
-	Bypass   Phase = "bypass"
 )
 
 // Reason — почему агента не стало.
