@@ -19,11 +19,32 @@ import (
 // Приоритеты правил. Порядок — часть контракта: исключения §5.6 и правило
 // защиты от петли §6.8 обязаны стоять выше правила туннеля, иначе туннельная
 // таблица заберёт их первой.
+//
+// Перехват :53 стоит между ними, и это тот же порядок, что в §3.4, по той же
+// причине: системный DNS обычно и есть локальный роутер. Без правила prioDNS
+// запрос на 192.168.1.1:53 уходит в локальную сеть по исключению §5.6 и до
+// вердикта не доезжает вовсе — перехват формально работает, а утечка идёт
+// (T16).
+//
+// Защита от петли стоит выше перехвата: bootstrap агента (§5.7а) спрашивает
+// публичный резолвер на том же :53, и заведи его правило prioDNS в туннель —
+// имя узла ждало бы живого узла, а живой узел ждал бы имени.
 const (
+	prioLoopGuard  = 30500 // §6.8: трафик самого агента мимо туннеля
+	prioDNS        = 30750 // §3.4 п.1: :53 в туннель прежде исключений §5.6
 	prioExclusions = 31000 // §5.6: локальные сети, DHCP, NTP
-	prioLoopGuard  = 31500 // §6.8: трафик самого агента мимо туннеля
 	prioTunnel     = 32000 // всё остальное — в таблицу туннеля
 )
+
+// Priorities — все приоритеты, которые раскладывает hopd, и единственный их
+// перечень. По нему убирает Reclaim, по нему же убирает за собой стенд L3.
+//
+// Экспортировано после того, как два независимых перечисления разъехались:
+// перехват :53 (§5.7) добавил приоритет и подвинул защиту от петли, стенд об
+// этом не узнал и оставил чужие правила в общем netns — следующие тесты
+// снимали их уже сами и падали на несовпадении снапшота. Один список чинит
+// это по построению.
+var Priorities = []int{prioLoopGuard, prioDNS, prioExclusions, prioTunnel}
 
 // Linux — привилегированная поверхность на Linux.
 type Linux struct {
@@ -141,6 +162,19 @@ func (l *Linux) Up(p tunnel.Params) (tunnel.Device, error) {
 		// форма зависит от того, чем маршрут оказался к моменту уборки, а место
 		// — нет.
 		{"route", l.tunnelRoute("add"), ip("route", "del", "default", "table", fmt.Sprint(p.Table))},
+	}
+	// §3.4, п. 1: перехват :53 — до всякой маршрутизации. Правило заводит
+	// оба транспорта в таблицу туннеля, где их встречает netstack и отдаёт
+	// резолверу (§5.7).
+	for _, proto := range []string{"udp", "tcp"} {
+		steps = append(steps, struct {
+			name     string
+			add, del []string
+		}{
+			"hijack dns/" + proto,
+			ip("rule", "add", "ipproto", proto, "dport", "53", "lookup", fmt.Sprint(p.Table), "priority", fmt.Sprint(prioDNS)),
+			ip("rule", "del", "ipproto", proto, "dport", "53", "lookup", fmt.Sprint(p.Table), "priority", fmt.Sprint(prioDNS)),
+		})
 	}
 	for _, pfx := range LocalPrefixes {
 		steps = append(steps, struct {
@@ -271,7 +305,7 @@ func (l *Linux) tunnelRoute(verb string) []string {
 // Опознаются правила по приоритетам, которые раскладывает только hopd.
 func Reclaim() (int, error) {
 	dropped := 0
-	for _, prio := range []int{prioExclusions, prioLoopGuard, prioTunnel} {
+	for _, prio := range Priorities {
 		for i := 0; i < 64; i++ {
 			if err := run(ip("rule", "del", "priority", fmt.Sprint(prio)))(); err != nil {
 				break // правил с этим приоритетом больше нет

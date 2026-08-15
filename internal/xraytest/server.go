@@ -17,6 +17,12 @@ import (
 
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/infra/conf/serial"
+
+	// Роутер нужен узлу с DNSRedirect: правило «порт 53 в выход dns» без него
+	// разбирается, но не исполняется. Продукту он не нужен вовсе — у агента
+	// правило одно и оно выражено вердиктом §3.4, — поэтому импорт здесь, а не
+	// в internal/engine.
+	_ "github.com/xtls/xray-core/app/router"
 )
 
 // Server — запущенный VLESS-инбаунд.
@@ -32,6 +38,14 @@ type Options struct {
 	UUID string
 	// Listen — адрес инбаунда. Пусто — 127.0.0.1 со свободным портом.
 	Listen string
+	// DNSRedirect — куда узел уводит всё, что уходит на порт 53, независимо от
+	// адреса, который назвал клиент (freedom `redirect` за правилом роутинга).
+	//
+	// Нужен там, где проверяется не «дошло ли», а «через какой узел дошло»:
+	// клиент спрашивает один и тот же публичный адрес, а отвечают разные
+	// серверы — ровно как разные резолверы за выходами в разных странах.
+	// Остальной трафик узла (пробы §6.7, эхо) идёт наружу как обычно.
+	DNSRedirect string
 }
 
 // DefaultUUID — пользователь стенда. Не секрет: стенд локальный и живёт
@@ -76,7 +90,10 @@ func NewServer(opt Options) (*Server, error) {
 			},
 			"streamSettings": map[string]any{"network": "raw", "security": "none"},
 		}},
-		"outbounds": []map[string]any{{"protocol": "freedom", "tag": "direct"}},
+		"outbounds": outbounds(opt.DNSRedirect),
+	}
+	if r := routing(opt.DNSRedirect); r != nil {
+		cfg["routing"] = r
 	}
 
 	inst, err := start(cfg)
@@ -113,6 +130,32 @@ func (s *Server) Close() error {
 	err := s.inst.Close()
 	s.inst = nil
 	return err
+}
+
+// outbounds — выходы узла. Второй появляется только под DNSRedirect и берёт на
+// себя порт 53 по правилу роутинга: так стенд отличает «спросили через A» от
+// «спросили через B», не трогая остальной трафик узла.
+func outbounds(dnsRedirect string) []map[string]any {
+	direct := map[string]any{"protocol": "freedom", "tag": "direct"}
+	if dnsRedirect == "" {
+		return []map[string]any{direct}
+	}
+	return []map[string]any{direct, {
+		"protocol": "freedom",
+		"tag":      "dns",
+		"settings": map[string]any{"redirect": dnsRedirect},
+	}}
+}
+
+// routing — правило «порт 53 уходит в выход dns». Пусто, когда редиректа нет:
+// узел без правил роутинга не поднимает роутер вовсе.
+func routing(dnsRedirect string) map[string]any {
+	if dnsRedirect == "" {
+		return nil
+	}
+	return map[string]any{"rules": []map[string]any{
+		{"type": "field", "port": "53", "outboundTag": "dns"},
+	}}
 }
 
 func start(cfg map[string]any) (*core.Instance, error) {

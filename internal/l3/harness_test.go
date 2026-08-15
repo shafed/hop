@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/shafed/hop/internal/netstate"
+	"github.com/shafed/hop/internal/platform"
 )
 
 const (
@@ -137,10 +138,15 @@ func (s *service) cleanup() {
 
 // dropHopRules снимает всё, что раскладывает hopd, по приоритету. Приоритеты
 // выбраны так, чтобы уборка не могла случайно снять чужое правило.
+//
+// Список берётся у продукта, а не повторяется здесь: своя копия однажды уже
+// отстала от него, и правила с новыми приоритетами оставались в общем netns —
+// следующий тест снимал их своим Reclaim и падал на снапшоте, хотя ломался не
+// он.
 func dropHopRules() {
-	for _, prio := range []string{"31000", "31500", "32000"} {
+	for _, prio := range platform.Priorities {
 		for i := 0; i < 32; i++ {
-			if exec.Command("ip", "rule", "del", "priority", prio).Run() != nil {
+			if exec.Command("ip", "rule", "del", "priority", fmt.Sprint(prio)).Run() != nil {
 				break
 			}
 		}
