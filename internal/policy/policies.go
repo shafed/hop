@@ -191,6 +191,37 @@ var (
 		},
 	}
 
+	// MergeKey — ключ слияния подписок §6.16: protocol + server + port +
+	// user_id (этап 7). Выключение переводит ключ на полный отпечаток узла —
+	// второй вариант nekoray (ProfileFilter_ent_key), который §6.16 отвергает:
+	// косметическая правка у провайдера (сменился транспорт, сменился SNI)
+	// перестаёт быть тем же узлом, узел получает новый id и теряет историю проб
+	// на ровном месте. T18, S1.
+	MergeKey = &Policy{
+		Name: "merge_key",
+		Doc:  "ключ слияния §6.16, а не полный отпечаток узла (§5.8, T18, S1)",
+		Guards: []Guard{
+			{Pkg: "./internal/subscription", Test: "^TestT18SNIChangeKeepsSameID$"},
+			{Pkg: "./internal/subscription", Test: "^TestS1TransportChangeKeepsID$"},
+		},
+	}
+
+	// MergeKeyUserID — в ключ §6.16 входит user_id по таблице протоколов (этап
+	// 7). Выключение оставляет один адрес — первый вариант nekoray, — и два
+	// узла на одном сервере и порту, различающиеся только ключом доступа,
+	// склеиваются в один: история одного приписывается другому. S3.
+	//
+	// Флаг отдельный от merge_key, а не режим внутри него: HOP_DISABLE двоичен,
+	// и одним флагом одна из двух проверок осталась бы без охранника
+	// (docs/verification-store.md §6).
+	MergeKeyUserID = &Policy{
+		Name: "merge_key_userid",
+		Doc:  "user_id по таблице §6.16 в ключе слияния, а не один адрес (S3)",
+		Guards: []Guard{
+			{Pkg: "./internal/subscription", Test: "^TestS3UserIDDistinguishesNodes$"},
+		},
+	}
+
 	// NATKey — UDP full-cone: NAT по source addr:port (§5.3, этап 3).
 	// Выключение переводит ключ на пару src+dst: записей становится по одной на
 	// адрес назначения, а ответ с адреса, на который клиент не слал, теряется.
@@ -223,6 +254,8 @@ func All() []*Policy {
 		TrafficKills,
 		ErrorClassify,
 		ParseCascade,
+		MergeKey,
+		MergeKeyUserID,
 	}
 }
 
