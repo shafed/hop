@@ -248,6 +248,20 @@ var (
 		},
 	}
 
+	// HealthSlice — на диск идёт срез живости, а не вся NodeHealth (§2, этап
+	// 7). Выключение пишет и восстанавливает окно, traffic_failures и
+	// last_error: окно, пролежавшее выключенным час, воскрешает узел по §6.3 из
+	// записей, которым час, а восстановленный alive выдаёт себя за проверенный —
+	// стартовый бюджет §5.6 не отсчитывается заново. S36, S37.
+	HealthSlice = &Policy{
+		Name: "health_slice",
+		Doc:  "на диск идёт срез живости, а не окно (§2, S36, S37)",
+		Guards: []Guard{
+			{Pkg: "./internal/store", Test: "^TestS36RestoredHealthHasNoWindow$"},
+			{Pkg: "./internal/store", Test: "^TestS37RestoredAliveNodeCarriesNoProbe$"},
+		},
+	}
+
 	// NATKey — UDP full-cone: NAT по source addr:port (§5.3, этап 3).
 	// Выключение переводит ключ на пару src+dst: записей становится по одной на
 	// адрес назначения, а ответ с адреса, на который клиент не слал, теряется.
@@ -284,6 +298,7 @@ func All() []*Policy {
 		MergeKeyUserID,
 		AtomicWrite,
 		StoreLock,
+		HealthSlice,
 	}
 }
 

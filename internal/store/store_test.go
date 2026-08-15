@@ -65,11 +65,17 @@ func addNode(t *testing.T, s *Store, n Node) {
 	s.dirty |= sectionNodes
 }
 
+// putHealth кладёт живость в состояние стора, минуя дебаунс PutHealth: здесь
+// проверяется запись, а не то, как часто она случается (шаг 6 — health_test.go).
+//
+// Обрезка та же, что у PutHealth: в healthByNode по построению лежит срез, а не
+// вся NodeHealth (§2), и помощник, который клал бы туда окно, проверял бы стор,
+// которого нет.
 func putHealth(t *testing.T, s *Store, h health.NodeHealth) {
 	t.Helper()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.healthByNode[h.NodeID] = h
+	s.healthByNode[h.NodeID] = healthSlice(h)
 	s.dirty |= sectionHealth
 }
 

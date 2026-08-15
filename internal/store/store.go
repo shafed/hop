@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/shafed/hop/internal/clock"
 	"github.com/shafed/hop/internal/health"
@@ -61,10 +62,12 @@ type Store struct {
 	groupOrder []string
 	groups     map[string]Group
 	nodes      map[string]Node
-	// health — срез живости с диска. Кто его читает и обновляет — шаг 6
-	// регистра (Health, PutHealth, дебаунс); здесь он только загружается,
-	// пишется и переживает рестарт.
+	// healthByNode — срез живости: то, чему можно верить после паузы (§2).
+	// Пополняется PutHealth, отдаётся Health, переживает рестарт.
 	healthByNode map[string]health.NodeHealth
+	// lastHealthAt — когда живость последний раз дошла до диска. По часам
+	// стора: дебаунс §2 не имеет права тратить настоящее время (см. health.go).
+	lastHealthAt time.Time
 	dirty        section
 	closed       bool
 }

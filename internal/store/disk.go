@@ -76,12 +76,20 @@ type diskHealth struct {
 
 // diskNodeHealth — срез живости, а не вся NodeHealth (§2): окно,
 // traffic_failures и last_error описывают «прямо сейчас» и после паузы врут.
-// Дебаунс записи и флаг health_slice — шаг 6 регистра.
+//
+// Три последних поля в продукте не появляются никогда: обрезает живость
+// healthSlice (health.go), и с включённой политикой health_slice они приходят
+// сюда пустыми. Место для них есть ровно затем, чтобы выключенная политика
+// действительно писала на диск всю NodeHealth, а не делала вид (S36, S37).
 type diskNodeHealth struct {
 	NodeID      string `json:"node_id"`
 	State       string `json:"state"`
 	RTTMs       int64  `json:"rtt_ms,omitempty"`
 	LastProbeAt string `json:"last_probe_at,omitempty"`
+
+	Window          []string `json:"window,omitempty"`
+	TrafficFailures int      `json:"traffic_failures,omitempty"`
+	LastError       string   `json:"last_error,omitempty"`
 }
 
 // encodeGroups сериализует группы в порядке, в котором они лежат в сторе.
@@ -240,6 +248,12 @@ func encodeHealth(hs map[string]health.NodeHealth) ([]byte, error) {
 			State:       h.State.String(),
 			RTTMs:       h.RTT.Milliseconds(),
 			LastProbeAt: formatTime(h.LastProbeAt),
+			// Не «если политика включена», а «что принесли»: обрезает один
+			// healthSlice, и второе место, где спрашивают тот же флаг, однажды
+			// разошлось бы с первым.
+			Window:          encodeWindow(h.Window),
+			TrafficFailures: h.TrafficFailures,
+			LastError:       h.LastError,
 		})
 	}
 	return marshal(d)
@@ -263,14 +277,24 @@ func decodeHealth(raw []byte) (map[string]health.NodeHealth, error) {
 		if err != nil {
 			return nil, fmt.Errorf("живость узла %q: last_probe_at: %w", n.NodeID, err)
 		}
-		// Window, TrafficFailures и LastError не восстанавливаются намеренно
-		// (§2): пустое окно означает «не проверен», и стартовый бюджет §5.6
-		// отсчитывается заново.
+		// Окна в файле нет: его не пишет healthSlice (§2) — пустое окно
+		// означает «не проверен», и стартовый бюджет §5.6 отсчитывается заново.
+		// Разбор всё же есть: файл, написанный сборкой с выключенной политикой
+		// health_slice, обязан читаться ею же целиком, иначе выключение
+		// политики ломало бы запись и чтение по-разному и S36 краснела бы не по
+		// той причине.
+		window, err := decodeWindow(n.Window)
+		if err != nil {
+			return nil, fmt.Errorf("живость узла %q: %w", n.NodeID, err)
+		}
 		hs[n.NodeID] = health.NodeHealth{
-			NodeID:      n.NodeID,
-			State:       state,
-			RTT:         time.Duration(n.RTTMs) * time.Millisecond,
-			LastProbeAt: probed,
+			NodeID:          n.NodeID,
+			State:           state,
+			RTT:             time.Duration(n.RTTMs) * time.Millisecond,
+			LastProbeAt:     probed,
+			Window:          window,
+			TrafficFailures: n.TrafficFailures,
+			LastError:       n.LastError,
 		}
 	}
 	return hs, nil
@@ -330,6 +354,59 @@ func unsupReasonFromString(s string) (UnsupReason, error) {
 		return UnsupParse, nil
 	}
 	return UnsupNone, fmt.Errorf("неизвестная причина unsup_reason %q", s)
+}
+
+// encodeWindow и decodeWindow — окно исходов словами, а не числами: файл читают
+// глазами, и перенумерование Outcome не должно молча переназначать смысл
+// записанного. В продукте окно на диск не идёт вовсе (§2); эти две функции
+// существуют ради выключенной политики health_slice.
+func encodeWindow(w []health.Outcome) []string {
+	if len(w) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(w))
+	for _, o := range w {
+		out = append(out, outcomeString(o))
+	}
+	return out
+}
+
+func decodeWindow(w []string) ([]health.Outcome, error) {
+	if len(w) == 0 {
+		return nil, nil
+	}
+	out := make([]health.Outcome, 0, len(w))
+	for _, s := range w {
+		o, err := outcomeFromString(s)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, nil
+}
+
+func outcomeString(o health.Outcome) string {
+	switch o {
+	case health.Fail:
+		return "fail"
+	case health.Timeout:
+		return "timeout"
+	default:
+		return "ok"
+	}
+}
+
+func outcomeFromString(s string) (health.Outcome, error) {
+	switch s {
+	case "ok":
+		return health.OK, nil
+	case "fail":
+		return health.Fail, nil
+	case "timeout":
+		return health.Timeout, nil
+	}
+	return health.OK, fmt.Errorf("неизвестный исход пробы %q", s)
 }
 
 // healthStateFromString — разбор состояния живости. Своя функция, а не метод в
