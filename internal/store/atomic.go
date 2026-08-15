@@ -44,6 +44,13 @@ type writer struct {
 	dir    string
 	create createFunc
 	rename renameFunc
+
+	// wrote — сколько раз каждый файл добрался до диска. Существует ради S8
+	// («health.json не переписан на обновлении без изменений»): у времени
+	// модификации разрешение файловой системы, и два соседних обновления по
+	// нему неотличимы, а счётчик не мигает. Тот же приём, что и счётчик шагов
+	// в subscription.diff для S7.
+	wrote map[string]int
 }
 
 // newWriter собирает слой записи. atomic снимается из политики один раз при
@@ -58,8 +65,12 @@ func newWriter(dir string, atomic bool) *writer {
 		// вырождается: временного имени нет, переименовывать нечего.
 		create = createInPlace
 	}
-	return &writer{dir: dir, create: create, rename: os.Rename}
+	return &writer{dir: dir, create: create, rename: os.Rename, wrote: map[string]int{}}
 }
+
+// writes — сколько раз файл base был записан. Считается только успешная
+// запись: отказ посреди неё не меняет того, что читатель видит (У4).
+func (w *writer) writes(base string) int { return w.wrote[base] }
 
 // write кладёт data в файл base с правами perm так, что читатель видит либо
 // прежнее содержимое целиком, либо новое целиком (У4).
@@ -105,7 +116,11 @@ func (w *writer) write(base string, perm fs.FileMode, data []byte) (err error) {
 	}
 	// fsync каталога: на Unix без него rename может пережить обрыв, а
 	// появление имени в каталоге — нет (§4 регистра).
-	return syncDir(w.dir)
+	if err = syncDir(w.dir); err != nil {
+		return err
+	}
+	w.wrote[base]++
+	return nil
 }
 
 // sweep убирает временные файлы, оставшиеся от процесса, убитого посреди
