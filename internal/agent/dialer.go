@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+
+	"github.com/shafed/hop/internal/netstack"
 )
 
 // ErrNoNode — дозвониться некуда: живого узла нет. Netstack превращает это в
@@ -15,10 +17,14 @@ var ErrNoNode = errors.New("agent: живого узла нет")
 //
 // Узкий интерфейс, а не *health.Manager: во-первых, на этом пути лежит каждое
 // исходящее соединение, и таскать снимок всех узлов ради одной строки дорого;
-// во-вторых, фейк в тесте выражается одной функцией.
+// во-вторых, фейк в тесте выражается двумя функциями.
 type picker interface {
 	// Active — id узла, которому принадлежат новые соединения, или пусто.
 	Active() string
+	// Healthy — различает «узла нет, потому что все мертвы» и «узла нет,
+	// потому что ещё не проверяли». Без второго стартовое окно §5.6
+	// неотличимо от fail-close, и трафик получает RST там, где обязан ждать.
+	Healthy() bool
 }
 
 // dialer соединяет netstack с движком. Реализует netstack.Dialer.
@@ -81,6 +87,12 @@ func (d *dialer) DialUDP(src netip.AddrPort) (net.PacketConn, error) {
 func (d *dialer) route() (*instance, string, error) {
 	node := d.pick.Active()
 	if node == "" {
+		// Различие §5.6, и оно наблюдаемо клиентом: в стартовом окне поток
+		// придерживается (netstack не отвечает на SYN, клиент повторит), при
+		// fail-close — отвергается RST'ом.
+		if d.pick.Healthy() {
+			return nil, "", netstack.ErrNotReady
+		}
 		return nil, "", ErrNoNode
 	}
 	in := d.engine.current()

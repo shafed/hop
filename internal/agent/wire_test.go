@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"errors"
+	"net/netip"
 	"runtime"
 	"strings"
 	"sync"
@@ -8,6 +10,7 @@ import (
 	"time"
 
 	"github.com/shafed/hop/internal/health"
+	"github.com/shafed/hop/internal/netstack"
 	"github.com/shafed/hop/internal/tunnel"
 )
 
@@ -428,4 +431,52 @@ func atomicNext(n *int64) int64 {
 	defer seqMu.Unlock()
 	*n++
 	return *n
+}
+
+// TestW33WaitingHoldsTrafficInsteadOfRejecting — W33: в стартовом окне трафик
+// придерживается, а не отвергается.
+//
+// §5.6 называет именно этот отказ: «иначе первое же приложение получает RST в
+// те секунды, пока идёт стартовый обход подписки». Различие наблюдаемо
+// клиентом: netstack не отвечает на SYN вовсе, и клиент повторяет его сам.
+//
+// Проверка появилась не сразу: первая редакция регистра отнесла W33 к
+// свойствам netstack и не написала её. Шов между «живость говорит healthy» и
+// «активного узла ещё нет» лежит ровно в связке, и до этой проверки трафик в
+// waiting получал RST.
+func TestW33WaitingHoldsTrafficInsteadOfRejecting(t *testing.T) {
+	r := newRig(t, "a")
+	// Цикл проб не запускается: стартовое окно — это состояние «ещё не
+	// проверяли», и запуск его бы закрыл.
+	if err := r.a.Up(); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	if s := r.a.Snapshot(); s.Traffic != PhaseWaiting {
+		t.Fatalf("фаза %q, ожидалась waiting", s.Traffic)
+	}
+
+	d := newDialer(r.hm, r.a.engine)
+	_, err := d.DialTCP(netip.MustParseAddrPort("93.184.216.34:443"))
+	if err == nil {
+		t.Fatal("дозвон удался без активного узла")
+	}
+	if !errors.Is(err, netstack.ErrNotReady) {
+		t.Fatalf("в стартовом окне диалер вернул %v, ожидалась ErrNotReady: "+
+			"иначе netstack отвечает RST там, где §5.6 требует ожидания", err)
+	}
+
+	// А после того, как бюджет истёк и живых узлов нет, — уже отказ, а не
+	// ожидание: знание вместо незнания.
+	r.prob.set("a", health.Result{Err: errDead})
+	r.start()
+	r.killAll("a")
+	r.clk.Advance(health.DefaultStartupBudget)
+
+	if s := r.a.Snapshot(); s.Traffic != PhaseFailing {
+		t.Fatalf("фаза %q, ожидалась failing", s.Traffic)
+	}
+	_, err = d.DialTCP(netip.MustParseAddrPort("93.184.216.34:443"))
+	if !errors.Is(err, ErrNoNode) {
+		t.Fatalf("при fail-close диалер вернул %v, ожидалась ErrNoNode", err)
+	}
 }
