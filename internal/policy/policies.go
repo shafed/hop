@@ -24,6 +24,7 @@ var (
 		Guards: []Guard{
 			{Pkg: "./internal/tunnel", Test: "^TestEdgeInstallsReject$"},
 			{Pkg: "./internal/reject", Test: "^TestReplyRefusesInsteadOfSilence$"},
+			{Pkg: "./internal/reject", Test: "^TestDNSInOrphanedRefusesEvenToLocalRouter$"},
 		},
 	}
 
@@ -187,6 +188,32 @@ var (
 			{Pkg: "./internal/netstack", Test: "^TestT15FullConeKeepsOneEntry$"},
 		},
 	}
+
+	// DNSCacheFlush — кэш резолвера помечен узлом, через который добыт ответ
+	// (§5.7в, этап 6). Выключение перестаёт смотреть на метку, и после
+	// переключения приложение получает адрес, выданный CDN прежнего региона:
+	// трафик едет через новый узел на чужой континент. Краснит T14 — и на
+	// фейковом транспорте, и на настоящих узлах.
+	DNSCacheFlush = &Policy{
+		Name: "dns_cache_flush_on_switch",
+		Doc:  "кэш DNS не переживает смену узла (§5.7в, T14)",
+		Guards: []Guard{
+			{Pkg: "./internal/resolver", Test: "^TestT14CacheDoesNotSurviveSwitch$"},
+			{Pkg: "./internal/l2", Test: "^TestT14CacheDoesNotSurviveSwitchOnRealNodes$"},
+		},
+	}
+
+	// Bootstrap — хостнеймы узлов разрешаются мимо туннеля (§5.7а, этап 6).
+	// Выключение отправляет вопрос системному резолверу, который после
+	// поднятия туннеля указывает на нас же: имя узла ждёт живого узла, живой
+	// узел ждёт имени. Краснит TestBootstrapBreaksStartupLoop.
+	Bootstrap = &Policy{
+		Name: "bootstrap",
+		Doc:  "резолв хостнеймов узлов мимо туннеля (§5.7а)",
+		Guards: []Guard{
+			{Pkg: "./internal/resolver", Test: "^TestBootstrapBreaksStartupLoop$"},
+		},
+	}
 )
 
 // All — полный список политик продукта.
@@ -207,6 +234,8 @@ func All() []*Policy {
 		ProbeTiers,
 		TrafficKills,
 		ErrorClassify,
+		DNSCacheFlush,
+		Bootstrap,
 	}
 }
 

@@ -45,6 +45,25 @@ func TestT21Up(t *testing.T) {
 			t.Fatalf("нет исключения §5.6 %q: %s", want, r)
 		}
 	}
+	// §3.4 п. 1 и §5.7: :53 заводится в таблицу туннеля, иначе запрос на
+	// локальный роутер уходит в локальную сеть по исключению выше — перехват
+	// формально работает, а утечка идёт.
+	for _, want := range []string{"ipproto udp dport 53", "ipproto tcp dport 53"} {
+		if !strings.Contains(r, want) {
+			t.Fatalf("нет правила перехвата :53 %q: %s", want, r)
+		}
+	}
+	// Порядок правил — часть контракта, и он тот же, что в §3.4: сперва свой
+	// трафик мимо туннеля (§6.8), потом перехват :53, потом исключения §5.6.
+	// `ip rule list` печатает правила по возрастанию приоритета, поэтому
+	// порядок строк и есть порядок применения.
+	loop := strings.Index(r, "uidrange")
+	dns := strings.Index(r, "dport 53")
+	excl := strings.Index(r, "192.168.0.0/16")
+	if !(loop < dns && dns < excl) {
+		t.Fatalf("порядок правил не тот: защита от петли %d, перехват :53 %d, исключения %d\n%s",
+			loop, dns, excl, r)
+	}
 }
 
 // T22 — общий платформенный контракт §8.4: после down снапшот совпал с
@@ -113,6 +132,31 @@ func TestT23bWindowNeverGoesSilent(t *testing.T) {
 		t.Fatalf("проб всего %d — окно не покрыто", probes)
 	}
 	t.Logf("окно покрыто %d пробами, все отказали", probes)
+}
+
+// T23c — §5.7б внутри окна §6.2: DNS отказывает вместе со всем остальным.
+//
+// Запрос идёт на локальный роутер — самый частый случай, потому что системный
+// DNS обычно и есть роутер. В туннель его заводит правило перехвата :53 (§3.4,
+// п. 1); без правила он ушёл бы в локальную сеть по исключению §5.6, а внутри
+// окна — молчал бы, потому что по адресу это RFC1918.
+//
+// Ожидается именно ECONNREFUSED: так выглядит ICMP port unreachable, который
+// синтезировал наш респондер. ENETUNREACH означал бы, что до устройства запрос
+// не дошёл вовсе, то есть перехват не встал, — и такой отказ теста не устроит,
+// хотя формально это тоже отказ.
+//
+// Половина свойства проверена без прав в internal/reject
+// (TestDNSInOrphanedRefusesEvenToLocalRouter).
+func TestT23cDNSInWindowRefuses(t *testing.T) {
+	s := startService(t, 3*time.Second)
+	s.startAgent(filepath.Join(t.TempDir(), "token"))
+	killAgentAndWaitOrphaned(t, s)
+
+	err := udpProbe("192.168.1.1:53", 500*time.Millisecond)
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("DNS-запрос в окне дал %v, ожидался ICMP port unreachable от респондера", err)
+	}
 }
 
 // T23-slow — свойство уборки. Длинный порог теперь безвреден именно потому,
@@ -205,7 +249,7 @@ func TestT29ServiceDeath(t *testing.T) {
 
 	var leaked []string
 	for _, line := range strings.Split(rules(), "\n") {
-		for _, prio := range []string{"31000:", "31500:", "32000:"} {
+		for _, prio := range []string{"30500:", "30750:", "31000:", "32000:"} {
 			if strings.HasPrefix(strings.TrimSpace(line), prio) {
 				leaked = append(leaked, strings.TrimSpace(line))
 			}

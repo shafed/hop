@@ -52,6 +52,10 @@ type harness struct {
 
 type options struct {
 	nodes []string
+	// redirect — куда узел уводит весь свой выход, по id узла
+	// (xraytest.Options.DNSRedirect). Так стенд отличает «через A» от «через B»
+	// там, где ответ зависит от узла, а не от адреса: DNS этапа 6.
+	redirect map[string]string
 	// Расписание. Нули заменяются сжатыми значениями стенда.
 	activeInterval, candidateInterval, probeTimeout, tolerance time.Duration
 }
@@ -78,7 +82,7 @@ func newHarness(t *testing.T, opt options) *harness {
 
 	var nodes []engine.Node
 	for _, id := range opt.nodes {
-		srv, err := xraytest.NewServer(xraytest.Options{UUID: uuidFor(id)})
+		srv, err := xraytest.NewServer(xraytest.Options{UUID: uuidFor(id), DNSRedirect: opt.redirect[id]})
 		if err != nil {
 			t.Fatalf("инбаунд %s: %v", id, err)
 		}

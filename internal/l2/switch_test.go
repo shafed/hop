@@ -276,18 +276,25 @@ func TestProbeTargetBlockedByOneURL(t *testing.T) {
 	h := newHarness(t, options{})
 	active := h.waitAnyActive(budget)
 
+	// Сначала — что блокировка вообще есть: проба, пережившая блокировку,
+	// которой не было, ничего не доказывает. Спросить сам таргет, а не
+	// счётчик запросов после MultiProber: тот возвращается по первому успеху
+	// и отменяет остальные, поэтому «сколько запросов дошло до медленного
+	// URL» — гонка, а не свойство (§5.4, Р3).
+	blockedTarget := &health.HTTPTarget{URL: blocked.URL(), Dial: h.dialFunc()}
+	if _, err := blockedTarget.Check(context.Background(), active); err == nil {
+		t.Fatal("заблокированный URL ответил успехом — стенд собран не так")
+	}
+
 	// Подменять пробер на живом менеджере нельзя, поэтому проверяем сведение
 	// на самом MultiProber — тем же путём, через движок.
 	p := &health.MultiProber{Targets: []health.Target{
-		&health.HTTPTarget{URL: blocked.URL(), Dial: h.dialFunc()},
+		blockedTarget,
 		&health.HTTPTarget{URL: h.tgt.URL(), Dial: h.dialFunc()},
 	}}
 	res := p.Probe(context.Background(), active)
 	if res.Err != nil {
 		t.Errorf("проба провалилась при живом втором URL: %v", res.Err)
-	}
-	if blocked.Requests() == 0 {
-		t.Error("заблокированный URL не опрашивался — стенд собран не так")
 	}
 }
 

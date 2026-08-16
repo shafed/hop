@@ -5,7 +5,7 @@
 // порядке §3.4 — hijack-dns → bypass → reject → proxy, — и дальше пакет идёт по
 // своей ветке:
 //
-//	hijack-dns  → Resolver (на этапе 3 — заглушка, настоящий резолвер — этап 6)
+//	hijack-dns  → Resolver (internal/resolver: кэш, апстрим через узел, §5.7)
 //	bypass      → Bypass, мимо туннеля (§6.10)
 //	reject      → internal/reject, тот же код, что обслуживает orphaned (§6.2)
 //	proxy       → Dialer (на этапе 3 — фейк, на этапе 4 — core.Dial/core.DialUDP)
@@ -44,8 +44,8 @@ type Dialer interface {
 	DialUDP(src netip.AddrPort) (net.PacketConn, error)
 }
 
-// Resolver — перехваченный DNS (§5.7). Этап 3 доводит запрос до заглушки;
-// настоящий резолвер, кэш и bootstrap — этап 6.
+// Resolver — перехваченный DNS (§5.7). Реализация — internal/resolver; здесь
+// интерфейс, потому что netstack не должен знать ни про кэш, ни про узлы.
 type Resolver interface {
 	// Query отвечает на DNS-запрос. server — адрес, на который клиент слал:
 	// ответ обязан прийти именно с него, иначе резолвер клиента его не примет.
@@ -86,6 +86,9 @@ const (
 	defaultFlowIdle = 2 * time.Minute
 	defaultUDPIdle  = 60 * time.Second
 	readBatch       = 64
+	// maxDNSInFlight — потолок одновременных резолвов (см. hijackUDP).
+	// Верхняя граница памяти на висящие запросы, не политика.
+	maxDNSInFlight = 256
 )
 
 // Stats — наблюдаемость. Числа нужны B3 и тестам: «NAT-таблица не деградирует
@@ -97,6 +100,7 @@ type Stats struct {
 	Blocked     int64 // дропнуто по §6.9/§6.10
 	Rejected    int64 // отвечено отказом
 	NATOrphaned int64 // ответов, не нашедших записи NAT
+	DNSDropped  int64 // DNS-запросов дропнуто по потолку одновременных резолвов
 }
 
 // Stack — netstack поверх одного PacketDevice.
@@ -110,9 +114,12 @@ type Stack struct {
 	nat   *natTable
 	tcp   *tcpStack
 
-	mu       sync.Mutex
-	blocked  int64
-	rejected int64
+	dnsSlots chan struct{} // потолок одновременных резолвов
+
+	mu         sync.Mutex
+	blocked    int64
+	rejected   int64
+	dnsDropped int64
 
 	closeOnce sync.Once
 	done      chan struct{}
@@ -138,10 +145,11 @@ func New(cfg Config) (*Stack, error) {
 	}
 
 	s := &Stack{
-		cfg:   cfg,
-		dev:   cfg.Device,
-		flows: newFlowTable(cfg.Clock, cfg.FlowIdle),
-		done:  make(chan struct{}),
+		cfg:      cfg,
+		dev:      cfg.Device,
+		flows:    newFlowTable(cfg.Clock, cfg.FlowIdle),
+		dnsSlots: make(chan struct{}, maxDNSInFlight),
+		done:     make(chan struct{}),
 	}
 	s.nat = newNATTable(s, cfg.Clock, cfg.UDPIdle)
 	t, err := newTCPStack(s)
@@ -194,7 +202,7 @@ func (s *Stack) Close() {
 // Stats — снимок счётчиков.
 func (s *Stack) Stats() Stats {
 	s.mu.Lock()
-	st := Stats{Blocked: s.blocked, Rejected: s.rejected}
+	st := Stats{Blocked: s.blocked, Rejected: s.rejected, DNSDropped: s.dnsDropped}
 	s.mu.Unlock()
 	st.Flows = s.flows.len()
 	st.NATEntries, st.NATSockets, st.NATOrphaned = s.nat.stats()
