@@ -6,7 +6,6 @@ import (
 	"text/tabwriter"
 
 	"github.com/shafed/hop/internal/events"
-	"github.com/shafed/hop/internal/store"
 	"github.com/shafed/hop/internal/tunnel"
 )
 
@@ -77,8 +76,7 @@ func renderNodes(w io.Writer, list []events.NodeInfo, live bool) {
 
 // renderGroups — `hop sub list`. Группа manual тоже здесь: пользователь видит
 // один список источников, а не два (§5.8).
-func renderGroups(w io.Writer, st *store.Store) {
-	groups := st.Groups()
+func renderGroups(w io.Writer, groups []events.GroupInfo) {
 	if len(groups) == 0 {
 		fmt.Fprintln(w, "подписок нет: hop sub add <url>")
 		return
@@ -88,14 +86,14 @@ func renderGroups(w io.Writer, st *store.Store) {
 	fmt.Fprintln(t, "ID\tИМЯ\tУЗЛОВ\tОБНОВЛЕНА\tИСТОЧНИК")
 	for _, g := range groups {
 		updated := "—"
-		if !g.LastUpdatedAt.IsZero() {
-			updated = g.LastUpdatedAt.Format("2006-01-02 15:04")
+		if !g.UpdatedAt.IsZero() {
+			updated = g.UpdatedAt.Format("2006-01-02 15:04")
 		}
 		src := g.SourceURL
 		if src == "" {
 			src = "—"
 		}
-		fmt.Fprintf(t, "%s\t%s\t%d\t%s\t%s\n", g.ID, g.Name, len(st.Nodes(g.ID)), updated, src)
+		fmt.Fprintf(t, "%s\t%s\t%d\t%s\t%s\n", g.ID, g.Name, g.Nodes, updated, src)
 	}
 	t.Flush()
 }

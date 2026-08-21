@@ -1,8 +1,12 @@
 package events
 
 import (
+	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"strings"
 	"testing"
 	"time" //hop:realtime
 
@@ -29,10 +33,19 @@ func (a *stubAgent) Ping(id string) (NodeInfo, error) {
 	return NodeInfo{ID: id, State: health.Alive}, nil
 }
 
+// Состав узлов этому двойнику не нужен: он проверяет поток событий, а не
+// каталог. Отдельный catalogStub ниже отвечает за шесть команд §С2.
+func (a *stubAgent) SubAdd(string, string) (SubResult, error) { return SubResult{}, nil }
+func (a *stubAgent) SubUpdate(string) ([]SubResult, error)    { return nil, nil }
+func (a *stubAgent) SubRemove(string) error                   { return nil }
+func (a *stubAgent) SubList() []GroupInfo                     { return nil }
+func (a *stubAgent) NodeAdd(string) (NodeInfo, error)         { return NodeInfo{}, nil }
+func (a *stubAgent) NodeRemove(string) (string, error)        { return "", nil }
+
 func serve(t *testing.T, a Agent) (*Server, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "agent.sock")
-	srv, err := Serve(path, a)
+	srv, err := Serve(path, a, -1)
 	if err != nil {
 		t.Fatalf("Serve: %v", err)
 	}
@@ -171,5 +184,183 @@ func TestRequestResponse(t *testing.T) {
 	call(func(cl *Client) error { return cl.Auto(false) })
 	if !a.bypass || a.auto {
 		t.Fatalf("агент не увидел команд: bypass=%v auto=%v", a.bypass, a.auto)
+	}
+}
+
+// catalogStub — агент, у которого состав узлов есть, но датаплейна нет.
+type catalogStub struct {
+	stubAgent
+	added   string
+	name    string
+	updated string
+	removed string
+	link    string
+	dropped string
+	groups  []GroupInfo
+}
+
+func (a *catalogStub) SubAdd(url, name string) (SubResult, error) {
+	a.added, a.name = url, name
+	return SubResult{GroupID: "ee8e3a30", GroupName: "sub.example", Added: 2, Unsupported: 1}, nil
+}
+
+func (a *catalogStub) SubUpdate(id string) ([]SubResult, error) {
+	a.updated = id
+	return []SubResult{{GroupID: "ee8e3a30", Kept: 2}}, nil
+}
+
+func (a *catalogStub) SubRemove(id string) error { a.removed = id; return nil }
+func (a *catalogStub) SubList() []GroupInfo      { return a.groups }
+
+func (a *catalogStub) NodeAdd(link string) (NodeInfo, error) {
+	a.link = link
+	return NodeInfo{ID: "n9", Name: "Прага", Group: "manual", Supported: true}, nil
+}
+
+func (a *catalogStub) NodeRemove(id string) (string, error) {
+	a.dropped = id
+	return "ee8e3a30", nil
+}
+
+// §3.3: состав узлов правит агент, а не клиент. Шесть команд обязаны доехать по
+// сокету целиком — вместе с аргументами и вместе с ответом, иначе клиенту
+// пришлось бы лезть в стор, до которого он под своим UID не достаёт (§6.8).
+func TestCatalogCommandsCrossTheSocket(t *testing.T) {
+	a := &catalogStub{groups: []GroupInfo{{ID: "ee8e3a30", Name: "sub.example", Nodes: 2}}}
+	_, path := serve(t, a)
+
+	// Одно соединение — одна команда (шапка пакета), поэтому клиент на каждую
+	// свой. Тест, переиспользовавший соединение, ловил бы broken pipe и читался
+	// бы как дефект сервера.
+	cl := func() *Client {
+		c, err := Dial(path)
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+
+	res, err := cl().SubAdd("https://sub.example/list", "мои")
+	if err != nil {
+		t.Fatalf("SubAdd: %v", err)
+	}
+	if a.added != "https://sub.example/list" || a.name != "мои" {
+		t.Fatalf("до агента доехало url=%q name=%q", a.added, a.name)
+	}
+	if res.Added != 2 || res.Unsupported != 1 || res.GroupID != "ee8e3a30" {
+		t.Fatalf("сводка не доехала обратно: %+v", res)
+	}
+
+	if _, err := cl().SubUpdate("ee8e3a30"); err != nil {
+		t.Fatalf("SubUpdate: %v", err)
+	}
+	if a.updated != "ee8e3a30" {
+		t.Fatalf("id подписки не доехал: %q", a.updated)
+	}
+
+	groups, err := cl().SubList()
+	if err != nil {
+		t.Fatalf("SubList: %v", err)
+	}
+	if len(groups) != 1 || groups[0].Nodes != 2 {
+		t.Fatalf("список подписок не доехал: %+v", groups)
+	}
+
+	if err := cl().SubRemove("ee8e3a30"); err != nil {
+		t.Fatalf("SubRemove: %v", err)
+	}
+	if a.removed != "ee8e3a30" {
+		t.Fatalf("id на удаление не доехал: %q", a.removed)
+	}
+
+	n, err := cl().NodeAdd("vless://x@c.example:443#Прага")
+	if err != nil {
+		t.Fatalf("NodeAdd: %v", err)
+	}
+	if a.link != "vless://x@c.example:443#Прага" || n.Name != "Прага" {
+		t.Fatalf("ссылка=%q, узел=%+v", a.link, n)
+	}
+
+	from, err := cl().NodeRemove("n9")
+	if err != nil {
+		t.Fatalf("NodeRemove: %v", err)
+	}
+	if a.dropped != "n9" || from != "ee8e3a30" {
+		t.Fatalf("удаление: до агента %q, обратно подписка %q", a.dropped, from)
+	}
+}
+
+// Ошибка агента доезжает до клиента ошибкой, а не пустым успехом: `sub add` с
+// недоступным адресом обязан быть виден как отказ.
+func TestCatalogErrorReachesClient(t *testing.T) {
+	_, path := serve(t, &failingCatalog{})
+	cl, err := Dial(path)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer cl.Close()
+
+	if _, err := cl.SubAdd("https://sub.example/list", ""); err == nil ||
+		!strings.Contains(err.Error(), "сеть недоступна") {
+		t.Fatalf("ошибка агента не доехала: %v", err)
+	}
+}
+
+type failingCatalog struct{ catalogStub }
+
+func (a *failingCatalog) SubAdd(string, string) (SubResult, error) {
+	return SubResult{}, errors.New("сеть недоступна")
+}
+
+// §3.3: сокет агента лежит не в каталоге пользователя, а на общем пути с
+// правами группы `hop` — под системным пользователем (§6.8) агент до `$HOME`
+// клиента не дотянется, а клиент до каталога агента.
+//
+// Права даёт сам сокет, а не каталог. Прежде наоборот: каталог 0700 закрывал и
+// сокет, и лежащий рядом attach-token. Каталог, открытый группе, открыл бы ей
+// заодно и токен, а §6.14 требует ровно обратного — членство в группе даёт
+// сокет, но не ключи.
+func TestSocketOpensToGroupAndNotToEveryone(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("права unix-сокета: на Windows граница выражена ACL трубы")
+	}
+	path := filepath.Join(t.TempDir(), "agent.sock")
+	// Собственная группа процесса: chown в неё не требует прав, а проверяется
+	// решение — какие биты выставлены, — а не то, кому машина их выдала.
+	srv, err := Serve(path, &stubAgent{}, os.Getgid())
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("сокет: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o660 {
+		t.Fatalf("права сокета %04o, ожидалось 0660 — группе rw, остальным ничего", perm)
+	}
+}
+
+// Без группы сокет остаётся у одного владельца: так он поднимается в отладке и
+// на стенде, и лишний бит там опаснее, чем неудобство.
+func TestSocketWithoutGroupStaysPrivate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("права unix-сокета: на Windows граница выражена ACL трубы")
+	}
+	path := filepath.Join(t.TempDir(), "agent.sock")
+	srv, err := Serve(path, &stubAgent{}, -1)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("сокет: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("права сокета %04o, ожидалось 0600", perm)
 	}
 }

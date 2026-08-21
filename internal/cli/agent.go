@@ -107,8 +107,12 @@ func status(env Env) (events.Status, error) {
 	}, nil
 }
 
-// cmdNodes — §С5. Без агента список берётся из стора: узлы надо видеть сразу
-// после `hop sub add`, то есть до первого подключения (§С2).
+// cmdNodes — §С5. Состав отдаёт агент: у клиента стора нет (§3.3).
+//
+// Прежде при спящем агенте список читался прямо из стора — узлы надо видеть
+// сразу после `hop sub add`, до первого подключения (§С2). Читать его больше
+// неоткуда, да и незачем: агент стартует при старте ОС (§6.13) и потому есть
+// всегда, а молчаливый пустой список был бы хуже внятного отказа.
 func cmdNodes(env Env, args []string) error {
 	fs := flags(env, "nodes")
 	asJSON := fs.Bool("json", false, "машинный формат")
@@ -116,29 +120,20 @@ func cmdNodes(env Env, args []string) error {
 		return err
 	}
 
-	var (
-		list []events.NodeInfo
-		live bool
-	)
-	if cl, err := dial(env); err == nil {
-		defer cl.Close()
-		if list, err = cl.Nodes(); err != nil {
-			return err
-		}
-		live = true
-	} else {
-		st, err := openStore(env)
-		if err != nil {
-			return err
-		}
-		defer st.Close()
-		list = StoreNodes(st)
+	cl, err := dial(env)
+	if err != nil {
+		return errNoAgent
 	}
+	defer cl.Close()
 
+	list, err := cl.Nodes()
+	if err != nil {
+		return err
+	}
 	if *asJSON {
 		return writeJSON(env.Out, list)
 	}
-	renderNodes(env.Out, list, live)
+	renderNodes(env.Out, list, true)
 	return nil
 }
 

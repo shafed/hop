@@ -18,18 +18,33 @@ package events
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"time" //hop:realtime
 
 	"github.com/shafed/hop/internal/health"
 	"github.com/shafed/hop/internal/tunnel"
 )
 
-// DefaultPath — сокет агента по умолчанию: каталог пользователя, а не /run
-// (§3.3). Рядом с ним лежит attach-token, и каталог создаётся с правами 0700.
-var DefaultPath = defaultPath()
+// DefaultPath — сокет агента по умолчанию (§3.3).
+var DefaultPath = SocketPath(runtime.GOOS, os.Getenv)
 
-func defaultPath() string {
-	dir := os.Getenv("XDG_RUNTIME_DIR")
+// SocketPath — где искать сокет агента. Считается здесь, а не у каждой из
+// сторон: агент его поднимает, CLI к нему подключается, и разойтись эти два
+// пути не имеют права.
+//
+// ОС — аргумент, а не build tag, и окружение спрашивается функцией: решение
+// проверяется на любой машине, а не только на своей (§8).
+//
+// На Linux путь общий, а не в каталоге пользователя: агент работает под
+// системным пользователем `hop` (§6.8) и до `$XDG_RUNTIME_DIR` клиента не
+// дотянется. Доступ гейтит группа `hop` правами самого сокета (Serve).
+// На macOS и Windows агент остался пользовательским (C27), и сокет вместе с
+// ним.
+func SocketPath(goos string, env func(string) string) string {
+	if goos == "linux" {
+		return "/run/hop/agent.sock"
+	}
+	dir := env("XDG_RUNTIME_DIR")
 	if dir == "" {
 		dir = os.TempDir()
 	}
@@ -83,6 +98,32 @@ type NodeInfo struct {
 	LastError string `json:"last_error,omitempty"`
 }
 
+// GroupInfo — строка `hop sub list`: подписка (§5.8) вместе с её составом.
+type GroupInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+	// Nodes — сколько узлов сейчас в группе. Считает агент: у клиента стора нет
+	// (§3.3), и пересчитать ему нечем.
+	Nodes     int       `json:"nodes"`
+	UpdatedAt time.Time `json:"updated_at,omitzero"`
+	// SourceURL пуст у ручной группы: её обновлять неоткуда.
+	SourceURL string `json:"source_url,omitempty"`
+}
+
+// SubResult — сводка §С2 по одной подписке: наблюдаемый результат
+// diff-слияния (§5.8). Считает её агент, потому что слияние делает он.
+type SubResult struct {
+	GroupID     string `json:"group_id"`
+	GroupName   string `json:"group_name,omitempty"`
+	Added       int    `json:"added"`
+	Kept        int    `json:"kept"`
+	Removed     int    `json:"removed"`
+	Unsupported int    `json:"unsupported"`
+	// Warning — нераспознанные строки подписки. Не ошибка: узлы разобрались,
+	// но сказать об остальном надо.
+	Warning string `json:"warning,omitempty"`
+}
+
 // Event — то, что уезжает подписчикам (§3.3): смена узла и/или фазы туннеля.
 type Event struct {
 	At    time.Time    `json:"at"`
@@ -103,6 +144,16 @@ const (
 	CmdBypass Cmd = "bypass"
 	CmdPing   Cmd = "ping"
 	CmdEvents Cmd = "events"
+
+	// Состав узлов (§С2, §5.8). Шесть команд, которые до системного
+	// пользователя правил сам процесс CLI (C12): под своим UID клиент до стора
+	// агента не достаёт, и §3.3 всё это время требовал ровно такой границы.
+	CmdSubAdd    Cmd = "sub.add"
+	CmdSubUpdate Cmd = "sub.update"
+	CmdSubRemove Cmd = "sub.rm"
+	CmdSubList   Cmd = "sub.list"
+	CmdNodeAdd   Cmd = "node.add"
+	CmdNodeRm    Cmd = "node.rm"
 )
 
 // Request — запрос клиента. Узлов и ключей в нём нет: клиент называет id, а
@@ -111,16 +162,24 @@ type Request struct {
 	Cmd  Cmd    `json:"cmd"`
 	Node string `json:"node,omitempty"`
 	On   bool   `json:"on,omitempty"`
+	// URL, Name — `hop sub add`; Group — id подписки для update и rm;
+	// Link — ссылка на отдельный узел для `hop node add`.
+	URL   string `json:"url,omitempty"`
+	Name  string `json:"name,omitempty"`
+	Group string `json:"group,omitempty"`
+	Link  string `json:"link,omitempty"`
 }
 
 // Response — ответ агента. Для подписки таких ответов приходит много, по
 // одному на событие.
 type Response struct {
-	Error  string     `json:"error,omitempty"`
-	Status *Status    `json:"status,omitempty"`
-	Nodes  []NodeInfo `json:"nodes,omitempty"`
-	Node   *NodeInfo  `json:"node,omitempty"`
-	Event  *Event     `json:"event,omitempty"`
+	Error  string      `json:"error,omitempty"`
+	Status *Status     `json:"status,omitempty"`
+	Nodes  []NodeInfo  `json:"nodes,omitempty"`
+	Node   *NodeInfo   `json:"node,omitempty"`
+	Event  *Event      `json:"event,omitempty"`
+	Groups []GroupInfo `json:"groups,omitempty"`
+	Subs   []SubResult `json:"subs,omitempty"`
 }
 
 // FromSwitch переводит событие переключения из health в машинный вид.

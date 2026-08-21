@@ -8,21 +8,7 @@ import (
 	"github.com/shafed/hop/internal/tunnel"
 )
 
-// Attach-token переживает `kill -9` агента, потому что иначе его незачем
-// заводить: реаттач (T24) по определению делает **новый процесс**, а память
-// убитого ему недоступна.
-//
-// Отсюда файл — но с оговорками §6.14: каталог 0700, файл 0600, в логи не
-// попадает ни на debug (за это отвечает тип tunnel.Token), сервису не
-// передаётся никуда, кроме самого Attach, и в вывод status не входит.
-// Подробнее — «Deviations» в implementation-notes.md.
-func defaultTokenFile() string {
-	dir := os.Getenv("XDG_RUNTIME_DIR")
-	if dir == "" {
-		dir = os.TempDir()
-	}
-	return filepath.Join(dir, "hop", "attach-token")
-}
+// Где лежит attach-token — в paths.go вместе с остальными путями агента.
 
 func loadToken(path string) (tunnel.Token, error) {
 	b, err := os.ReadFile(path)

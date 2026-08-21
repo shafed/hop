@@ -42,7 +42,7 @@ func main() {
 
 	// Группа резолвится до всякой привилегированной работы: опечатка в имени
 	// должна валить старт, а не оставлять сокет, к которому агент не достучится.
-	gid, err := lookupGID(*group)
+	gid, err := ipc.LookupGID(*group)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "hopd:", err)
 		os.Exit(1)

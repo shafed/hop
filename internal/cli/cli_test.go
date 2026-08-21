@@ -23,6 +23,16 @@ type stubAgent struct {
 	auto   bool
 	bypass bool
 	pinned string
+
+	groups      []events.GroupInfo
+	subURL      string
+	subName     string
+	subUpdated  string
+	subRemoved  string
+	nodeLink    string
+	nodeDropped string
+	fromGroup   string
+	fail        error
 }
 
 func (a *stubAgent) Status() events.Status    { return a.status }
@@ -34,6 +44,43 @@ func (a *stubAgent) Ping(id string) (events.NodeInfo, error) {
 	return events.NodeInfo{ID: id, Name: "Токио", State: health.Alive, RTTms: 42}, nil
 }
 
+// Состав узлов (§С2) правит агент, а не клиент: под системным пользователем
+// `hop` до стора агента клиент не достаёт (§3.3, §6.8). Двойник запоминает,
+// что до него доехало, и отдаёт заранее заготовленный ответ.
+func (a *stubAgent) SubAdd(url, name string) (events.SubResult, error) {
+	a.subURL, a.subName = url, name
+	if a.fail != nil {
+		return events.SubResult{}, a.fail
+	}
+	return events.SubResult{
+		GroupID: "ee8e3a30", GroupName: "sub.example", Added: 2, Unsupported: 1,
+	}, nil
+}
+
+func (a *stubAgent) SubUpdate(id string) ([]events.SubResult, error) {
+	a.subUpdated = id
+	if a.fail != nil {
+		return nil, a.fail
+	}
+	return []events.SubResult{{GroupID: "ee8e3a30", GroupName: "sub.example", Kept: 2}}, nil
+}
+
+func (a *stubAgent) SubRemove(id string) error   { a.subRemoved = id; return a.fail }
+func (a *stubAgent) SubList() []events.GroupInfo { return a.groups }
+
+func (a *stubAgent) NodeAdd(link string) (events.NodeInfo, error) {
+	a.nodeLink = link
+	if a.fail != nil {
+		return events.NodeInfo{}, a.fail
+	}
+	return events.NodeInfo{ID: "n9", Name: "Прага", Group: "manual", Supported: true}, nil
+}
+
+func (a *stubAgent) NodeRemove(id string) (string, error) {
+	a.nodeDropped = id
+	return a.fromGroup, a.fail
+}
+
 // env собирает окружение команды. Сокет агента заведомо не существует, пока
 // тест не позвал serveAgent: команды обязаны это переживать.
 func env(t *testing.T) (Env, *bytes.Buffer, *bytes.Buffer) {
@@ -41,18 +88,16 @@ func env(t *testing.T) (Env, *bytes.Buffer, *bytes.Buffer) {
 	dir := t.TempDir()
 	var out, errOut bytes.Buffer
 	return Env{
-		Out:      &out,
-		Err:      &errOut,
-		Socket:   filepath.Join(dir, "agent.sock"),
-		Service:  filepath.Join(dir, "service.sock"),
-		StoreDir: filepath.Join(dir, "store"),
-		Clock:    clock.NewFake(time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)),
+		Out:     &out,
+		Err:     &errOut,
+		Socket:  filepath.Join(dir, "agent.sock"),
+		Service: filepath.Join(dir, "service.sock"),
 	}, &out, &errOut
 }
 
 func serveAgent(t *testing.T, e Env, a events.Agent) *events.Server {
 	t.Helper()
-	srv, err := events.Serve(e.Socket, a)
+	srv, err := events.Serve(e.Socket, a, -1)
 	if err != nil {
 		t.Fatalf("Serve: %v", err)
 	}
@@ -169,21 +214,40 @@ func TestNodesTable(t *testing.T) {
 	}
 }
 
-// §С2 раньше §С3: узлы видны сразу после добавления подписки, до первого
-// подключения.
-func TestSubAddThenListWithoutAgent(t *testing.T) {
+// §С2: подписка добавляется и показывается через агента. Клиент своего стора
+// не открывает — ни на запись, ни на чтение (§3.3): под системным пользователем
+// `hop` он до каталога агента не достаёт (§6.8).
+func TestSubCommandsReachAgent(t *testing.T) {
 	e, out, _ := env(t)
-	e.Fetch = func(context.Context, string) ([]byte, string, error) {
-		return []byte("vless://11111111-1111-1111-1111-111111111111@a.example:443?type=ws&security=tls#Токио\n" +
-			"tuic://22222222-2222-2222-2222-222222222222@b.example:443#Осака\n"), "", nil
-	}
+	a := &stubAgent{groups: []events.GroupInfo{{
+		ID:        "ee8e3a30",
+		Name:      "sub.example",
+		Nodes:     2,
+		UpdatedAt: time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC),
+		SourceURL: "https://sub.example/list",
+	}}}
+	serveAgent(t, e, a)
 
 	if err := run(t, e, "sub", "add", "https://sub.example/list"); err != nil {
 		t.Fatalf("sub add: %v", err)
 	}
-	want := "подписка sub.example (ee8e3a30): добавлено 2, сохранено 0, удалено 0, не поддержано 1\n"
+	if a.subURL != "https://sub.example/list" {
+		t.Fatalf("до агента доехал адрес %q", a.subURL)
+	}
+	// Вторая строка — предупреждение C12: живой агент состав не перечитывает.
+	want := "подписка sub.example (ee8e3a30): добавлено 2, сохранено 0, удалено 0, не поддержано 1\n" +
+		"агент уже работает: новый состав узлов вступит в силу после hop down и hop up\n"
 	if out.String() != want {
 		t.Fatalf("sub add напечатал:\n%s\nожидалось:\n%s", out, want)
+	}
+
+	// --name доезжает до агента: имя группы выбирает пользователь (§5.8).
+	out.Reset()
+	if err := run(t, e, "sub", "add", "https://sub.example/list", "--name", "мои"); err != nil {
+		t.Fatalf("sub add --name: %v", err)
+	}
+	if a.subName != "мои" {
+		t.Fatalf("имя группы не доехало: %q", a.subName)
 	}
 
 	out.Reset()
@@ -197,75 +261,98 @@ ee8e3a30  sub.example  2      2026-08-10 12:00  https://sub.example/list
 		t.Fatalf("sub list напечатал:\n%s\nожидалось:\n%s", out, want)
 	}
 
-	// Тот же адрес второй раз — не вторая группа, а обновление: id считается от
-	// адреса, и история проб переживает его (§5.8).
 	out.Reset()
-	if err := run(t, e, "sub", "add", "https://sub.example/list"); err != nil {
-		t.Fatalf("повторный sub add: %v", err)
+	if err := run(t, e, "sub", "update"); err != nil {
+		t.Fatalf("sub update: %v", err)
 	}
-	if got := out.String(); !strings.Contains(got, "добавлено 0, сохранено 2") {
-		t.Fatalf("повторный sub add напечатал: %s", got)
+	if !strings.Contains(out.String(), "сохранено 2") {
+		t.Fatalf("sub update напечатал: %s", out)
 	}
 
 	out.Reset()
-	if err := run(t, e, "nodes"); err != nil {
-		t.Fatalf("nodes: %v", err)
+	if err := run(t, e, "sub", "rm", "ee8e3a30"); err != nil {
+		t.Fatalf("sub rm: %v", err)
 	}
-	got := out.String()
-	if !strings.Contains(got, "агент не запущен") || !strings.Contains(got, "Токио") ||
-		!strings.Contains(got, "Осака (не поддержан)") {
-		t.Fatalf("nodes без агента напечатал:\n%s", got)
+	if a.subRemoved != "ee8e3a30" || !strings.HasPrefix(out.String(), "подписка ee8e3a30 удалена\n") {
+		t.Fatalf("sub rm: агент получил %q, напечатано %q", a.subRemoved, out)
 	}
 }
 
-// Недоступная подписка не оставляет после себя пустую группу: иначе опечатка в
-// адресе навсегда поселяется в `sub list`.
-func TestSubAddKeepsNothingOnFetchError(t *testing.T) {
+// Пустой `sub list` — не пустой вывод: пользователю надо сказать, чем его
+// наполнить.
+func TestSubListEmpty(t *testing.T) {
 	e, out, _ := env(t)
-	e.Fetch = func(context.Context, string) ([]byte, string, error) {
-		return nil, "", errors.New("сеть недоступна")
-	}
-
-	if err := run(t, e, "sub", "add", "https://sub.example/list"); err == nil {
-		t.Fatal("sub add с недоступным адресом обязан быть ошибкой")
-	}
-	out.Reset()
+	serveAgent(t, e, &stubAgent{})
 	if err := run(t, e, "sub", "list"); err != nil {
 		t.Fatalf("sub list: %v", err)
 	}
 	if out.String() != "подписок нет: hop sub add <url>\n" {
-		t.Fatalf("в сторе осталось лишнее:\n%s", out)
+		t.Fatalf("sub list напечатал: %q", out)
 	}
 }
 
-// §С2: ссылка на отдельный узел уезжает в группу manual.
-func TestNodeAddAndRemove(t *testing.T) {
+// Отказ агента доезжает до пользователя отказом, а не пустым успехом.
+func TestSubAddReportsAgentError(t *testing.T) {
+	e, _, _ := env(t)
+	serveAgent(t, e, &stubAgent{fail: errors.New("сеть недоступна")})
+	err := run(t, e, "sub", "add", "https://sub.example/list")
+	if err == nil || !strings.Contains(err.Error(), "сеть недоступна") {
+		t.Fatalf("sub add с недоступным адресом вернул %v", err)
+	}
+}
+
+// §С2: ссылка на отдельный узел уезжает агенту, а тот кладёт её в manual.
+func TestNodeAddAndRemoveReachAgent(t *testing.T) {
 	e, out, _ := env(t)
+	a := &stubAgent{fromGroup: "ee8e3a30"}
+	serveAgent(t, e, a)
+
 	link := "vless://33333333-3333-3333-3333-333333333333@c.example:443?security=tls#Прага"
 	if err := run(t, e, "node", "add", link); err != nil {
 		t.Fatalf("node add: %v", err)
 	}
-	got := out.String()
-	if !strings.Contains(got, "(Прага), группа manual") {
+	if a.nodeLink != link {
+		t.Fatalf("ссылка до агента не доехала: %q", a.nodeLink)
+	}
+	if got := out.String(); !strings.Contains(got, "узел добавлен: n9 (Прага), группа manual") {
 		t.Fatalf("node add напечатал: %s", got)
 	}
-	id := strings.Fields(got)[2] // «узел <id> (Прага), группа manual»
 
 	out.Reset()
-	if err := run(t, e, "node", "rm", id); err != nil {
+	if err := run(t, e, "node", "rm", "n9"); err != nil {
 		t.Fatalf("node rm: %v", err)
 	}
-	if out.String() != "узел "+id+" удалён\n" {
-		t.Fatalf("node rm напечатал: %s", out)
+	if a.nodeDropped != "n9" {
+		t.Fatalf("id на удаление не доехал: %q", a.nodeDropped)
 	}
+	got := out.String()
+	if !strings.Contains(got, "узел n9 удалён") {
+		t.Fatalf("node rm напечатал: %s", got)
+	}
+	// Узел из подписки вернётся при следующем обновлении — молчать об этом
+	// нельзя, иначе удаление выглядит несработавшим.
+	if !strings.Contains(got, "hop sub update") {
+		t.Fatalf("про возврат узла из подписки не сказано: %s", got)
+	}
+}
 
-	out.Reset()
-	if err := run(t, e, "nodes"); err != nil {
-		t.Fatalf("nodes: %v", err)
+// Неподдержанный узел (§6.11) сохраняется, но об этом говорится сразу: иначе
+// пользователь ждёт от него подключения.
+func TestNodeAddWarnsOnUnsupported(t *testing.T) {
+	e, out, _ := env(t)
+	serveAgent(t, e, &unsupportedAgent{})
+	if err := run(t, e, "node", "add", "tuic://x@c.example:443#Осака"); err != nil {
+		t.Fatalf("node add: %v", err)
 	}
-	if strings.Contains(out.String(), "Прага") {
-		t.Fatalf("удалённый узел остался в списке:\n%s", out)
+	if !strings.Contains(out.String(), "в выборе не участвует") {
+		t.Fatalf("node add напечатал: %s", out)
 	}
+}
+
+type unsupportedAgent struct{ stubAgent }
+
+func (a *unsupportedAgent) NodeAdd(string) (events.NodeInfo, error) {
+	return events.NodeInfo{ID: "n9", Name: "Осака", Group: "manual", Supported: false}, nil
 }
 
 func TestBypassAndAutoReachAgent(t *testing.T) {
@@ -419,6 +506,14 @@ func TestArgumentErrors(t *testing.T) {
 func TestCommandsNeedAgent(t *testing.T) {
 	for _, args := range [][]string{
 		{"bypass", "--on"}, {"auto", "on"}, {"node", "ping", "n1"}, {"events", "--follow"},
+		// Шесть команд состава §С2 — тоже: стор живёт в агенте, и без агента
+		// править его нечем (§3.3). Прежде их делал сам процесс CLI (C12).
+		{"sub", "add", "https://sub.example/list"}, {"sub", "update"},
+		{"sub", "rm", "ee8e3a30"}, {"sub", "list"},
+		{"node", "add", "vless://x@c.example:443"}, {"node", "rm", "n1"},
+		// `nodes` показывал состав из стора, пока агент спал. Показывать его
+		// больше неоткуда, и молчаливый пустой список хуже отказа.
+		{"nodes"},
 	} {
 		e, _, _ := env(t)
 		if err := run(t, e, args...); !errors.Is(err, errNoAgent) {

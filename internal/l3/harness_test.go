@@ -167,8 +167,16 @@ type agent struct {
 }
 
 // commandAgent собирает команду агента, но не запускает её.
+//
+// Сокет клиентов, стор и группа задаются явно, а умолчания не берутся. С
+// системным пользователем (§6.8) умолчания у агента системные — /run/hop и
+// /var/lib/hop, — и стенд писал бы в состояние машины, а не в свой каталог.
+// Группа `hop` на чистом раннере не заведена вовсе, и `-group hop` уронил бы
+// агента ещё до сокета; здесь она не нужна — стенд ходит к агенту под тем же
+// пользователем.
 func commandAgent(t *testing.T, sock, tokenFile string) *exec.Cmd {
 	t.Helper()
+	dir := filepath.Dir(tokenFile)
 	cmd := exec.Command(hopAgent(t),
 		"-socket", sock,
 		"-ifname", ifname,
@@ -176,6 +184,9 @@ func commandAgent(t *testing.T, sock, tokenFile string) *exec.Cmd {
 		"-table", fmt.Sprint(table),
 		"-heartbeat", "200ms",
 		"-token-file", tokenFile,
+		"-client-socket", filepath.Join(dir, "agent.sock"),
+		"-store", filepath.Join(dir, "store"),
+		"-group", "",
 		"-debug",
 	)
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr

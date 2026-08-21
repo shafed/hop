@@ -4,12 +4,9 @@
 // выполняться этими командами. Вся логика живёт в агенте (§3.3), здесь только
 // разбор аргументов, один запрос в сокет агента и печать ответа.
 //
-// Два исключения из «тонкого клиента», оба вынужденные и записанные в
-// «Deviations» (C11, C12):
+// Одно исключение из «тонкого клиента», вынужденное и записанное в
+// «Deviations» (C11):
 //
-//   - подписки и узлы правятся прямо в сторе: `hop sub add` должен работать до
-//     первого `hop up`, то есть когда агента ещё нет вовсе (§С2 идёт раньше
-//     §С3);
 //   - при недоступном агенте `status` спрашивает сервис напрямую — иначе
 //     фаза `orphaned`, которую §2 обязывает показывать, не видна никому, а
 //     `down` не снимает осиротевший туннель.
@@ -27,11 +24,8 @@ import (
 	"io"
 	"os"
 
-	"github.com/shafed/hop/internal/clock"
 	"github.com/shafed/hop/internal/events"
 	"github.com/shafed/hop/internal/ipc"
-	"github.com/shafed/hop/internal/store"
-	"github.com/shafed/hop/internal/sub"
 )
 
 // Env — всё, от чего зависит команда. Швы (Fetch, Up, Down) существуют затем,
@@ -41,14 +35,13 @@ type Env struct {
 	Err io.Writer
 
 	// Socket — сокет агента (§3.3), Service — управляющий сокет сервиса (§3.1).
+	//
+	// Каталога стора здесь нет намеренно: клиент не открывает стор ни на
+	// запись, ни на чтение (§3.3), и под системным пользователем `hop` (§6.8)
+	// не смог бы. Всё, что он про узлы знает, он спросил у агента.
 	Socket  string
 	Service string
-	// StoreDir — каталог стора агента (§2).
-	StoreDir string
-	Clock    clock.Clock
 
-	// Fetch — загрузка подписки.
-	Fetch func(ctx context.Context, url string) (body []byte, quota string, err error)
 	// Up — запуск агента: блокирует, пока туннель жив. pin непуст — узел
 	// фиксируется сразу (§С3).
 	Up func(ctx context.Context, pin string) error
@@ -121,7 +114,7 @@ func Usage(w io.Writer) {
   node rm <id>
   node ping <id>          узлы поштучно
 
-глобальные флаги идут до команды: hop -store <каталог> nodes
+глобальные флаги идут до команды: hop -socket <путь> nodes
 `)
 }
 
@@ -137,12 +130,6 @@ func (e *Env) fill() {
 	}
 	if e.Service == "" {
 		e.Service = ipc.DefaultPath
-	}
-	if e.Clock == nil {
-		e.Clock = clock.System{}
-	}
-	if e.Fetch == nil {
-		e.Fetch = sub.Fetch
 	}
 }
 
@@ -164,13 +151,6 @@ func parse(fs *flag.FlagSet, args []string) error {
 // её формулирует вызывающий, потому что для одних команд это отказ, а для
 // других повод сходить в стор или к сервису.
 func dial(env Env) (*events.Client, error) { return events.Dial(env.Socket) }
-
-func openStore(env Env) (*store.Store, error) {
-	if env.StoreDir == "" {
-		return nil, errors.New("не задан каталог стора")
-	}
-	return store.Open(env.StoreDir)
-}
 
 // writeJSON — машинный вывод `--json`.
 func writeJSON(w io.Writer, v any) error {

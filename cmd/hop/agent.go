@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
-	"github.com/shafed/hop/internal/cli"
+	"github.com/shafed/hop/internal/catalog"
+	"github.com/shafed/hop/internal/clock"
 	"github.com/shafed/hop/internal/events"
 	"github.com/shafed/hop/internal/health"
 	"github.com/shafed/hop/internal/ipc"
@@ -24,6 +26,7 @@ type agentAPI struct {
 	sup *supervisor.Supervisor
 	cl  *ipc.Client
 	st  *store.Store
+	cat *catalog.Catalog
 
 	mu   sync.Mutex
 	auto bool
@@ -32,8 +35,8 @@ type agentAPI struct {
 var _ events.Agent = (*agentAPI)(nil)
 
 // newAgentAPI — автопереключение по умолчанию включено (§6.13).
-func newAgentAPI(sup *supervisor.Supervisor, cl *ipc.Client, st *store.Store) *agentAPI {
-	return &agentAPI{sup: sup, cl: cl, st: st, auto: true}
+func newAgentAPI(sup *supervisor.Supervisor, cl *ipc.Client, st *store.Store, clk clock.Clock) *agentAPI {
+	return &agentAPI{sup: sup, cl: cl, st: st, cat: catalog.New(st, clk, nil), auto: true}
 }
 
 func (a *agentAPI) Status() events.Status {
@@ -80,7 +83,7 @@ func (a *agentAPI) Nodes() []events.NodeInfo {
 	}
 	active := a.sup.Status().ActiveNode
 
-	list := cli.StoreNodes(a.st)
+	list := a.cat.Nodes()
 	for i := range list {
 		if h, ok := live[list[i].ID]; ok {
 			list[i].State = h.State
@@ -139,3 +142,26 @@ func (a *agentAPI) setAuto(on bool) {
 	a.auto = on
 	a.mu.Unlock()
 }
+
+// Состав узлов §С2 и §5.8 — целиком на стороне агента (§3.3). Клиент под своим
+// UID до стора не достаёт (§6.8), и всё, что он умеет, — назвать адрес или id.
+//
+// Контекста у этих вызовов нет: загрузку подписки агент доводит до конца
+// независимо от того, дождался ли клиент ответа. Пределы времени ставит сам
+// загрузчик (internal/sub).
+
+func (a *agentAPI) SubAdd(url, name string) (events.SubResult, error) {
+	return a.cat.SubAdd(context.Background(), url, name)
+}
+
+func (a *agentAPI) SubUpdate(groupID string) ([]events.SubResult, error) {
+	return a.cat.SubUpdate(context.Background(), groupID)
+}
+
+func (a *agentAPI) SubRemove(groupID string) error { return a.cat.SubRemove(groupID) }
+
+func (a *agentAPI) SubList() []events.GroupInfo { return a.cat.SubList() }
+
+func (a *agentAPI) NodeAdd(link string) (events.NodeInfo, error) { return a.cat.NodeAdd(link) }
+
+func (a *agentAPI) NodeRemove(nodeID string) (string, error) { return a.cat.NodeRemove(nodeID) }

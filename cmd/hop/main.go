@@ -19,7 +19,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -44,6 +43,7 @@ type options struct {
 	client string
 	token  string
 	store  string
+	group  string
 	beat   time.Duration
 	params tunnel.Params
 	mtu    int
@@ -63,6 +63,7 @@ func main() {
 		data   = flag.String("store", defaultStoreDir(), "каталог стора агента")
 		down   = flag.Bool("down", false, "снять туннель и выйти")
 		stat   = flag.Bool("status", false, "сырое состояние сервиса и выйти")
+		group  = flag.String("group", "hop", "группа, которой открыт сокет агента; пусто — только владелец (§3.3)")
 		debug  = flag.Bool("debug", false, "подробный лог")
 	)
 	flag.Usage = func() {
@@ -77,7 +78,7 @@ func main() {
 		level = slog.LevelDebug
 	}
 	opt := options{
-		sock: *sock, client: *client, token: *token, store: *data, beat: *beat, mtu: *mtu,
+		sock: *sock, client: *client, token: *token, store: *data, beat: *beat, mtu: *mtu, group: *group,
 		params: tunnel.Params{Name: *name, MTU: *mtu, Addr: *addr, Table: *table},
 		log:    slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})),
 	}
@@ -87,11 +88,10 @@ func main() {
 
 	if args := flag.Args(); len(args) > 0 {
 		env := cli.Env{
-			Socket:   opt.client,
-			Service:  opt.sock,
-			StoreDir: opt.store,
-			Up:       func(ctx context.Context, pin string) error { return runAgent(ctx, opt, pin) },
-			Down:     func() error { return stopTunnel(opt) },
+			Socket:  opt.client,
+			Service: opt.sock,
+			Up:      func(ctx context.Context, pin string) error { return runAgent(ctx, opt, pin) },
+			Down:    func() error { return stopTunnel(opt) },
 		}
 		if err := cli.Run(ctx, env, args); err != nil {
 			if !cli.IsUsage(err) {
@@ -177,7 +177,7 @@ func runAgent(ctx context.Context, opt options, pin string) error {
 		return err
 	}
 
-	api := newAgentAPI(sup, cl, st)
+	api := newAgentAPI(sup, cl, st, clock.System{})
 	if pin != "" {
 		// `hop up --node` (§С3): фиксация до старта, иначе первый же прогон проб
 		// успеет выбрать не тот узел.
@@ -186,9 +186,21 @@ func runAgent(ctx context.Context, opt options, pin string) error {
 		}
 	}
 
+	// Группа резолвится здесь, а не в main: она нужна одному агенту, который
+	// открывает ей свой сокет (§3.3). Резолви её main — и `hop status` на
+	// машине без группы `hop` падал бы, ни разу к агенту не сходив.
+	//
+	// Отсутствующая группа валит старт агента, а не понижается молча до 0600:
+	// поднятый сокет, к которому клиент не может подключиться, выглядит рабочим
+	// и не работает.
+	gid, err := ipc.LookupGID(opt.group)
+	if err != nil {
+		return err
+	}
+
 	// Сокет клиентов поднимается до Run: `hop status` обязан отвечать и в фазе
 	// starting, когда ни одна проба ещё не закончилась (§2).
-	srv, err := events.Serve(opt.client, api)
+	srv, err := events.Serve(opt.client, api, gid)
 	if err != nil {
 		return err
 	}
@@ -306,22 +318,6 @@ func forceOnSignal(ctx context.Context, sup *supervisor.Supervisor, log *slog.Lo
 			sup.Force(health.TriggerInterface)
 		}
 	}
-}
-
-// defaultStoreDir — каталог стора агента. Права 0700 выставляет сам стор
-// (§6.14): в узлах лежат ключи доступа.
-func defaultStoreDir() string {
-	if dir := os.Getenv("HOP_STORE"); dir != "" {
-		return dir
-	}
-	if dir := os.Getenv("XDG_DATA_HOME"); dir != "" {
-		return filepath.Join(dir, "hop")
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(os.TempDir(), "hop")
-	}
-	return filepath.Join(home, ".local", "share", "hop")
 }
 
 func fail(err error) {

@@ -27,6 +27,22 @@ type Agent interface {
 	Bypass(on bool)
 	// Ping — форс-проверка узла (§6.6) и его состояние после неё.
 	Ping(nodeID string) (NodeInfo, error)
+
+	// Состав узлов (§С2, §5.8). Стор принадлежит агенту целиком, и правит его
+	// тоже он: клиент под своим UID до каталога агента не достаёт (§3.3, §6.8).
+	//
+	// Контекста здесь нет намеренно. Загрузка подписки — работа агента, и
+	// доводит он её до конца независимо от того, дождался клиент ответа или
+	// ушёл по Ctrl-C: брошенная на середине, она оставила бы стор в состоянии,
+	// про которое никто не спрашивал.
+	SubAdd(url, name string) (SubResult, error)
+	SubUpdate(groupID string) ([]SubResult, error)
+	SubRemove(groupID string) error
+	SubList() []GroupInfo
+	NodeAdd(link string) (NodeInfo, error)
+	// NodeRemove возвращает id подписки, из которой узел пришёл, или пусто для
+	// ручного: узел из подписки вернётся при следующем обновлении.
+	NodeRemove(nodeID string) (string, error)
 }
 
 // Server — сокет клиентов агента.
@@ -40,16 +56,22 @@ type Server struct {
 
 // Serve поднимает сокет и начинает принимать клиентов.
 //
-// Права даёт каталог, а не сокет: net.Listen создаёт файл по umask, и chmod
-// после bind оставил бы окно, в котором сокет доступен лишним. Каталог 0700
-// (§6.14) закрывает и сокет, и лежащий рядом attach-token, и не требует
-// платформенных вызовов.
-func Serve(path string, a Agent) (*Server, error) {
+// Права даёт сам сокет, а не каталог. Прежде было наоборот: каталог 0700
+// закрывал и сокет, и лежащий рядом attach-token. Но агент работает под
+// системным пользователем (§6.8), а управляют им из группы `hop`, и каталог,
+// открытый группе, открыл бы ей заодно ключи — §6.14 требует ровно обратного:
+// членство в группе даёт сокет, но не каталог агента. Поэтому токен переехал в
+// свой приватный каталог, а здесь остались права одного файла.
+//
+// gid < 0 — группу не трогать: сокет остаётся у одного владельца. Так он
+// поднимается в отладке и на стенде.
+//
+// Порядок прав важен. Сначала umask даёт 0600, и только потом доступ
+// расширяется до группы: в промежутке сокет уже, чем задуман, а не шире.
+// Обратный порядок оставил бы окно, в котором он доступен лишним.
+func Serve(path string, a Agent, gid int) (*Server, error) {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, err
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
 	// Файл от прошлого сеанса: bind по существующему пути не проходит, а
@@ -58,7 +80,7 @@ func Serve(path string, a Agent) (*Server, error) {
 		return nil, err
 	}
 
-	ln, err := net.Listen("unix", path)
+	ln, err := listen(path, gid)
 	if err != nil {
 		return nil, fmt.Errorf("events: сокет клиентов: %w", err)
 	}
@@ -130,6 +152,39 @@ func (s *Server) dispatch(req Request) Response {
 			return Response{Error: err.Error()}
 		}
 		return Response{Node: &n}
+	case CmdSubAdd:
+		res, err := s.agent.SubAdd(req.URL, req.Name)
+		if err != nil {
+			return Response{Error: err.Error()}
+		}
+		return Response{Subs: []SubResult{res}}
+	case CmdSubUpdate:
+		res, err := s.agent.SubUpdate(req.Group)
+		if err != nil {
+			return Response{Error: err.Error()}
+		}
+		return Response{Subs: res}
+	case CmdSubRemove:
+		if err := s.agent.SubRemove(req.Group); err != nil {
+			return Response{Error: err.Error()}
+		}
+		return Response{}
+	case CmdSubList:
+		return Response{Groups: s.agent.SubList()}
+	case CmdNodeAdd:
+		n, err := s.agent.NodeAdd(req.Link)
+		if err != nil {
+			return Response{Error: err.Error()}
+		}
+		return Response{Node: &n}
+	case CmdNodeRm:
+		from, err := s.agent.NodeRemove(req.Node)
+		if err != nil {
+			return Response{Error: err.Error()}
+		}
+		// Имя подписки уезжает полем Group запроса-эха: отдельного поля ради
+		// одной строки в Response заводить не за что.
+		return Response{Groups: []GroupInfo{{ID: from}}}
 	default:
 		return Response{Error: fmt.Sprintf("events: неизвестная команда %q", req.Cmd)}
 	}
