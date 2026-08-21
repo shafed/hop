@@ -156,6 +156,69 @@ func TestNoReplyToRST(t *testing.T) {
 	}
 }
 
+// TestDNSInOrphanedRefusesEvenToLocalRouter — ГЕНУИННЫЙ ПРОБЕЛ, найден при
+// спот-чеке ветки против main (21df748, T23c — SPEC.md §8.4, PLAN.md §0), не
+// исправлен.
+//
+// Стык §5.7б с §6.2: hijack-dns ставит перехват :53 выше bypass, поэтому в
+// нормальной работе запрос на локальный роутер уходит через активный узел, а
+// не провайдеру. В orphaned запрос приходит уже на устройство, и по адресу
+// это RFC1918 — то есть, по буквальному чтению isLocal(), исключение §5.6.
+// Если считать его исключением, приложение получает не отказ, а полный
+// таймаут резолвера на каждое имя вместо мгновенного ICMP/RST — именно то,
+// против чего написан §5.6 в первую очередь.
+//
+// На этой ветке Excluded() (reject.go) проверяет isLocal(dst) без учёта
+// порта: DNS-запрос на 192.168.1.1:53 классифицируется как исключение точно
+// так же, как HTTP на 192.168.1.1:80. Подтверждено прогоном: с этим тестом
+// без t.Skip Excluded() возвращает true и Reply() — nil для DNS на локальный
+// роутер.
+//
+// Не исправлено намеренно: правка Excluded() — это решение, требующее
+// понимания, как именно она должна отличать «DNS к локальному роутеру» от
+// «DNS к 8.8.8.8» (порт 53 сам по себе недостаточен — DNS к настоящему
+// публичному резолверу обязан отвергаться так же, как любой другой трафик,
+// а к локальному — тоже отвергаться, только по другой причине: у него нет
+// перехватчика в orphaned). Это продакшен-логика, а не тест, и не в рамках
+// спот-чека.
+func TestDNSInOrphanedRefusesEvenToLocalRouter(t *testing.T) {
+	t.Skip("известный пробел: Excluded() проверяет isLocal(dst) без учёта порта — " +
+		"DNS на локальный роутер (RFC1918:53) ошибочно считается исключением §5.6 " +
+		"и проходит без ответа вместо ICMP/RST; см. комментарий к тесту")
+
+	router := ap("192.168.1.1:53")
+
+	dev := packettest.NewFake(1400)
+	done := make(chan error, 1)
+	go func() { done <- Serve(dev) }()
+
+	dev.Inject(
+		packettest.UDP(client, router, []byte("query")),
+		packettest.TCPSyn(client, router, 1000),
+	)
+
+	emitted := dev.WaitEmitted(t, 2)
+	dev.Close()
+	if err := <-done; err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+
+	icmp := header.ICMPv4(header.IPv4(emitted[0]).Payload())
+	if icmp.Type() != header.ICMPv4DstUnreachable || icmp.Code() != header.ICMPv4PortUnreachable {
+		t.Fatalf("на DNS по UDP ответ не ICMP port unreachable: % x", emitted[0])
+	}
+	rst := header.IPv4(emitted[1])
+	if header.TCP(rst.Payload()).Flags()&header.TCPFlagRst == 0 {
+		t.Fatalf("на DNS по TCP ответ не RST: % x", emitted[1])
+	}
+
+	// Остальной локальный трафик исключением быть не перестал: иначе в
+	// orphaned ломается печать, Bonjour и всё, ради чего §6.10 их выпускает.
+	if !Excluded(packettest.TCPSyn(client, ap("192.168.1.1:80"), 1)) {
+		t.Fatal("локальный трафик перестал быть исключением §5.6")
+	}
+}
+
 // Мусор с границы не должен ронять привилегированный процесс.
 func TestGarbageIsIgnored(t *testing.T) {
 	for _, pkt := range [][]byte{
