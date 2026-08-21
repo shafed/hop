@@ -178,6 +178,13 @@ type harness struct {
 
 func newHarness(t *testing.T, ids ...string) *harness {
 	t.Helper()
+	return newHarnessCfg(t, nil, ids...)
+}
+
+// newHarnessCfg — тот же стенд с правкой конфига до сборки: стартовое окно Р5
+// приходится укорачивать, иначе его потолок недостижим раньше таймаута пробы.
+func newHarnessCfg(t *testing.T, tweak func(*Config), ids ...string) *harness {
+	t.Helper()
 
 	h := &harness{
 		t:      t,
@@ -192,13 +199,17 @@ func newHarness(t *testing.T, ids ...string) *harness {
 		nodes = append(nodes, node.Node{ID: id, Supported: true})
 	}
 
-	sup, err := New(Config{
+	cfg := Config{
 		Device:   h.dev,
 		Nodes:    nodes,
 		Clock:    h.clk,
 		Outbound: h.out,
 		Prober:   h.prober,
-	})
+	}
+	if tweak != nil {
+		tweak(&cfg)
+	}
+	sup, err := New(cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -532,4 +543,73 @@ func tcpOf(p []byte) (header.TCP, bool) {
 		return nil, false
 	}
 	return header.TCP(payload), true
+}
+
+// A15/A16 — стартовое окно Р5 (docs/verification-autoswitch.md).
+//
+// «Живых нет» и «ещё никого не спросили» — разные вещи, и healthy() обязан их
+// различать: свежий монитор пуст, и без окна первый же пакет после `hop up`
+// получал бы RST по §5.6 в те секунды, пока идёт первый обход подписки.
+//
+// Узлы здесь висят (§8.1, blackhole): проба началась и не кончится, то есть об
+// узлах нет ни одного исхода — ровно то состояние, ради которого окно и есть.
+// Force поэтому уходит в горутину: он ждёт конца раунда, а раунд на фейковых
+// часах кончится только с таймаутом пробы.
+func TestStartupGraceHoldsTrafficUntilFirstRound(t *testing.T) {
+	h := newHarness(t, "A", "B")
+	h.prober.hang("A")
+	h.prober.hang("B")
+	go h.sup.Force(health.TriggerInterface)
+	h.prober.waitStart(t, "A")
+
+	if h.sup.mon.HasAlive() {
+		t.Fatal("узел жив, хотя ни одна проба не ответила — стенд собран не так")
+	}
+	if !h.sup.healthy() {
+		t.Fatal("healthy() == false в стартовом окне: трафик получит RST вместо ожидания (Р5)")
+	}
+}
+
+// A16 — потолок окна. Узел за blackhole не отвечает никогда, и без бюджета окно
+// осталось бы открытым навсегда: это fail-open, которого §5.6 не даёт.
+//
+// Бюджет здесь короче таймаута пробы намеренно: иначе к его концу пробы уже
+// снялись бы по таймауту, окно закрылось бы по «все ответили», и потолок
+// остался бы непроверенным.
+func TestStartupGraceEndsWithBudget(t *testing.T) {
+	const budget = 500 * ms
+	h := newHarnessCfg(t, func(c *Config) { c.StartupBudget = budget }, "A", "B")
+	h.prober.hang("A")
+	h.prober.hang("B")
+	go h.sup.Force(health.TriggerInterface)
+	h.prober.waitStart(t, "A")
+
+	if !h.sup.healthy() {
+		t.Fatal("healthy() == false до истечения бюджета — окно не открылось (Р5)")
+	}
+	h.clk.Advance(budget)
+
+	if len(h.sup.mon.Get("A").Window) != 0 {
+		t.Fatal("узел успел ответить: тест померил бы «все ответили», а не потолок")
+	}
+	if h.sup.healthy() {
+		t.Fatal("healthy() == true после истечения стартового бюджета: fail-close не наступил (Р5)")
+	}
+}
+
+// Окно закрывается и раньше бюджета — как только о каждом поддержанном узле
+// есть исход и ни один не жив. Иначе отказ всей подписки был бы виден лишь
+// через тридцать секунд после того, как он уже доказан.
+//
+// Одной неудачи из трёх мало для смерти по §6.3, и узел остаётся в состоянии
+// untested — но ответ от него уже есть, и ждать больше нечего.
+func TestStartupGraceEndsWhenEveryNodeAnswered(t *testing.T) {
+	h := newHarness(t, "A", "B")
+	h.prober.dead("A")
+	h.prober.dead("B")
+	h.sup.Force(health.TriggerInterface)
+
+	if h.sup.healthy() {
+		t.Fatal("healthy() == true, хотя каждый узел ответил отказом: окно не закрылось по завершению обхода (Р5)")
+	}
 }

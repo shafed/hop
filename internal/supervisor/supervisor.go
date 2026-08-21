@@ -75,6 +75,8 @@ type Config struct {
 	Schedule health.ScheduleConfig
 	// Probes — пробе-таргеты §5.4; пусто — DefaultProbes.
 	Probes []health.Target
+	// StartupBudget — потолок стартового окна (Р5). Ноль — DefaultStartupBudget.
+	StartupBudget time.Duration
 
 	// Outbound и Prober — швы §8.1. nil означает продукт: движок Xray и пробер
 	// по нескольким URL.
@@ -108,6 +110,11 @@ type Event struct {
 // быть занят.
 const subBuffer = 64
 
+// DefaultStartupBudget — потолок стартового окна Р5. Тридцати секунд хватает
+// на обход подписки в 200 узлов по расписанию §6.5; дальше молчание узлов уже
+// не «ещё не спросили», а отказ, и §5.6 требует его показать.
+const DefaultStartupBudget = 30 * time.Second
+
 // Supervisor — сам агент.
 type Supervisor struct {
 	clk   clock.Clock
@@ -121,6 +128,12 @@ type Supervisor struct {
 	// candidates — поддержанные узлы (§6.11) в порядке стора.
 	candidates []string
 	switches   <-chan health.Switch
+
+	// budget — потолок стартового окна (Р5), started — его начало, ставится
+	// в Run. До Run started нулевой, и окно закрыто: healthy() у несобранного
+	// агента обязан отвечать честно.
+	budget  time.Duration
+	started time.Time
 
 	mu         sync.Mutex
 	running    bool
@@ -166,6 +179,9 @@ func New(cfg Config) (*Supervisor, error) {
 	if cfg.Schedule.Active <= 0 {
 		cfg.Schedule = health.DefaultScheduleConfig()
 	}
+	if cfg.StartupBudget <= 0 {
+		cfg.StartupBudget = DefaultStartupBudget
+	}
 
 	mon := health.NewMonitor(cfg.Monitor, cfg.Clock)
 
@@ -179,10 +195,11 @@ func New(cfg Config) (*Supervisor, error) {
 	}
 
 	s := &Supervisor{
-		clk: cfg.Clock,
-		mon: mon,
-		sel: health.NewSelector(mon, cfg.Selector, cfg.Clock),
-		out: out,
+		clk:    cfg.Clock,
+		mon:    mon,
+		sel:    health.NewSelector(mon, cfg.Selector, cfg.Clock),
+		out:    out,
+		budget: cfg.StartupBudget,
 	}
 	for _, n := range cfg.Nodes {
 		if n.Supported {
@@ -255,6 +272,9 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if err := s.out.Start(); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	s.started = s.clk.Now()
+	s.mu.Unlock()
 	s.setRunning(true)
 
 	netErr := make(chan error, 1)
@@ -389,7 +409,40 @@ func (s *Supervisor) dialTCP(ctx context.Context, dst netip.AddrPort) (net.Conn,
 //
 // Обход — это и есть единственный разрешённый fail-open (§5.6): пока он
 // выключен, отсутствие живых узлов закрывает и трафик, и DNS.
-func (s *Supervisor) healthy() bool { return s.mon.HasAlive() || s.bypassed() }
+func (s *Supervisor) healthy() bool {
+	return s.mon.HasAlive() || s.bypassed() || s.inStartupGrace()
+}
+
+// inStartupGrace — стартовое окно Р5.
+//
+// Fail-close наступает, когда каждый поддержанный узел (§6.11) проверен хотя
+// бы раз и ни один не жив, либо истёк бюджет — что раньше. Без этого окна
+// «живых нет» неотличимо от «ещё никого не спросили»: свежий монитор пуст, и
+// первый же пакет после `hop up` получал бы RST в те секунды, пока идёт
+// первый обход подписки, — то есть fail-close по §5.6 срабатывал бы там, где
+// отказа ещё не было.
+//
+// Бюджет нужен на случай, когда обход не кончается вовсе: узел за blackhole
+// не отвечает и остаётся untested, а без потолка окно осталось бы открытым
+// навсегда — это уже fail-open, которого §5.6 не разрешает.
+func (s *Supervisor) inStartupGrace() bool {
+	s.mu.Lock()
+	started := s.started
+	s.mu.Unlock()
+
+	if started.IsZero() || s.clk.Now().Sub(started) >= s.budget {
+		return false
+	}
+	for _, id := range s.candidates {
+		// Пустое окно — «об узле нет ни одного исхода», и это не то же самое,
+		// что состояние Untested: узел с одной неудачей из трёх (§6.3) тоже
+		// untested, но он уже ответил, и ждать его больше нечего.
+		if len(s.mon.Get(id).Window) == 0 {
+			return true
+		}
+	}
+	return false
+}
 
 // watch — приёмник событий переключения.
 func (s *Supervisor) watch(ctx context.Context) {
