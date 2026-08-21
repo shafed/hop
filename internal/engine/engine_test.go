@@ -391,6 +391,14 @@ func fakeNode(id string, addr netip.AddrPort) node.Node { return vlessNodeSpec(i
 
 // vlessNode поднимает настоящий VLESS-инбаунд Xray в этом же процессе:
 // свободный выход наружу через freedom. Это «узел» стенда §8.1.
+//
+// `finalRules: allow` обязателен. С версии xray-core
+// v1.260327.1-0.20260819053144 freedom подставляет за инбаундом vless правило
+// по умолчанию «блокировать приватные адреса» (`getDefaultFinalRule`,
+// `proxy/freedom/freedom.go:154`), а блокировка там не отказ, а blackhole на
+// 30–90 секунд. Сайт стенда живёт на 127.0.0.1, то есть ровно в приватном
+// диапазоне, и без этого правила тесты узла висят до таймаута вместо ответа.
+// Правило сужено до loopback: приватные адреса вообще узел глушить обязан.
 func vlessNode(t *testing.T) netip.AddrPort {
 	t.Helper()
 	port := freePort(t)
@@ -403,7 +411,11 @@ func vlessNode(t *testing.T) netip.AddrPort {
 	    "protocol": "vless",
 	    "settings": {"clients": [{"id": %q}], "decryption": "none"}
 	  }],
-	  "outbounds": [{"tag": "out", "protocol": "freedom"}]
+	  "outbounds": [{
+	    "tag": "out",
+	    "protocol": "freedom",
+	    "settings": {"finalRules": [{"action": "allow", "ip": ["127.0.0.0/8"]}]}
+	  }]
 	}`, port, testUUID)
 
 	pb, err := serial.LoadJSONConfig(strings.NewReader(cfg))
