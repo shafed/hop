@@ -255,12 +255,22 @@ func (h *harness) waitSwitch() health.Switch {
 	}
 }
 
+// force — форс-проверка как отдельное событие сети (§6.6). Часы сдвигаются за
+// окно склейки: два события в одно и то же мгновение фейковых часов — это для
+// расписания один залп, оно склеит их в один прогон, и второй проверки не
+// будет. Тесту же нужны именно два прогона.
+func (h *harness) force() {
+	h.t.Helper()
+	h.clk.Advance(health.DefaultScheduleConfig().ForceDebounce)
+	h.sup.Force(health.TriggerInterface)
+}
+
 // start приводит агента в рабочее состояние: узлы живы, активным стал первый.
 func (h *harness) start(first, second string) {
 	h.t.Helper()
 	h.prober.alive(first, 10*ms)
 	h.prober.alive(second, 200*ms)
-	h.sup.Force(health.TriggerInterface)
+	h.force()
 
 	sw := h.waitSwitch()
 	if sw.To != first {
@@ -289,8 +299,8 @@ func TestDeadSwitchInterruptsConnections(t *testing.T) {
 
 	h.prober.dead("A")
 	// Две неудачи из трёх — политика смерти §6.3.
-	h.sup.Force(health.TriggerInterface)
-	h.sup.Force(health.TriggerInterface)
+	h.force()
+	h.force()
 
 	sw := h.waitSwitch()
 	if sw.To != "B" || sw.Reason != health.ReasonDead {
@@ -317,7 +327,7 @@ func TestFasterSwitchKeepsConnections(t *testing.T) {
 	// A деградировал, B стал быстрее больше чем на tolerance (§6.4).
 	h.prober.alive("A", 100*ms)
 	h.prober.alive("B", 10*ms)
-	h.sup.Force(health.TriggerInterface)
+	h.force()
 
 	sw := h.waitSwitch()
 	if sw.To != "B" || sw.Reason != health.ReasonFaster {
@@ -451,8 +461,8 @@ func TestNoAliveNodesRejectsNewFlows(t *testing.T) {
 
 	h.prober.dead("A")
 	h.prober.dead("B")
-	h.sup.Force(health.TriggerInterface)
-	h.sup.Force(health.TriggerInterface)
+	h.force()
+	h.force()
 
 	sw := h.waitSwitch()
 	if sw.To != "" {
@@ -499,7 +509,7 @@ func TestNodeSwitchFlushesDNSCache(t *testing.T) {
 
 	h.prober.alive("A", 100*ms)
 	h.prober.alive("B", 10*ms)
-	h.sup.Force(health.TriggerInterface)
+	h.force()
 	if sw := h.waitSwitch(); sw.To != "B" {
 		t.Fatalf("переключение %+v, ожидалось на B", sw)
 	}
@@ -607,7 +617,7 @@ func TestStartupGraceEndsWhenEveryNodeAnswered(t *testing.T) {
 	h := newHarness(t, "A", "B")
 	h.prober.dead("A")
 	h.prober.dead("B")
-	h.sup.Force(health.TriggerInterface)
+	h.force()
 
 	if h.sup.healthy() {
 		t.Fatal("healthy() == true, хотя каждый узел ответил отказом: окно не закрылось по завершению обхода (Р5)")

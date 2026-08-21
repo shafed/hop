@@ -49,16 +49,43 @@ type URLProber struct {
 	dial    DialFunc
 	targets []Target
 	clk     clock.Clock
+	hedge   time.Duration
 }
+
+// DefaultProbeHedge — сколько ждём молчащий таргет, прежде чем параллельно
+// пустить следующий.
+//
+// Триста миллисекунд заведомо больше латентности рабочего узла и заведомо
+// меньше ProbeTimeout: здоровый таргет успевает ответить раньше, и второе
+// соединение не открывается вовсе — иначе цена пробы удвоилась бы на каждой
+// пробе здоровой подписки и вышла за бюджет §6.5 (B2, §8.6).
+const DefaultProbeHedge = 300 * time.Millisecond
 
 var _ Prober = (*URLProber)(nil)
 
 // NewURLProber создаёт пробер по списку таргетов.
 func NewURLProber(dial DialFunc, targets []Target, clk clock.Clock) *URLProber {
-	return &URLProber{dial: dial, targets: append([]Target(nil), targets...), clk: clk}
+	return &URLProber{
+		dial:    dial,
+		targets: append([]Target(nil), targets...),
+		clk:     clk,
+		hedge:   DefaultProbeHedge,
+	}
 }
 
 // Probe гоняет пробу через узел nodeID.
+//
+// Таргеты опрашиваются с подстраховкой, а не строго по очереди: первый идёт
+// сразу, следующий пускается параллельно, если предыдущий не ответил за hedge.
+// Успех — первый ответивший, то есть быстрейший из запущенных; узел мёртв,
+// только если не ответил ни один.
+//
+// Строгая очередь давала ложную смерть: таргет, который не отвечает вовсе
+// (цензура, роняющая пакеты, а не отдающая отказ), съедал весь ProbeTimeout, и
+// до второго, рабочего, дело не доходило. Полный параллелизм эту дыру тоже
+// закрывает, но платит вторым соединением на каждой пробе — цена пробы
+// удваивается на здоровой подписке и выходит за бюджет §6.5. Подстраховка
+// платит только там, где первый таргет действительно молчит.
 func (p *URLProber) Probe(ctx context.Context, nodeID string) Result {
 	targets := p.targets
 	if !policy.MultiURL.On() && len(targets) > 1 {
@@ -68,20 +95,65 @@ func (p *URLProber) Probe(ctx context.Context, nodeID string) Result {
 		return Result{Err: errors.New("health: список пробе-таргетов пуст")}
 	}
 
+	// Отмена на выходе снимает те пробы, которые ещё в полёте: вернувшись по
+	// первому успеху, мы обязаны не оставить за собой висящих соединений.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type outcome struct {
+		rtt time.Duration
+		err error
+	}
+	done := make(chan outcome, len(targets))
+	var started, finished int
+	launch := func() {
+		t := targets[started]
+		started++
+		go func() {
+			rtt, err := p.probeOne(ctx, nodeID, t)
+			done <- outcome{rtt: rtt, err: err}
+		}()
+	}
+	launch()
+
 	var last error
-	for _, t := range targets {
-		rtt, err := p.probeOne(ctx, nodeID, t)
-		if err == nil {
-			return Result{RTT: rtt}
+	for {
+		// Таймер подстраховки взводится заново на каждом витке и только пока
+		// есть кого пускать.
+		var hedge <-chan time.Time
+		if started < len(targets) {
+			hedge = p.clk.After(p.hedgeDelay())
 		}
-		last = err
-		if ctx.Err() != nil {
-			// Прогон отменён или вышло время: остальные таргеты ответить уже
-			// не успеют, а исход обязан остаться таймаутом, а не отказом.
+		select {
+		case o := <-done:
+			finished++
+			if o.err == nil {
+				return Result{RTT: o.rtt}
+			}
+			last = o.err
+			if ctx.Err() != nil {
+				// Прогон отменён или вышло время: остальные ответить уже не
+				// успеют, а исход обязан остаться таймаутом, а не отказом.
+				return Result{Err: ctx.Err()}
+			}
+			if started < len(targets) {
+				launch() // отказавший освободил место — не ждём подстраховки
+			} else if finished == started {
+				return Result{Err: last}
+			}
+		case <-hedge:
+			launch()
+		case <-ctx.Done():
 			return Result{Err: ctx.Err()}
 		}
 	}
-	return Result{Err: last}
+}
+
+func (p *URLProber) hedgeDelay() time.Duration {
+	if p.hedge <= 0 {
+		return DefaultProbeHedge
+	}
+	return p.hedge
 }
 
 // probeOne — один таргет: GET и ожидание 2xx. Ответ 403 — это отказ узла в
@@ -163,6 +235,9 @@ type ScheduleConfig struct {
 	// выключает подтверждение целиком: мгновенный повтор той же пробы — не
 	// второе свидетельство, а то же самое, и §6.3 от него ничего не получает.
 	ConfirmDelay time.Duration
+	// ForceDebounce — окно склейки форс-событий (§6.6). Ноль выключает склейку:
+	// каждое событие даёт свой прогон.
+	ForceDebounce time.Duration
 }
 
 // DefaultScheduleConfig — стартовые значения §6.5. Проверяются численно
@@ -181,6 +256,10 @@ func DefaultScheduleConfig() ScheduleConfig {
 		// секунды, активным всё равно не годится.
 		ProbeTimeout: 2 * time.Second,
 		ConfirmDelay: 500 * time.Millisecond,
+		// Одна смена сети — это залп событий, а не одно: интерфейс, маршрут и
+		// адрес приезжают порознь за доли секунды. Секунда склеивает залп в
+		// один прогон и не склеивает два разных переключения сети.
+		ForceDebounce: time.Second,
 	}
 }
 
@@ -217,6 +296,9 @@ type Scheduler struct {
 	pool   []string
 	rest   []string
 	next   map[string]time.Time // когда узел снова подлежит пробе
+	// lastForce — когда форс-событие в последний раз довело дело до прогона.
+	// По нему работает склейка (§6.6).
+	lastForce time.Time
 }
 
 // NewScheduler собирает расписание. Исходы проб уезжают в монитор, пересчёт
@@ -321,6 +403,18 @@ func (s *Scheduler) Force(t Trigger) {
 	for _, id := range s.hotLocked() {
 		s.next[id] = now
 	}
+	// Склейка залпа. Срок узлам проставлен выше в любом случае — склеиваются
+	// прогоны, а не намерение: подавленное событие ничего не теряет, его узлы
+	// уже подлежат пробе и уйдут в ближайший прогон.
+	//
+	// Первое событие проходит всегда: §6.6 требует прогона без единого тика, и
+	// склейка по заднему фронту сделала бы «немедленно» неотличимым от «на
+	// следующем тике» (это краснит T6).
+	if d := s.cfg.ForceDebounce; d > 0 && !s.lastForce.IsZero() && now.Sub(s.lastForce) < d {
+		s.mu.Unlock()
+		return
+	}
+	s.lastForce = now
 	s.mu.Unlock()
 
 	s.Sweep(context.Background())

@@ -118,6 +118,11 @@ func (m *Monitor) Observe(nodeID string, r Result) {
 	} else {
 		h.RTT = r.RTT
 		h.LastError = ""
+		// Успешная проба обнуляет счётчик трафика ровно как ReportSuccess
+		// (§5.4: проба и трафик — одно свидетельство о живости). Иначе
+		// `hop nodes` показывает ошибки на узле, который час как жив: сам
+		// выбор при этом верен, врёт только то, что видит пользователь.
+		h.TrafficFailures = 0
 		died = m.pushLocked(h, OK)
 	}
 	m.mu.Unlock()
