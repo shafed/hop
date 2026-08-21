@@ -218,7 +218,9 @@ func (l *Linux) Up(p tunnel.Params) (tunnel.Device, error) {
 // что правило защиты не привязано к интерфейсу и переживает смерть сервиса
 // (T29): убирать его надо тем же способом, что и всё остальное.
 func (l *Linux) applyGuard(uid int) error {
-	guard, err := loopguard.New(loopguard.Params{AgentUID: uid})
+	// Порог служебных UID спрашивается у машины, а не зашит: §6.8 отказывает,
+	// если UID агента оказался UID человека, и граница у машины своя.
+	guard, err := loopguard.New(loopguard.Params{AgentUID: uid, SystemUIDMax: loopguard.SysUIDMax()})
 	if err != nil {
 		return err
 	}

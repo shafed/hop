@@ -10,7 +10,13 @@ import (
 )
 
 const (
-	agentUID = 4242
+	// agentUID — UID системного пользователя `hop`, под которым агент работает
+	// по §1 С1. Число само по себе неважно, важно, что оно ниже sysUIDMax.
+	agentUID = 972
+	// sysUIDMax — SYS_UID_MAX из /etc/login.defs: граница, ниже которой живут
+	// служебные учётки, а выше — люди. Порог отдаёт сервис, а не план: план —
+	// данные, и от файлов машины он зависеть не должен.
+	sysUIDMax = 999
 	// bindIface — что подставной определитель отвечает вместо ядра. Тест
 	// смотрит на решение защиты, а не на сеть машины, иначе он проходил бы
 	// только там, где интерфейс называется так же.
@@ -34,7 +40,7 @@ func (r *recorder) run(args []string) error {
 // applied строит план и прогоняет его через подставного исполнителя.
 func applied(t *testing.T, goos string) (Plan, *recorder, *netstate.Journal) {
 	t.Helper()
-	pl, err := plan(goos, Params{AgentUID: agentUID}, fakeLookup)
+	pl, err := plan(goos, Params{AgentUID: agentUID, SystemUIDMax: sysUIDMax}, fakeLookup)
 	if err != nil {
 		t.Fatalf("%s: план не построен: %v", goos, err)
 	}
@@ -77,7 +83,7 @@ func TestT25NoLoopOnNodeDial(t *testing.T) {
 			if goos == "linux" {
 				// Правило уводит трафик агента в main — туда, где живёт
 				// настоящий маршрут к узлу, а не в таблицу туннеля.
-				if !hasCmd(rec.done, "rule add", "uidrange 4242-4242", "lookup main") {
+				if !hasCmd(rec.done, "rule add", "uidrange 972-972", "lookup main") {
 					t.Fatalf("трафик агента не выведен мимо туннеля, поставлено: %v", rec.done)
 				}
 				if pl.Bind != "" {
@@ -211,5 +217,84 @@ func TestBindLookupFailureFailsPlan(t *testing.T) {
 	boom := errors.New("дефолтного маршрута нет")
 	if _, err := plan("darwin", Params{}, func() (string, error) { return "", boom }); !errors.Is(err, boom) {
 		t.Fatalf("план построился без имени интерфейса: %v", err)
+	}
+}
+
+// Правило §6.8 выводит мимо туннеля всех, кто работает под его UID. Пока это
+// UID системного агента, оно исключает известную личность — ровно то, ради
+// чего заведено. Подставь ему UID живого человека, и мимо туннеля уйдёт весь
+// пользователь целиком: правило стоит на 30000, туннельное — на 32000, разбор
+// идёт по возрастанию, и до туннельной таблицы дело не доходит никогда.
+//
+// Дефект наблюдался в поле, не выведен рассуждением (C25): туннель поднят,
+// узел выбран, `hop status` зелёный, а локальный адрес сокета — адрес wlan0.
+//
+// Отказ вслух, а не молчаливо не поставленное правило: без правила исходящее
+// агента к узлу возвращается в собственный TUN и наматывается само на себя —
+// это T25. Молчание обменяло бы одну тихую утечку на другую.
+func TestInteractiveUIDIsRefused(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		p    Params
+		ok   bool
+	}{
+		{"системный UID агента — та самая известная личность", Params{AgentUID: agentUID, SystemUIDMax: sysUIDMax}, true},
+		{"граница включительно: SYS_UID_MAX ещё системный", Params{AgentUID: sysUIDMax, SystemUIDMax: sysUIDMax}, true},
+		{"первый интерактивный UID — уже человек", Params{AgentUID: sysUIDMax + 1, SystemUIDMax: sysUIDMax}, false},
+		{"UID из поля, тот самый", Params{AgentUID: 1000, SystemUIDMax: 999}, false},
+		// Root проходит: интерактивным пользователем он не является, а стенд L3
+		// (§8.4) поднимает агента именно под root — `sudo unshare -n`. Личность
+		// агента в продукте закрепляет упаковка (§1 С1), а не этот план.
+		{"root — не человек, стенд L3 работает под ним", Params{AgentUID: 0, SystemUIDMax: sysUIDMax}, true},
+		{"порог не задан — закрываемся, а не открываемся", Params{AgentUID: agentUID}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			pl, err := plan("linux", c.p, fakeLookup)
+			if c.ok {
+				if err != nil {
+					t.Fatalf("системный UID %d отвергнут: %v", c.p.AgentUID, err)
+				}
+				rec := &recorder{}
+				if err := Apply(&netstate.Journal{}, pl, rec.run); err != nil {
+					t.Fatalf("план не поставлен: %v", err)
+				}
+				if !hasCmd(rec.done, "rule add", "uidrange") {
+					t.Fatalf("правило §6.8 не поставлено: %v", rec.done)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("UID %d при пороге %d принят — мимо туннеля уйдёт весь пользователь",
+					c.p.AgentUID, c.p.SystemUIDMax)
+			}
+		})
+	}
+}
+
+// Порог берётся из /etc/login.defs — там его держит сама машина, и там же его
+// правит администратор, заводя нестандартную нумерацию учёток.
+func TestSysUIDMaxIsReadFromLoginDefs(t *testing.T) {
+	const defs = `# комментарии и пустые строки — мимо
+UID_MIN			 1000
+#SYS_UID_MAX		  111
+SYS_UID_MIN		  500
+SYS_UID_MAX		  899
+`
+	if got := parseSysUIDMax(strings.NewReader(defs)); got != 899 {
+		t.Fatalf("SYS_UID_MAX = %d, в файле 899", got)
+	}
+
+	// Закомментированная строка — не значение: иначе порог уехал бы на 111,
+	// и системный агент с UID выше него получил бы отказ на ровном месте.
+	if got := parseSysUIDMax(strings.NewReader("#SYS_UID_MAX 111\n")); got != DefaultSysUIDMax {
+		t.Fatalf("закомментированный порог принят: %d", got)
+	}
+
+	// Файла нет или строки в нём нет — умолчание shadow-utils, а не ноль:
+	// ноль закрыл бы туннель на каждой машине без явной настройки.
+	for _, s := range []string{"", "UID_MIN 1000\n", "SYS_UID_MAX не-число\n"} {
+		if got := parseSysUIDMax(strings.NewReader(s)); got != DefaultSysUIDMax {
+			t.Fatalf("без внятного порога получено %d, ожидалось умолчание %d", got, DefaultSysUIDMax)
+		}
 	}
 }

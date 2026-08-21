@@ -68,6 +68,10 @@ type Params struct {
 	// AgentUID — чей трафик выводится мимо туннеля (§6.8, Linux). Сервис знает
 	// его из учётных данных пира на управляющем сокете, а не со слов агента.
 	AgentUID int
+	// SystemUIDMax — SYS_UID_MAX машины: последний UID служебных учёток.
+	// Отдаёт сервис (SysUIDMax), а не план: план — данные, и читать файлы
+	// машины он не должен, иначе решение перестанет проверяться где угодно.
+	SystemUIDMax int
 }
 
 // Step — одно изменение сети и то, чем оно снимается.
@@ -106,7 +110,7 @@ func New(p Params) (Plan, error) { return plan(runtime.GOOS, p, DefaultInterface
 func plan(goos string, p Params, lookup func() (string, error)) (Plan, error) {
 	switch goos {
 	case "linux":
-		return linuxPlan(p), nil
+		return linuxPlan(p)
 	case "darwin":
 		return bindPlan(Subnets, lookup, darwinIPv6Block())
 	case "windows":
@@ -116,13 +120,35 @@ func plan(goos string, p Params, lookup func() (string, error)) (Plan, error) {
 	}
 }
 
+// systemUID — годится ли UID в правило §6.8.
+//
+// Правило выводит мимо туннеля всех, кто работает под этим UID, поэтому UID
+// обязан принадлежать служебной учётке: UID человека увёл бы мимо туннеля
+// пользователя целиком (C25). Граница служебных учёток — SYS_UID_MAX машины.
+//
+// Порог не задан — отказ: забытое поле обязано закрывать туннель, а не
+// открывать дыру молча. Root (0) порог проходит — интерактивным пользователем
+// он не является, и под ним работает агент стенда L3. То, что агент продукта
+// не должен быть root, закрепляет упаковка (§1 С1, §5.2), а не этот план.
+func systemUID(uid, max int) bool { return max > 0 && uid >= 0 && uid <= max }
+
 // linuxPlan — правило по UID-диапазону плюс отказ для глобального IPv6.
-func linuxPlan(p Params) Plan {
+func linuxPlan(p Params) (Plan, error) {
 	pl := Plan{Routes: []string{"0.0.0.0/0"}}
 
 	// Политика §8: без развилки трафик агента к узлу возвращается в
 	// собственный TUN и наматывается сам на себя — T25.
 	if policy.LoopGuard.On() {
+		if !systemUID(p.AgentUID, p.SystemUIDMax) {
+			// Отказ вслух, а не правило мимо: поставленное на UID человека,
+			// оно уводит мимо туннеля весь его трафик — правило §6.8 стоит
+			// выше туннельного и совпадает первым (C25).
+			return Plan{}, fmt.Errorf(
+				"loopguard: UID агента %d не служебный при SYS_UID_MAX=%d — "+
+					"правило §6.8 увело бы мимо туннеля весь трафик этого UID; "+
+					"агент обязан работать под системным пользователем hop (§1 С1)",
+				p.AgentUID, p.SystemUIDMax)
+		}
 		uid := fmt.Sprintf("%d-%d", p.AgentUID, p.AgentUID)
 		pl.Steps = append(pl.Steps, Step{
 			Name: "loop guard uidrange " + uid,
@@ -140,7 +166,7 @@ func linuxPlan(p Params) Plan {
 			Del:  ip("-6", "rule", "del", "to", GlobalIPv6, "unreachable", "priority", fmt.Sprint(prioIPv6Block)),
 		})
 	}
-	return pl
+	return pl, nil
 }
 
 // bindPlan — macOS и Windows: защита от петли выражена не правилом, а привязкой
