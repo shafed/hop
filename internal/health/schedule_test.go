@@ -189,7 +189,7 @@ func TestT6ForcedProbeOnEvent(t *testing.T) {
 func TestScheduleRestTierIsSpreadByJitter(t *testing.T) {
 	sch, prober, clk, _, _ := newScheduler(t, 50)
 
-	sch.sweep(context.Background())
+	sch.Sweep(context.Background())
 	first := prober.taken()
 	if !has(first, "A") || !has(first, "B") {
 		t.Fatalf("горячий ярус не проверен на старте: %v", first)
@@ -199,7 +199,7 @@ func TestScheduleRestTierIsSpreadByJitter(t *testing.T) {
 	}
 
 	clk.Advance(DefaultScheduleConfig().Jitter)
-	sch.sweep(context.Background())
+	sch.Sweep(context.Background())
 	seen := map[string]bool{}
 	for _, id := range append(first, prober.taken()...) {
 		seen[id] = true
@@ -214,17 +214,17 @@ func TestScheduleActiveIsProbedOftenerThanPool(t *testing.T) {
 	cfg := DefaultScheduleConfig()
 	sch, prober, clk, _, _ := newScheduler(t, 2)
 
-	sch.sweep(context.Background())
+	sch.Sweep(context.Background())
 	prober.taken()
 
 	clk.Advance(cfg.Active)
-	sch.sweep(context.Background())
+	sch.Sweep(context.Background())
 	if got := prober.taken(); !has(got, "A") || has(got, "B") {
 		t.Fatalf("через период активного яруса проверены %v, ожидался только A", got)
 	}
 
 	clk.Advance(cfg.Active)
-	sch.sweep(context.Background())
+	sch.Sweep(context.Background())
 	if got := prober.taken(); !has(got, "A") || !has(got, "B") {
 		t.Fatalf("через период пула проверены %v, ожидались A и B", got)
 	}
@@ -247,11 +247,11 @@ func TestPoolSizeCapsHotTier(t *testing.T) {
 	sch := NewScheduler(prober, mon, sel, cfg, clk)
 	sch.SetNodes("A", pool, nil)
 
-	sch.sweep(context.Background())
+	sch.Sweep(context.Background())
 	prober.taken()
 
 	clk.Advance(cfg.Pool)
-	sch.sweep(context.Background())
+	sch.Sweep(context.Background())
 	got := prober.taken()
 	for _, id := range pool[:cfg.PoolSize] {
 		if !has(got, id) {

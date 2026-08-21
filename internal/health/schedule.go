@@ -276,13 +276,13 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	t := s.clk.NewTicker(s.tick())
 	defer t.Stop()
 
-	s.sweep(ctx) // старт агента — та же новость, что смена сети: истории нет вовсе
+	s.Sweep(ctx) // старт агента — та же новость, что смена сети: истории нет вовсе
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C():
-			s.sweep(ctx)
+			s.Sweep(ctx)
 		}
 	}
 }
@@ -323,11 +323,15 @@ func (s *Scheduler) Force(t Trigger) {
 	}
 	s.mu.Unlock()
 
-	s.sweep(context.Background())
+	s.Sweep(context.Background())
 }
 
-// sweep — один прогон: пробуются узлы, чей срок наступил.
-func (s *Scheduler) sweep(ctx context.Context) {
+// Sweep — один прогон: пробуются узлы, чей срок наступил. Это то же самое, что
+// делает Run на каждом тике; наружу метод вынесен ради B2 (§8.6), который
+// крутит расписание по фейковым часам и считает исходящие соединения. Второй
+// драйвер расписания в бенчмарке означал бы, что мерится копия тикера, а не
+// само расписание.
+func (s *Scheduler) Sweep(ctx context.Context) {
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
 

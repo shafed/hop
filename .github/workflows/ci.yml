@@ -107,6 +107,20 @@ jobs:
         with: { go-version: '${{ env.GO_VERSION }}' }
       - run: go run ./cmd/b3 -mode fullcone
 
+  # B2 (§8.6): стоимость проб. Порог §6.5 — расписание не должно вырождаться в
+  # полный обход подписки. Часы фейковые, час прокручивается за доли секунды,
+  # платформа на результат не влияет — отсюда одна ОС, а не три.
+  b2-probe-cost:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '${{ env.GO_VERSION }}' }
+      - run: go run ./cmd/b2
+      - run: go run ./cmd/b2 -json > b2-probe-cost.json
+      - uses: actions/upload-artifact@v4
+        with: { name: b2-probe-cost, path: b2-probe-cost.json }
+
   # Долг этапа 1: латентность поверх netstack, Linux против Windows. Порога
   # нет — базовая линия. B1 показал, что стоимость границы тонет в пропускной
   # способности на крупных пакетах; здесь видно, во что она обходится на
