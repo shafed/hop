@@ -64,9 +64,17 @@ func (o *fakeOutbound) Active() string {
 	return o.active
 }
 
-func (o *fakeOutbound) DialVia(_ context.Context, _ string, dst netip.AddrPort) (net.Conn, error) {
+// Пустой узел — ошибка, ровно как в Engine.DialVia (engine.go). Фейк, который
+// идентификатор игнорирует, маскирует продуктовое поведение: именно из-за этого
+// первая редакция стартового окна выглядела рабочей, а клиент получал RST.
+func (o *fakeOutbound) DialVia(_ context.Context, nodeID string, dst netip.AddrPort) (net.Conn, error) {
+	if nodeID == "" {
+		return nil, errNoActiveNode
+	}
 	return o.Dialer.DialTCP(dst)
 }
+
+var errNoActiveNode = errors.New("нет активного узла")
 
 func (o *fakeOutbound) DialDirect(_ context.Context, dst netip.AddrPort) (net.Conn, error) {
 	return o.Dialer.DialTCP(dst)
@@ -577,6 +585,63 @@ func TestStartupGraceHoldsTrafficUntilFirstRound(t *testing.T) {
 	}
 	if !h.sup.healthy() {
 		t.Fatal("healthy() == false в стартовом окне: трафик получит RST вместо ожидания (Р5)")
+	}
+}
+
+// Свойство, ради которого стартовое окно существует: в нём клиент не получает
+// ответа вовсе — ни рукопожатия, ни RST, — и повторяет SYN сам (§5.6).
+//
+// Проверяется наблюдаемое клиента, а не healthy(): первая редакция окна делала
+// healthy() истинным и на этом останавливалась, а дальше вердикт становился
+// Proxy, диалер не находил активного узла, и netstack превращал его ошибку в
+// RST. Окно было, свойства не было.
+func TestStartupGraceHoldsSYNInsteadOfRST(t *testing.T) {
+	h := newHarness(t, "A", "B")
+	h.prober.hang("A")
+	h.prober.hang("B")
+	go h.sup.Force(health.TriggerInterface)
+	h.prober.waitStart(t, "A")
+
+	if act := h.sup.sel.Active(); act != "" {
+		t.Fatalf("активен узел %q — стенд собран не так", act)
+	}
+
+	h.dev.Inject(packettest.TCPSyn(client, web, 42))
+
+	deadline := clock.System{}.After(packettest.WaitTimeout)
+	for {
+		if got := h.dev.Emitted(); len(got) > 0 {
+			if tcp, ok := tcpOf(got[0]); ok && tcp.Flags()&header.TCPFlagRst != 0 {
+				t.Fatal("в стартовом окне на SYN пришёл RST: трафик отвергнут вместо ожидания (§5.6)")
+			}
+			t.Fatalf("в стартовом окне на SYN пришёл ответ: % x", got[0])
+		}
+		select {
+		case <-deadline:
+			return // ответа нет — SYN придержан, клиент повторит
+		default:
+		}
+	}
+}
+
+// Fail-close от стартового окна отличается наблюдаемым: когда узлы проверены и
+// мертвы, тот же SYN обязан получить RST, а не молчание. Иначе «ждём» и
+// «отказано» сливаются в одно.
+func TestFailCloseRejectsSYNAfterGrace(t *testing.T) {
+	h := newHarness(t, "A", "B")
+	h.prober.dead("A")
+	h.prober.dead("B")
+	h.force()
+
+	if h.sup.healthy() {
+		t.Fatal("окно не закрылось, хотя каждый узел ответил отказом")
+	}
+
+	h.dev.Inject(packettest.TCPSyn(client, web, 43))
+	got := h.dev.WaitEmitted(t, 1)
+	tcp, ok := tcpOf(got[0])
+	if !ok || tcp.Flags()&header.TCPFlagRst == 0 {
+		t.Fatalf("после стартового окна ответом на SYN не был RST: % x", got[0])
 	}
 }
 

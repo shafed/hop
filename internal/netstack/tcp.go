@@ -2,6 +2,7 @@ package netstack
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -115,7 +116,9 @@ func (t *tcpStack) proxy(r *tcp.ForwarderRequest, f flow) {
 	}
 	remote, err := t.s.cfg.Dialer.DialTCP(f.dst)
 	if err != nil {
-		r.Complete(true)
+		// Стартовое окно §5.6: SYN остаётся без ответа, клиент повторит его
+		// сам. Complete(false) освобождает место в форвардере, не посылая RST.
+		r.Complete(!errors.Is(err, ErrNotReady))
 		return
 	}
 	local, ok := t.accept(r)

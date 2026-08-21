@@ -402,6 +402,17 @@ func (s *Supervisor) dialTCP(ctx context.Context, dst netip.AddrPort) (net.Conn,
 	if s.bypassed() {
 		return s.out.DialDirect(ctx, dst)
 	}
+	// Различие §5.6, наблюдаемое клиентом: в стартовом окне поток
+	// придерживается (netstack не отвечает на SYN, клиент повторит), при
+	// fail-close — отвергается RST'ом.
+	//
+	// Без этой ветки стартовое окно не давало ничего: healthy() возвращал
+	// true, вердикт становился Proxy, диалер не находил активного узла и отдавал
+	// ошибку, а netstack превращал любую ошибку дозвона в RST. То есть §5.6
+	// нарушался ровно тем способом, который он сам и называет.
+	if s.sel.Active() == "" && s.inStartupGrace() {
+		return nil, netstack.ErrNotReady
+	}
 	return s.out.DialVia(ctx, s.sel.Active(), dst)
 }
 
