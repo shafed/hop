@@ -16,29 +16,31 @@ import (
 	"time"
 
 	"github.com/shafed/hop/internal/health"
+	"github.com/shafed/hop/internal/phase"
 	"github.com/shafed/hop/internal/tunnel"
 )
 
 // TrafficPhase — §2, TunnelState.traffic_phase: фаза, которой владеет агент.
 //
-// Вторая половина разделения из §2. Сервисная фаза (`tunnel.Phase`) отвечает на
-// вопрос «есть ли интерфейс», эта — на вопрос «что происходит с пакетом». Одно
-// поле на оба не годилось: комбинация «туннель поднят, живых узлов нет»
-// истинна целиком, а выражалась бы половиной.
-type TrafficPhase string
+// Псевдоним, а не свой тип: смысл и значения живут в `internal/phase`, потому
+// что фазу читает и резолвер этапа 6, а он импортируется связкой (см. doc
+// пакета phase). Псевдоним оставляет все существующие обращения — снимок,
+// IPC, тесты связки — работать без единой правки, и значение, собранное в
+// одном месте, подходит другому.
+type TrafficPhase = phase.Traffic
 
 const (
 	// PhaseWaiting — стартовый бюджет §5.6: ни один узел ещё не проверен,
 	// трафик ждёт. Это не Failing: там знание, здесь незнание, и пользователю
 	// показывать их одинаково нельзя.
-	PhaseWaiting TrafficPhase = "waiting"
+	PhaseWaiting = phase.Waiting
 	// PhaseProxied — есть живой узел, трафик идёт через него.
-	PhaseProxied TrafficPhase = "proxied"
+	PhaseProxied = phase.Proxied
 	// PhaseFailing — живых узлов нет, fail-close (§5.6).
-	PhaseFailing TrafficPhase = "failing"
+	PhaseFailing = phase.Failing
 	// PhaseBypass — обход включён осознанно (§1/С6). Туннель при этом снят
 	// (Р35 регистра связки), поэтому Tunnel в снимке будет Down.
-	PhaseBypass TrafficPhase = "bypass"
+	PhaseBypass = phase.Bypass
 )
 
 // Snapshot — всё наблюдаемое состояние агента одним значением.
