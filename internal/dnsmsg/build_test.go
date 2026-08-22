@@ -312,7 +312,10 @@ func TestD34Fit(t *testing.T) {
 		if !resp.Header.Response() || resp.Header.Rcode() != RcodeNoError {
 			t.Fatalf("флаги ответа испорчены: %#x", resp.Header.Flags)
 		}
-		if resp.Header.ANCount != 0 || len(resp.Sections()) != 0 {
+		// Заодно закреплено решение по OPT: в усечённом ответе её нет.
+		// Присутствие OPT определяется тем, объявил ли EDNS0 клиент, а Fit
+		// его запроса не видит — подробности в комментарии Fit.
+		if resp.Header.ANCount != 0 || resp.Header.ARCount != 0 || len(resp.Sections()) != 0 {
 			t.Fatal("в усечённый ответ попали куски RRset")
 		}
 		if !bytes.Equal(resp.QuestionBytes(), m.QuestionBytes()) {
