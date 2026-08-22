@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,23 +24,71 @@ import (
 // сломанный код падал, а не висел.
 const streamWatchdog = 2 * time.Second
 
+// chunkedConn — серверный конец стенда: net.Conn, чей Write **не** атомарен.
+// Он уходит в трубу двумя кусками — префикс длины отдельно от тела — с уступкой
+// планировщику между ними.
+//
+// Обёртка не декорация, без неё стенд не годится для D6. Настоящий приёмник
+// ответов — gonet.TCPConn, и его Write шлёт буфер циклом «сколько влезло в
+// окно» без всякого замка (gvisor, pkg/tcpip/adapters/gonet/gonet.go:387,
+// `for nbytes != len(b)`), так что две горутины вклиниваются друг в друга
+// свободно. net.Pipe, наоборот, сериализует Write целиком у себя внутри
+// («Ensure entirety of b is written together», GOROOT/src/net/pipe.go), и на
+// голой трубе кадры не могут перемешаться ни при какой реализации сервера —
+// охраняющий тест был бы зелен и без замка, который он охраняет, вопреки
+// правилу §8 регистра.
+//
+// Рвём ровно по границе префикса длины: перемешивание, которое ломает клиента,
+// — это чужие байты между префиксом и телом. Клиент после такого не
+// восстанавливается никогда, поэтому цена ошибки здесь и требует настоящей
+// охраны.
+type chunkedConn struct{ net.Conn }
+
+func (c chunkedConn) Write(b []byte) (int, error) {
+	const prefix = 2
+	if len(b) <= prefix {
+		return c.Conn.Write(b)
+	}
+	n, err := c.Conn.Write(b[:prefix])
+	if err != nil {
+		return n, err
+	}
+	runtime.Gosched()
+	m, err := c.Conn.Write(b[prefix:])
+	return n + m, err
+}
+
+// countingClock — фейковые часы, считающие заведённые таймеры. Считать их надо
+// потому, что clock.Clock не умеет отменять уже заведённое: «сколько таймеров»
+// — это не микрооптимизация, а память, которую соединение держит до их сроков.
+type countingClock struct {
+	*clock.Fake
+	afters atomic.Int64
+}
+
+func (c *countingClock) After(d time.Duration) <-chan time.Time {
+	c.afters.Add(1)
+	return c.Fake.After(d)
+}
+
 // dnsStream — одно соединение DNS поверх TCP на фейковых часах.
 //
 // Стек собирается настоящим New поверх поддельного устройства, но насос не
 // запускается: проверяется обслуживание уже принятого соединения, а рукопожатие
 // TCP к этому свойству ничего не добавляет. Клиентский конец — net.Pipe:
 // синхронная труба без буферов делает «ответ дошёл» наблюдаемым событием, а не
-// вопросом планировщика.
+// вопросом планировщика. Серверный конец — та же труба в chunkedConn, чтобы
+// стенд не давал реализации гарантий, которых не даёт gonet.TCPConn.
 type dnsStream struct {
 	st   *Stack
-	clk  *clock.Fake
+	clk  *countingClock
 	conn net.Conn
 }
 
 func newDNSStream(t *testing.T, res Resolver) *dnsStream {
 	t.Helper()
 
-	clk := clock.NewFake(time.Unix(1, 0))
+	clk := &countingClock{Fake: clock.NewFake(time.Unix(1, 0))}
 	st, err := New(Config{
 		Device:   packettest.NewFake(1500),
 		Resolver: res,
@@ -50,7 +99,7 @@ func newDNSStream(t *testing.T, res Resolver) *dnsStream {
 	}
 
 	local, remote := net.Pipe()
-	st.tcp.serveDNSStream(remote, flow{
+	st.tcp.serveDNSStream(chunkedConn{remote}, flow{
 		proto: uint8(header.TCPProtocolNumber),
 		src:   client,
 		dst:   router53,
@@ -162,10 +211,13 @@ func TestD6SlowQueryDoesNotBlockTheStream(t *testing.T) {
 
 // D6. Ответы, отпущенные одновременно, не перемешиваются в потоке байт.
 //
-// Тот же конвейер, но с тридцатью двумя запросами, отпущенными разом: без
-// замка на записи два ответа сложились бы в один кадр, и клиент, разбирающий
-// поток по префиксу длины, не восстановился бы никогда. Смысл теста виден под
-// `go test -race`; без него он ловит только грубое перемешивание.
+// Тот же конвейер, но с тридцатью двумя запросами, отпущенными разом. Это
+// охрана замка на записи в serveDNSStream: без него чужие байты встают между
+// префиксом длины и телом, и клиент, разбирающий поток по префиксу, не
+// восстанавливается до конца соединения. Проверено снятием замка — тест
+// краснеет; охраной его делает chunkedConn, см. комментарий там. Гонки данных
+// здесь нет ни при какой реализации (горутины трогают только свои буферы),
+// поэтому -race тут ничего не добавляет: ловит именно порядок байт.
 func TestD6ParallelAnswersKeepFraming(t *testing.T) {
 	const n = 32
 
@@ -291,5 +343,27 @@ func TestPlainResolverStillServesTheStream(t *testing.T) {
 	s.ask(t, query)
 	if got := s.answer(t); !bytes.Equal(got, query) {
 		t.Fatalf("ответ % x, ожидался % x", got, query)
+	}
+}
+
+// Срок простоя сдвигается на каждом запросе, а таймер на соединение остаётся
+// один. Таймер на запрос (clock.Clock не умеет Stop, снять его нечем) дожил бы
+// до своего срока: на конвейере RFC 7766, где клиент вправе слать запросы, не
+// читая ответов, это тысячи живых таймеров на одно соединение.
+func TestIdleTimerIsNotArmedPerQuery(t *testing.T) {
+	s := newDNSStream(t, &fakenet.Resolver{})
+
+	before := s.clk.afters.Load()
+	query := msg(0x7C, 14)
+	for i := 0; i < 20; i++ {
+		s.ask(t, query)
+		// Ответ уже у клиента — значит срок сдвинут (см. serveDNSStream), и
+		// счётчик читается не раньше, чем реализация успела бы завести таймер.
+		if got := s.answer(t); !bytes.Equal(got, query) {
+			t.Fatalf("запрос %d: ответ % x, ожидался % x", i, got, query)
+		}
+	}
+	if n := s.clk.afters.Load() - before; n != 0 {
+		t.Fatalf("на 20 запросах заведено таймеров: %d, ожидалось 0", n)
 	}
 }
