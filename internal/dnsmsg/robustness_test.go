@@ -13,8 +13,20 @@ func exercise(t *testing.T, raw []byte) {
 	t.Helper()
 	m, err := Parse(raw)
 	if err != nil {
+		// Msg{} — то, что Parse отдал вместе с ошибкой, и ровно то, что
+		// подаст дальше обработчик, написавший `return ServFail(m)` (D8).
+		// Раньше сюда не заглядывали, и паника на этом пути дожила до ревью.
+		exerciseMsg(t, m)
 		return
 	}
+	exerciseMsg(t, m)
+	_, _ = WithID(raw, 1)
+}
+
+// exerciseMsg прогоняет по одному Msg всё, что его принимает, — включая Msg{},
+// который Parse возвращает при ошибке.
+func exerciseMsg(t *testing.T, m Msg) {
+	t.Helper()
 	_ = m.Negative()
 	_ = m.Question.Key()
 	_ = m.Question.Name.String()
@@ -25,12 +37,14 @@ func exercise(t *testing.T, raw []byte) {
 		_, _ = m.Options(opt)
 	}
 	_, _, _ = StripECS(m)
-	_ = ServFail(m)
-	_ = NoData(m)
+	_, _ = ServFail(m)
+	_, _ = NoData(m)
 	_, _, _ = Fit(m, MinUDPSize)
-	_, _, _ = Fit(m, len(raw))
+	_, _, _ = Fit(m, len(m.Raw))
 	_ = Reply(m, 1)
-	_, _ = WithID(raw, 1)
+	_, _ = ReplyTo(m, m)
+	_, _ = ReplyTo(Msg{}, m)
+	_, _ = ReplyTo(m, Msg{})
 
 	s := m.Scan()
 	for s.Next() {

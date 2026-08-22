@@ -158,15 +158,18 @@ func TestD11Respond(t *testing.T) {
 
 	for _, c := range []struct {
 		name  string
-		build func(Msg) []byte
+		build func(Msg) ([]byte, error)
 		rcode uint8
 	}{
 		{"SERVFAIL", ServFail, RcodeServFail},
 		{"пустой NOERROR", NoData, RcodeNoError},
-		{"NXDOMAIN", func(m Msg) []byte { return Respond(m, RcodeNXDomain) }, RcodeNXDomain},
+		{"NXDOMAIN", func(m Msg) ([]byte, error) { return Respond(m, RcodeNXDomain) }, RcodeNXDomain},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			out := c.build(m)
+			out, err := c.build(m)
+			if err != nil {
+				t.Fatalf("%s: %v", c.name, err)
+			}
 			resp, err := Parse(out)
 			if err != nil {
 				t.Fatalf("ответ не разбирается: %v", err)
@@ -207,7 +210,11 @@ func TestD45NoDataIsNotNXDomain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	resp, err := Parse(NoData(m))
+	out, err := NoData(m)
+	if err != nil {
+		t.Fatalf("NoData: %v", err)
+	}
+	resp, err := Parse(out)
 	if err != nil {
 		t.Fatalf("ответ не разбирается: %v", err)
 	}
@@ -219,6 +226,45 @@ func TestD45NoDataIsNotNXDomain(t *testing.T) {
 	}
 	if !resp.Negative() {
 		t.Fatal("ответ не признан отрицательным — кэш положит его как обычный")
+	}
+}
+
+// D8. Parse при ошибке возвращает Msg{}, и самый естественный обработчик
+// «не-DNS на :53» подаёт его прямо в отказ. Каждая точка сборки обязана
+// вернуть ошибку: паника в горутине ответа не перехватывается нигде и снимает
+// туннель на пакете, который прислал любой локальный процесс.
+func TestD8BuildersRefuseUnparsedMsg(t *testing.T) {
+	unparsed := []struct {
+		name string
+		m    Msg
+	}{
+		{"нулевой Msg", Msg{}},
+		{"вопрос за границей буфера", Msg{Raw: make([]byte, HeaderLen), Question: Question{End: 40}}},
+		{"вопрос кончается в заголовке", Msg{Raw: make([]byte, 64), Question: Question{End: 4}}},
+	}
+	for _, c := range unparsed {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := Respond(c.m, RcodeServFail); err == nil {
+				t.Fatal("Respond собрал ответ")
+			}
+			if _, err := ServFail(c.m); err == nil {
+				t.Fatal("ServFail собрал ответ")
+			}
+			if _, err := NoData(c.m); err == nil {
+				t.Fatal("NoData собрал ответ")
+			}
+			if _, _, err := Fit(c.m, MinUDPSize); err == nil {
+				t.Fatal("Fit собрал ответ")
+			}
+			if _, err := ReplyTo(c.m, c.m); err == nil {
+				t.Fatal("ReplyTo собрал ответ")
+			}
+			// У Reply сигнатуры для ошибки нет, пока её зовёт резолвер:
+			// с неё довольно не паниковать и не выдумывать сообщение.
+			if got := Reply(c.m, 1); got.Raw != nil {
+				t.Fatalf("Reply собрала %d байт из неразобранного Msg", len(got.Raw))
+			}
+		})
 	}
 }
 

@@ -81,6 +81,13 @@ func ReplyTo(query, upstream Msg) (Msg, error) {
 // Смещения переносятся без пересчёта: подстановка идентификатора длин не
 // меняет, а повторный разбор той же копии стоил бы обхода мусора дважды.
 func Reply(upstream Msg, id uint16) Msg {
+	// Сигнатура без ошибки — наследство, снимаемое вместе с самой Reply;
+	// пока она жива, неразобранный Msg отдаётся неразобранным обратно.
+	// Паника здесь стоила бы туннеля: Parse при ошибке возвращает именно
+	// Msg{} (D8).
+	if upstream.checkParsed() != nil || HeaderLen+len(upstream.Question.Name) > len(upstream.Raw) {
+		return Msg{}
+	}
 	out := make([]byte, len(upstream.Raw))
 	copy(out, upstream.Raw)
 	binary.BigEndian.PutUint16(out[0:2], id)
@@ -104,7 +111,17 @@ func Reply(upstream Msg, id uint16) Msg {
 // Флаг RA от себя не выставляется: сегодняшняя заглушка агента его не
 // выставляет, и менять форму отказа заодно с переездом кода — значит менять
 // две вещи в одном месте.
-func Respond(q Msg, rcode uint8) []byte {
+//
+// Ошибка вместо паники на неразобранном запросе: сюда приезжает то, что
+// вернул Parse, а при ошибке он возвращает Msg{} — и самый естественный
+// обработчик «не-DNS на :53» подаёт этот Msg прямо в отказ (D8). Паника в
+// горутине ответа не перехватывается нигде и снимает туннель на пакете,
+// который прислал любой локальный процесс; ответить на такой пакет нечем —
+// в нём нет ни идентификатора, ни вопроса, которые отказ обязан отразить.
+func Respond(q Msg, rcode uint8) ([]byte, error) {
+	if err := q.checkParsed(); err != nil {
+		return nil, err
+	}
 	out := make([]byte, q.Question.End)
 	copy(out, q.Raw[:q.Question.End])
 
@@ -117,16 +134,16 @@ func Respond(q Msg, rcode uint8) []byte {
 	binary.BigEndian.PutUint16(out[6:8], 0)   // ANCOUNT
 	binary.BigEndian.PutUint16(out[8:10], 0)  // NSCOUNT
 	binary.BigEndian.PutUint16(out[10:12], 0) // ARCOUNT
-	return out
+	return out, nil
 }
 
 // ServFail — отказ (Р15, D9–D11, D14, D15).
-func ServFail(q Msg) []byte { return Respond(q, RcodeServFail) }
+func ServFail(q Msg) ([]byte, error) { return Respond(q, RcodeServFail) }
 
 // NoData — пустой NOERROR. Нужен для AAAA при заблокированном IPv6 (Р19,
 // D45): NXDOMAIN означал бы «имени нет вовсе», и стаб вправе распространить
 // это на A-запись того же имени.
-func NoData(q Msg) []byte { return Respond(q, RcodeNoError) }
+func NoData(q Msg) ([]byte, error) { return Respond(q, RcodeNoError) }
 
 // Fit — сообщение под потолком буфера клиента. Влезло — отдаётся как есть;
 // не влезло — заголовок с вопросом и поднятым флагом TC (D34).
@@ -138,13 +155,19 @@ func NoData(q Msg) []byte { return Respond(q, RcodeNoError) }
 // Влезающее сообщение возвращается без копии: оно уже принадлежит вызывающему
 // (Reply отдал ему свой буфер). truncated=true — повод увеличить TruncToClient.
 func Fit(m Msg, limit int) (out []byte, truncated bool, err error) {
+	if err := m.checkParsed(); err != nil {
+		return nil, false, err
+	}
 	if len(m.Raw) <= limit {
 		return m.Raw, false, nil
 	}
 	if m.Question.End > limit {
 		return nil, false, fmt.Errorf("%w: %d байт при потолке %d", ErrLimit, m.Question.End, limit)
 	}
-	out = Respond(m, m.Header.Rcode())
+	out, err = Respond(m, m.Header.Rcode())
+	if err != nil {
+		return nil, false, err
+	}
 	binary.BigEndian.PutUint16(out[2:4], binary.BigEndian.Uint16(out[2:4])|FlagTruncated)
 	return out, true, nil
 }
