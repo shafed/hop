@@ -119,6 +119,30 @@ func TestOptionsRejectsBadLength(t *testing.T) {
 	}
 }
 
+// OPT из чужого сообщения — отказ, а не чтение за концом буфера. Из сети такой
+// вход недостижим (нужны два разных сообщения), но сигнатура Options(opt) к
+// путанице располагает: резолвер держит на руках и запрос клиента, и ответ
+// апстрима сразу.
+func TestOptionsRefusesForeignOPT(t *testing.T) {
+	long := mustParse(t, assemble(1, 0, question("example.com", TypeA), nil, nil,
+		[][]byte{record("", TypeOPT, 4096, 0, option(10, make([]byte, 64)))}))
+	opt, ok, err := long.EDNS()
+	if err != nil || !ok {
+		t.Fatalf("EDNS: ok=%v err=%v", ok, err)
+	}
+
+	short := mustParse(t, aQuery(1)) // короче длинного и без OPT вовсе
+	if opt.RDEnd <= len(short.Raw) {
+		t.Fatalf("фикстура не короче: %d байт против границы OPT %d", len(short.Raw), opt.RDEnd)
+	}
+	if _, err := short.Options(opt); err == nil {
+		t.Fatal("опции разобраны по границам чужого сообщения")
+	}
+	if _, err := (Msg{}).Options(opt); err == nil {
+		t.Fatal("опции разобраны в нулевом Msg")
+	}
+}
+
 // D49, Р26. ECS вырезается, RDLENGTH правится, всё остальное — байт в байт.
 func TestD49StripECS(t *testing.T) {
 	cookie := option(10, []byte{1, 2, 3, 4, 5, 6, 7, 8})
