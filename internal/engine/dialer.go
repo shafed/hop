@@ -80,6 +80,38 @@ func reportDialFailure(nodeID string, err error) {
 	}
 }
 
+// probeKey — метка пробного дозвона (Р38).
+//
+// Тип неэкспортируемый и пустой, как требует контракт context: ключом служит
+// сам тип, и столкнуться с чужим он не может.
+type probeKey struct{}
+
+// WithProbe помечает контекст как пробный: отказ такого дозвона не пойдёт в
+// счётчик ошибок трафика.
+//
+// §5.4 требует двух **разных** счётчиков — окна проб и счётчика ошибок трафика.
+// Проба обязана идти через outbound проверяемого узла (§6.7), то есть тем же
+// путём, что трафик, и без метки один её провал засчитывался бы в оба. Узел
+// умирал бы вдвое быстрее порога §6.3 — в ту сторону, которую classify.go сам
+// называет худшей.
+//
+// Метка не отменяет классификацию: `DialTCP` по-прежнему вернёт `*DialError` с
+// вердиктом. Отменяется только рассылка в `OnFailure`; вердикт получает тот,
+// кто дозванивался, и решает сам. Для пробы это `health`, у которого свой счёт.
+func WithProbe(ctx context.Context) context.Context {
+	return context.WithValue(ctx, probeKey{}, true)
+}
+
+// IsProbe — стоит ли на контексте метка Р38.
+//
+// Экспортирована ради наблюдаемости: без неё «проба ушла с меткой» проверяется
+// только по отсутствию рассылки, то есть по молчанию, а молчание одинаково и
+// когда метка сработала, и когда дозвон вовсе не состоялся.
+func IsProbe(ctx context.Context) bool {
+	v, _ := ctx.Value(probeKey{}).(bool)
+	return v
+}
+
 // nodeDialer — обёртка над системным диалером Xray.
 type nodeDialer struct {
 	inner internet.SystemDialer
@@ -87,7 +119,7 @@ type nodeDialer struct {
 
 func (d *nodeDialer) Dial(ctx context.Context, src xnet.Address, dest xnet.Destination, sockopt *internet.SocketConfig) (xnet.Conn, error) {
 	conn, err := d.inner.Dial(ctx, src, dest, sockopt)
-	if err != nil {
+	if err != nil && !IsProbe(ctx) {
 		if id, ok := nodeFromContext(ctx); ok {
 			reportDialFailure(id, err)
 		}

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"testing"
@@ -257,4 +258,69 @@ func asDialError(err error, out **DialError) bool {
 		err = u.Unwrap()
 	}
 	return false
+}
+
+// TestProbeDialDoesNotReportTraffic — W37, решение Р38.
+//
+// Проба обязана идти через outbound проверяемого узла (§6.7), то есть тем же
+// путём, что трафик. Без метки её провал засчитался бы и в окно проб, и в
+// счётчик ошибок трафика, а §5.4 требует двух **разных** счётчиков: узел умирал
+// бы вдвое быстрее порога §6.3.
+//
+// Проверка построена как близнец TestDeadNodeGivesFatalVerdict: тот же мёртвый
+// узел, тот же дозвон, разница ровно в одной метке на контексте. Вердикт при
+// этом обязан вернуться вызывающему — отменяется рассылка, а не классификация.
+func TestProbeDialDoesNotReportTraffic(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("порт: %v", err)
+	}
+	dead := l.Addr().(*net.TCPAddr)
+	l.Close()
+
+	verdicts := make(chan *DialError, 8)
+	e, err := NewWithConfig(Config{
+		Nodes: []Node{{
+			ID: "проба", Protocol: "vless", Server: "127.0.0.1", Port: dead.Port,
+			Transport: "raw", Security: "none",
+			Params: map[string]string{"uuid": xraytest.DefaultUUID},
+		}},
+		OnFailure: func(de *DialError) { verdicts <- de },
+	})
+	if err != nil {
+		t.Fatalf("движок: %v", err)
+	}
+	t.Cleanup(func() { e.Close() })
+
+	// Соединение отдаётся лениво (conn.go): отказ узла приезжает на первом
+	// вводе-выводе, а не из Dial. Проба идёт тем же путём и видит то же.
+	ctx, cancel := context.WithTimeout(WithProbe(context.Background()), 10*time.Second) //hop:realtime
+	defer cancel()
+	conn, err := e.DialTCP(ctx, "проба", "203.0.113.1:80")
+	if err != nil {
+		t.Fatalf("Dial отказал сразу: %v — стенд не тот, что в TestDeadNodeGivesFatalVerdict", err)
+	}
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second)) //hop:realtime
+	conn.Write([]byte("ping"))
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second)) //hop:realtime
+	_, ioErr := conn.Read(make([]byte, 4))
+	conn.Close()
+
+	if ioErr == nil {
+		t.Fatal("мёртвый узел ответил — стенд не тот, что в TestDeadNodeGivesFatalVerdict")
+	}
+
+	// Вердикт вызывающему — да: Р38 отменяет рассылку, а не классификацию.
+	// Без этого проба не отличила бы смерть узла от отказа целевого хоста.
+	var de *DialError
+	if !errors.As(ioErr, &de) {
+		t.Fatalf("ошибка %v не несёт вердикта: проба не смогла бы отличить смерть узла от чужого отказа", ioErr)
+	}
+
+	// Рассылка в счётчик трафика — нет.
+	select {
+	case got := <-verdicts:
+		t.Fatalf("провал пробы доехал до OnFailure (%v): §5.4 требует двух разных счётчиков, а вышел один", got)
+	case <-time.After(2 * time.Second): //hop:realtime
+	}
 }

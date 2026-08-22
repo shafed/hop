@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"net/netip"
 	"runtime"
@@ -478,5 +479,63 @@ func TestW33WaitingHoldsTrafficInsteadOfRejecting(t *testing.T) {
 	_, err = d.DialTCP(netip.MustParseAddrPort("93.184.216.34:443"))
 	if !errors.Is(err, ErrNoNode) {
 		t.Fatalf("при fail-close диалер вернул %v, ожидалась ErrNoNode", err)
+	}
+}
+
+// TestW37ProbeGoesToNamedNodeMarked — проба идёт в названный узел и с меткой.
+//
+// Два утверждения в одной проверке, потому что порознь они не значат ничего.
+// Метка без правильного узла означала бы, что счётчики разведены, но мерится
+// не тот узел; правильный узел без метки — что мерится тот, но один его провал
+// идёт в оба счётчика (Р38, §5.4).
+//
+// Узел берётся заведомо **не** активный: живость выбрала первый, а проба
+// обязана уметь спросить кандидата, которым никто не пользуется.
+func TestW37ProbeGoesToNamedNodeMarked(t *testing.T) {
+	r := newRig(t, "n1", "n2")
+	r.start()
+	r.runRound()
+
+	active := r.a.Snapshot().Active
+	if active == "" {
+		t.Fatal("активного узла нет — стенд не дошёл до состояния, в котором проба осмысленна")
+	}
+	other := "n1"
+	if active == "n1" {
+		other = "n2"
+	}
+
+	c, err := r.a.ProbeDial(context.Background(), other, "tcp", "203.0.113.1:80")
+	if err != nil {
+		t.Fatalf("проба не дозвонилась: %v", err)
+	}
+	defer c.Close()
+
+	x := r.xrays.at(r.xrays.count() - 1)
+	seen := x.dialed()
+	if len(seen) == 0 {
+		t.Fatal("инстанс не увидел ни одного дозвона")
+	}
+	last := seen[len(seen)-1]
+
+	if last.node != other {
+		t.Errorf("проба ушла в узел %q, просили %q: пробер мерил бы активный узел под всеми именами", last.node, other)
+	}
+	if !last.probe {
+		t.Error("на контексте пробы нет метки Р38: её провал пойдёт и в окно проб, и в счётчик трафика (§5.4)")
+	}
+}
+
+// TestW37ProbeRefusesNonTCP — пробер, попросивший не tcp, получает ошибку.
+//
+// Через outbound Xray ходит только TCP, и молчаливая подмена протокола
+// выглядела бы смертью узла — то есть увела бы пользователя с живого.
+func TestW37ProbeRefusesNonTCP(t *testing.T) {
+	r := newRig(t, "n1")
+	r.start()
+	r.runRound()
+
+	if _, err := r.a.ProbeDial(context.Background(), "n1", "udp", "203.0.113.1:53"); err == nil {
+		t.Error("проба по udp принята молча: сломанный пробер выглядел бы мёртвым узлом")
 	}
 }

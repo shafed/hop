@@ -3,9 +3,11 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 
+	"github.com/shafed/hop/internal/engine"
 	"github.com/shafed/hop/internal/netstack"
 )
 
@@ -101,4 +103,45 @@ func (d *dialer) route() (*instance, string, error) {
 	}
 	in.acquire()
 	return in, node, nil
+}
+
+// ProbeDial — дозвон для пробы живости (§6.7). Реализует health.DialFunc.
+//
+// Отличий от обычного дозвона два, и оба существенны.
+//
+// Первое: узел задан вызывающим, а не выбран живостью. Проба проверяет
+// **конкретный** узел, в том числе кандидата, которым никто не пользуется;
+// спросить активный узел значило бы мерить один и тот же узел под всеми
+// именами и объявить живой всю подписку разом.
+//
+// Второе: контекст помечен как пробный (Р38). Проба идёт тем же путём, что
+// трафик, и без метки её провал засчитался бы и в окно проб, и в счётчик
+// ошибок трафика, а §5.4 требует двух разных счётчиков.
+//
+// Место в счётчике дренажа занимается так же, как в обычном дозвоне: проба —
+// такое же соединение через инстанс, и закрывать инстанс из-под неё нельзя.
+func (a *Agent) ProbeDial(ctx context.Context, nodeID, network, addr string) (net.Conn, error) {
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+	default:
+		// Не «узел мёртв», а ошибка вызывающего: пробер, попросивший UDP,
+		// сломан, и молчаливый отказ выглядел бы смертью узла.
+		return nil, fmt.Errorf("agent: проба просит %q, а через outbound ходит только tcp", network)
+	}
+	if nodeID == "" {
+		return nil, fmt.Errorf("agent: проба без узла")
+	}
+
+	in := a.engine.current()
+	if in == nil {
+		return nil, ErrNoNode
+	}
+	in.acquire()
+
+	c, err := in.x.DialTCP(engine.WithProbe(ctx), nodeID, addr)
+	if err != nil {
+		in.release()
+		return nil, err
+	}
+	return &countedConn{Conn: c, in: in}, nil
 }

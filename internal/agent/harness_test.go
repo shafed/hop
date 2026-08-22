@@ -88,13 +88,25 @@ type fakeXray struct {
 
 	mu    sync.Mutex
 	conns []net.Conn
+	// seen — чем был каждый дозвон: через какой узел и с меткой пробы или без.
+	// Нужен W37: «проба ушла в названный узел» иначе ненаблюдаемо.
+	seen []dialRec
 }
 
-func (f *fakeXray) DialTCP(_ context.Context, _, _ string) (net.Conn, error) {
+// dialRec — один дозвон, как его увидел инстанс.
+type dialRec struct {
+	node  string
+	probe bool
+}
+
+func (f *fakeXray) DialTCP(ctx context.Context, nodeID, _ string) (net.Conn, error) {
 	if f.closed.Load() {
 		return nil, errors.New("fakeXray: инстанс закрыт")
 	}
 	f.dials.Add(1)
+	f.mu.Lock()
+	f.seen = append(f.seen, dialRec{node: nodeID, probe: engine.IsProbe(ctx)})
+	f.mu.Unlock()
 	c, peer := net.Pipe()
 	// Дальний конец держится открытым, иначе запись в c упрётся в закрытую
 	// трубу и «соединение живо» перестанет быть наблюдаемым.
@@ -110,6 +122,13 @@ func (f *fakeXray) DialTCP(_ context.Context, _, _ string) (net.Conn, error) {
 	f.conns = append(f.conns, c)
 	f.mu.Unlock()
 	return c, nil
+}
+
+// dialed — что инстанс видел, по порядку.
+func (f *fakeXray) dialed() []dialRec {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]dialRec(nil), f.seen...)
 }
 
 func (f *fakeXray) DialUDP(_ context.Context, _ string) (net.PacketConn, error) {
