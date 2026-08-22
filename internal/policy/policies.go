@@ -325,6 +325,135 @@ var (
 			{Pkg: "./internal/agent", Test: "^TestW26BypassOffRaisesTunnel$"},
 		},
 	}
+
+	// --- Этап 6, DNS (docs/verification-dns.md §6). Десять флагов на этап —
+	// много, и это осознанно: negcheck гоняет каждый охранник дважды, а список
+	// сжат тем, что в Guards стоят только зарегистрированные охранники.
+
+	// Bootstrap — имена узлов резолвятся отдельным резолвером мимо туннеля
+	// (§5.7а, §6.8). Выключение отправляет их общим путём, через туннель, —
+	// то есть через резолвер, которому для работы нужен живой узел, которого
+	// нет, пока имя не разрешилось. Это петля старта, а не деградация.
+	Bootstrap = &Policy{
+		Name: "bootstrap",
+		Doc:  "имена узлов резолвит bootstrap мимо туннеля (§5.7а, D51, D52)",
+		Guards: []Guard{
+			{Pkg: "./internal/resolver", Test: "^TestD51NodeNameResolvesViaBootstrap$"},
+			{Pkg: "./internal/resolver", Test: "^TestD52BootstrapGoesDirect$"},
+		},
+	}
+
+	// DNSUpstream — апстримов два, второй с форой 150 мс (§5.7). Выключение
+	// оставляет один, и блокировка единственного апстрима означает мёртвый DNS
+	// при полностью живом узле — та же ошибка, против которой стоит multi_url
+	// в пробах.
+	DNSUpstream = &Policy{
+		Name: "dns_upstream",
+		Doc:  "два апстрима, второй с форой 150 мс (§5.7, D41, D42)",
+		Guards: []Guard{
+			{Pkg: "./internal/resolver", Test: "^TestD41FastFirstUpstreamSkipsSecond$"},
+			{Pkg: "./internal/resolver", Test: "^TestD42SilentFirstFallsToSecond$"},
+		},
+	}
+
+	// DNSTCPRetry — флаг TC от апстрима означает повтор по TCP (§5.7).
+	// Выключение отдаёт клиенту усечённое: большие RRset молча теряют записи,
+	// и приложение видит часть адресов вместо всех.
+	DNSTCPRetry = &Policy{
+		Name: "dns_tcp_retry",
+		Doc:  "повтор по TCP на флаг TC, а не усечённый ответ (§5.7, D33)",
+		Guards: []Guard{
+			{Pkg: "./internal/resolver", Test: "^TestD33TruncatedAnswerRetriesOverTCP$"},
+		},
+	}
+
+	// DNSCacheFlushOnSwitch — кэш сбрасывает сам резолвер, подписавшись на
+	// события живости (§5.7в). Выключение снимает подписку целиком, и после
+	// переключения трафик уходит в CDN чужого региона по адресу, добытому
+	// через прежний узел.
+	DNSCacheFlushOnSwitch = &Policy{
+		Name: "dns_cache_flush_on_switch",
+		Doc:  "сброс кэша по подписке на события health (§5.7в, T14, D19, D20)",
+		Guards: []Guard{
+			{Pkg: "./internal/resolver", Test: "^TestD19SwitchBumpsGeneration$"},
+			{Pkg: "./internal/resolver", Test: "^TestD20BypassEdgesFlushTwice$"},
+		},
+	}
+
+	// DNSFailClose — нет живых узлов, нет резолва (§5.7б, Р15). Выключение
+	// заставляет резолвер отвечать и без живых узлов: приложение получает
+	// адреса и виснет на connect, то есть молчание §5.6 сдвигается на шаг
+	// дальше вместо того, чтобы стать отказом.
+	DNSFailClose = &Policy{
+		Name: "dns_failclose",
+		Doc:  "SERVFAIL без живых узлов, и кэш при этом не отдаётся (Р15, D9–D11, D17)",
+		Guards: []Guard{
+			{Pkg: "./internal/resolver", Test: "^TestD9FailingPhaseAnswersServfail$"},
+			{Pkg: "./internal/resolver", Test: "^TestD10FailClosePreventsCacheHit$"},
+		},
+	}
+
+	// DNSWaitingHold — в стартовом окне §5.6 запрос ждёт живого узла, но не
+	// дольше 4 с (Р16). Выключение отвечает SERVFAIL сразу, и приложение,
+	// стартовавшее вместе с агентом, получает отказ там, где через секунду всё
+	// работало.
+	DNSWaitingHold = &Policy{
+		Name: "dns_waiting_hold",
+		Doc:  "удержание запроса в фазе waiting до 4 с (Р16, D12, D13)",
+		Guards: []Guard{
+			{Pkg: "./internal/resolver", Test: "^TestD12WaitingHoldsUntilNodeAppears$"},
+			{Pkg: "./internal/resolver", Test: "^TestD13WaitingGivesUpAtFourSeconds$"},
+		},
+	}
+
+	// DNSAAAANodata — при заблокированном IPv6 (§6.9) на AAAA синтезируется
+	// пустой NOERROR (Р19). Выключение отправляет AAAA наверх и отдаёт адреса,
+	// которые §6.9 дропает молча, — приложение платит за это таймаутом Happy
+	// Eyeballs на каждом соединении.
+	DNSAAAANodata = &Policy{
+		Name: "dns_aaaa_nodata",
+		Doc:  "AAAA отвечается пустым NOERROR, наверх не идёт (Р19, D45, D46)",
+		Guards: []Guard{
+			{Pkg: "./internal/resolver", Test: "^TestD45AAAAIsSynthesizedNodata$"},
+			{Pkg: "./internal/resolver", Test: "^TestD46AAAANodataKeepsAWorking$"},
+		},
+	}
+
+	// DNSNegativeCache — NXDOMAIN и NODATA кэшируются (Р18). Выключение
+	// отправляет через узел каждый запрос приложения, ищущего несуществующее
+	// имя в цикле, — самый дешёвый способ превратить резолвер в источник
+	// трафика.
+	DNSNegativeCache = &Policy{
+		Name: "dns_negative_cache",
+		Doc:  "отрицательные ответы кэшируются по SOA (Р18, D26–D28)",
+		Guards: []Guard{
+			{Pkg: "./internal/resolver", Test: "^TestD26NXDomainCachedBySOAMinimum$"},
+			{Pkg: "./internal/resolver", Test: "^TestD28NodataCachedLikeNXDomain$"},
+		},
+	}
+
+	// DNSSingleFlight — одинаковые вопросы в полёте склеиваются (Р24).
+	// Выключение отправляет наверх каждый клиентский запрос своим: один старт
+	// браузера даёт десятки одинаковых вопросов и столько же ассоциаций UDP
+	// через узел — ровно та деградация, которую меряет B3.
+	DNSSingleFlight = &Policy{
+		Name: "dns_single_flight",
+		Doc:  "одинаковые вопросы в полёте склеиваются (Р24, D38)",
+		Guards: []Guard{
+			{Pkg: "./internal/resolver", Test: "^TestD38IdenticalQuestionsCoalesce$"},
+		},
+	}
+
+	// DNSSwitchRetry — запрос, застигнутый переключением узла, повторяется
+	// ровно один раз через нового активного (Р20). Выключение отдаёт SERVFAIL:
+	// каждое переключение стоит отказа тем запросам, которые как раз летели.
+	DNSSwitchRetry = &Policy{
+		Name: "dns_switch_retry",
+		Doc:  "один повтор запроса, застигнутого переключением (Р20, D16)",
+		Guards: []Guard{
+			{Pkg: "./internal/resolver", Test: "^TestD16SwitchMidResolveRetriesOnce$"},
+		},
+	}
 )
 
 // All — полный список политик продукта.
@@ -355,6 +484,16 @@ func All() []*Policy {
 		SwitchOrder,
 		PhaseSplit,
 		BypassTeardown,
+		Bootstrap,
+		DNSUpstream,
+		DNSTCPRetry,
+		DNSCacheFlushOnSwitch,
+		DNSFailClose,
+		DNSWaitingHold,
+		DNSAAAANodata,
+		DNSNegativeCache,
+		DNSSingleFlight,
+		DNSSwitchRetry,
 	}
 }
 
