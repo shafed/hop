@@ -1,7 +1,6 @@
 package resolver
 
 import (
-	"bytes"
 	"container/list"
 	"context"
 	"errors"
@@ -229,31 +228,13 @@ func cacheTTL(m dnsmsg.Msg) (ttl time.Duration, negative bool, ok bool) {
 // проводу. Все границы кратны секунде по построению.
 func seconds(d time.Duration) uint32 { return uint32(d / time.Second) }
 
-// answerFor — кэшированный ответ, годный именно этому клиенту.
-//
-// Написание имени берётся из его запроса, а не из кэша (Р23, D30): стаб,
-// применяющий 0x20-рандомизацию, сверяет секцию вопроса побайтно и ответ с
-// чужим написанием молча отбросит — снаружи это выглядит как «DNS не
-// работает» при полностью рабочем резолвере.
-//
-// Совпало написание — отдаётся тот же срез без копии: ответ клиенту всё равно
-// собирает dnsmsg.Reply, и вторая копия на общем пути стоила бы аллокации на
-// каждое попадание. Длины имён равны по построению: ключ кэша — то же имя в
-// нижнем регистре, значит разного размера у них быть не может.
-func answerFor(cached, q dnsmsg.Msg) dnsmsg.Msg {
-	if bytes.Equal(cached.Question.Name, q.Question.Name) {
-		return cached
-	}
-
-	out := make([]byte, len(cached.Raw))
-	copy(out, cached.Raw)
-	copy(out[dnsmsg.HeaderLen:], q.Question.Name)
-
-	m := cached
-	m.Raw = out
-	m.Question.Name = dnsmsg.Name(out[dnsmsg.HeaderLen : dnsmsg.HeaderLen+len(q.Question.Name)])
-	return m
-}
+// Написание имени в ответе клиенту кэш не правит: dnsmsg.ReplyTo, которой
+// заканчивается спина запроса (fit, upstream.go), берёт секцию вопроса у того,
+// кто спрашивал, — и попадание в кэш здесь ничем не отличается от промаха
+// (Р23, D30). Второе место, где решается, чьё написание уедет клиенту, стоило
+// бы лишней копии сообщения на каждое попадание и первым разошлось бы с
+// первым, а расходятся они молча: стаб с 0x20-рандомизацией сверяет вопрос
+// побайтно и отбрасывает ответ без всякой диагностики.
 
 // flight — один летящий наверх вопрос и общий ответ на всех, кто его ждёт.
 type flight struct {
@@ -307,7 +288,7 @@ func (r *Resolver) lookup(ctx context.Context, q dnsmsg.Msg, rt route) (dnsmsg.M
 
 	if m, ok := r.cache.get(key); ok {
 		r.cnt.hits.Add(1)
-		return answerFor(m, q), nil
+		return m, nil
 	}
 
 	if !policy.DNSSingleFlight.On() {
@@ -316,7 +297,7 @@ func (r *Resolver) lookup(ctx context.Context, q dnsmsg.Msg, rt route) (dnsmsg.M
 		if err != nil {
 			return dnsmsg.Msg{}, err
 		}
-		return answerFor(m, q), nil
+		return m, nil
 	}
 
 	f, leader := r.flight.join(key)
@@ -330,7 +311,7 @@ func (r *Resolver) lookup(ctx context.Context, q dnsmsg.Msg, rt route) (dnsmsg.M
 			if f.err != nil {
 				return dnsmsg.Msg{}, f.err
 			}
-			return answerFor(f.msg, q), nil
+			return f.msg, nil
 		case <-ctx.Done():
 			// Бюджет клиента вышел раньше, чем ответ лидера. Лидер при этом
 			// продолжает и дойдёт до кэша: бросать чужой полёт из-за своего
@@ -346,7 +327,7 @@ func (r *Resolver) lookup(ctx context.Context, q dnsmsg.Msg, rt route) (dnsmsg.M
 	if m, ok := r.cache.get(key); ok {
 		r.flight.finish(key, f, m, nil)
 		r.cnt.hits.Add(1)
-		return answerFor(m, q), nil
+		return m, nil
 	}
 
 	r.cnt.misses.Add(1)
@@ -355,7 +336,7 @@ func (r *Resolver) lookup(ctx context.Context, q dnsmsg.Msg, rt route) (dnsmsg.M
 	if err != nil {
 		return dnsmsg.Msg{}, err
 	}
-	return answerFor(m, q), nil
+	return m, nil
 }
 
 // fetch — поход наверх, занимающий место в потолке летящих (Р24, D39).
