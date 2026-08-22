@@ -364,6 +364,13 @@ func (u *Upstream) newTCPConn(dst netip.AddrPort, via Via) net.Conn {
 // предыдущий — иначе Delay одного запроса блокирует конвейер целиком.
 func (u *Upstream) serveTCP(conn net.Conn, dst netip.AddrPort, via Via) {
 	defer conn.Close()
+	// done закрывается вместе с уходом из этого цикла (соединение разорвано
+	// или клиент его закрыл) и будит все answerTCP, ещё ждущие Delay на
+	// фейковых часах, — та же роль, что udpCore.done играет для answerUDP
+	// (М2 ревью волны 1): без него горутина с запрограммированной, но так и
+	// не докрученной задержкой висела бы до конца прогона бинаря.
+	done := make(chan struct{})
+	defer close(done)
 	var writeMu sync.Mutex
 	for {
 		var hdr [2]byte
@@ -376,17 +383,21 @@ func (u *Upstream) serveTCP(conn net.Conn, dst netip.AddrPort, via Via) {
 			return
 		}
 		u.recordQuery(Query{Payload: msg, Via: via, Dst: dst})
-		go u.answerTCP(conn, &writeMu, dst, msg)
+		go u.answerTCP(conn, &writeMu, dst, msg, done)
 	}
 }
 
-func (u *Upstream) answerTCP(conn net.Conn, writeMu *sync.Mutex, dst netip.AddrPort, query []byte) {
+func (u *Upstream) answerTCP(conn net.Conn, writeMu *sync.Mutex, dst netip.AddrPort, query []byte, done <-chan struct{}) {
 	b := u.behaviorFor(dst)
 	if b.Silent {
 		return
 	}
 	if b.Delay > 0 {
-		<-u.clk.After(b.Delay)
+		select {
+		case <-u.clk.After(b.Delay):
+		case <-done:
+			return
+		}
 	}
 
 	writeMu.Lock()

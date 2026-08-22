@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"runtime"
 	"testing"
 	"time"
 
@@ -165,6 +166,43 @@ func TestUpstreamTCPReadLoopNotBlockedByPendingAnswer(t *testing.T) {
 
 	readFramed(t, conn)
 	readFramed(t, conn)
+}
+
+// TestUpstreamTCPDelayedAnswerGoroutineReleasedOnClose — М2 ревью волны 1
+// (.superpowers/sdd/handoff-md-wondrous-boole/wave1-review.md): answerUDP
+// прерывает ожидание Delay по c.done, а answerTCP раньше — нет, и висел до
+// конца прогона бинаря, если клиент закрывал соединение раньше, чем часы
+// докручивали задержку. D40/D44 требуют, чтобы горутины не копились именно
+// в этом сценарии.
+func TestUpstreamTCPDelayedAnswerGoroutineReleasedOnClose(t *testing.T) {
+	fake := clock.NewFake(time.Unix(0, 0))
+	clk := NewClock(fake)
+	up := New(clk)
+	dst := netip.MustParseAddrPort("1.1.1.1:53")
+	// Час — заведомо дольше времени жизни теста: если бы починки не было,
+	// горутина answerTCP провисела бы до конца прогона бинаря, а не только
+	// до конца этого теста.
+	up.Program(dst, Behavior{Delay: time.Hour, Answer: []byte("answer")})
+
+	before := runtime.NumGoroutine()
+
+	conn, err := up.Dial(context.Background(), dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFramed(t, conn, []byte("q1"))
+
+	up.WaitQueries(1)
+	clk.WaitAfterCalls(1) // answerTCP гарантированно уже внутри select на Delay
+
+	conn.Close() // клиент уходит, не дожидаясь ответа — часы так и не докрутят Delay
+
+	if !WaitObserved(time.Second, func() bool {
+		runtime.GC()
+		return runtime.NumGoroutine() <= before
+	}) {
+		t.Fatalf("горутина answerTCP не отпущена после закрытия соединения: было %d, сейчас %d", before, runtime.NumGoroutine())
+	}
 }
 
 // TestUpstreamTCPBadLengthPrefixDoesNotDeliverFullMessage — D37: неверный
