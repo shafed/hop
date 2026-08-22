@@ -1,9 +1,10 @@
-// Команда hop — агент. На этапе 2 он заглушка по построению: берёт у сервиса
-// дескриптор или трубу, читает и выбрасывает. Netstack, Xray, DNS и health —
-// следующие этапы.
+// Команда hop — агент (§3.4, §5.2). Разбор аргументов и сборка модулей, и
+// больше ничего: вся логика живёт в internal/agent, который проверяется на
+// фейковых часах, без прав, на трёх ОС.
 //
-// Смысл этой заглушки в том, что она настоящая ровно там, где §6.2 требует:
-// живое соединение с сервисом, heartbeat, реаттач по токену и плановый Detach.
+// До этапа С здесь была заглушка этапа 2: агент брал у сервиса дескриптор,
+// читал его и выбрасывал прочитанное. Маршруты при этом заворачивали в туннель
+// весь трафик машины, то есть «hop up» означал чёрную дыру, а не прокси.
 package main
 
 import (
@@ -11,13 +12,17 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/shafed/hop/internal/agent"
 	"github.com/shafed/hop/internal/clock"
+	"github.com/shafed/hop/internal/health"
 	"github.com/shafed/hop/internal/ipc"
+	"github.com/shafed/hop/internal/store"
 	"github.com/shafed/hop/internal/tunnel"
 )
 
@@ -29,10 +34,18 @@ func main() {
 		mtu   = flag.Int("mtu", 1400, "MTU")
 		table = flag.Int("table", 8420, "таблица маршрутизации туннеля")
 		beat  = flag.Duration("heartbeat", time.Second, "интервал heartbeat")
-		store = flag.String("token-file", defaultTokenFile(), "где лежит attach-token")
+		tok   = flag.String("token-file", defaultTokenFile(), "где лежит attach-token")
 		down  = flag.Bool("down", false, "снять туннель и выйти")
 		stat  = flag.Bool("status", false, "показать состояние и выйти")
 		debug = flag.Bool("debug", false, "подробный лог")
+
+		// Ввод узлов (Р40) — временный интерфейс этапа С. Подкоманды приедут
+		// этапом 9 и наденутся поверх тех же вызовов.
+		subURL = flag.String("sub", "", "скачать подписку по ссылке, слить в стор и выйти")
+		link   = flag.String("node", "", "добавить один узел по ссылке (vless://…) и выйти")
+		list   = flag.Bool("nodes", false, "показать узлы из стора и выйти")
+		rm     = flag.String("rm", "", "удалить узел или группу по id и выйти")
+		probe  = flag.Bool("probe", false, "проверить узлы через outbound без туннеля и выйти")
 	)
 	flag.Parse()
 
@@ -41,6 +54,37 @@ func main() {
 		level = slog.LevelDebug
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+
+	// Режимы стора идут до соединения с сервисом: добавить подписку можно и
+	// при неподнятом hopd, и требовать сокет ради записи на диск незачем.
+	switch {
+	case *subURL != "":
+		fail(withStore(func(st *store.Store) error {
+			return addSubscription(context.Background(), st, *subURL, os.Stdout)
+		}))
+		return
+	case *link != "":
+		fail(withStore(func(st *store.Store) error {
+			return addNode(st, *link, os.Stdout)
+		}))
+		return
+	case *rm != "":
+		fail(withStore(func(st *store.Store) error {
+			return removeNode(st, *rm, os.Stdout)
+		}))
+		return
+	case *probe:
+		fail(withStore(func(st *store.Store) error {
+			return probeNodes(context.Background(), st, os.Stdout)
+		}))
+		return
+	case *list:
+		fail(withStore(func(st *store.Store) error {
+			listNodes(st, os.Stdout)
+			return nil
+		}))
+		return
+	}
 
 	cl, err := ipc.Connect(*sock)
 	if err != nil {
@@ -61,73 +105,120 @@ func main() {
 		if err := cl.Stop(); err != nil {
 			fail(err)
 		}
-		_ = removeToken(*store)
+		_ = removeToken(*tok)
 		return
 	}
 
-	res, err := acquire(cl, *store, tunnel.Params{
-		Name: *name, MTU: *mtu, Addr: *addr, Table: *table,
-	}, log)
-	if err != nil {
+	if err := run(log, cl, *tok, *beat, tunnelParams(*name, *addr, *mtu, *table)); err != nil {
 		fail(err)
 	}
-	// §6.14: токен не попадает в лог ни на debug. В аргументах его нет и быть
-	// не может — тип Token форматируется заглушкой.
-	log.Info("туннель получен", "device", res.Device, "fd", res.FD)
+}
+
+// tunnelParams собирает параметры туннеля.
+//
+// Отдельной функцией ради одного поля: AgentUID. §6.8 выводит трафик агента
+// мимо туннеля правилом по UID-диапазону, и до этапа С здесь стоял ноль по
+// умолчанию — то есть правило защищало root, а не агента. При заглушке это
+// было незаметно (агент никуда не ходил), при живом датаплейне трафик Xray к
+// узлу возвращался бы в туннель петлёй. Проверяется W36.
+func tunnelParams(name, addr string, mtu, table int) tunnel.Params {
+	return tunnel.Params{
+		Name: name, MTU: mtu, Addr: addr, Table: table,
+		AgentUID: os.Getuid(),
+	}
+}
+
+// withStore открывает стор, отдаёт его fn и закрывает.
+//
+// Закрытие обязательно и в отказном пути: стор держит межпроцессный замок
+// (§6.14), и брошенный замок сделал бы следующий запуск отказом на ровном месте.
+func withStore(fn func(*store.Store) error) error {
+	root, err := storeRoot()
+	if err != nil {
+		return err
+	}
+	st, err := store.Open(root, clock.System{})
+	if err != nil {
+		return err
+	}
+	err = fn(st)
+	if cerr := st.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// run — весь агент: стор, живость, связка, туннель.
+//
+// Порядок сборки продиктован одним кругом: проберу нужен дозвон через outbound
+// узла (§6.7), дозвон живёт в связке, а связке нужна живость, которой нужен
+// пробер. Круг разрывается замыканием — пробер зовёт дозвон лениво, к моменту
+// первой пробы связка уже собрана.
+func run(log *slog.Logger, cl control, tokenFile string, beat time.Duration, p tunnel.Params) error {
+	root, err := storeRoot()
+	if err != nil {
+		return err
+	}
+	st, err := store.Open(root, clock.System{})
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	var a *agent.Agent
+	hm := health.New(health.Config{
+		Clock: clock.System{},
+		Prober: newProber(func(ctx context.Context, nodeID, network, addr string) (net.Conn, error) {
+			return a.ProbeDial(ctx, nodeID, network, addr)
+		}),
+		// Interrupt не выставлен: разрыв активных соединений при смерти узла
+		// (§5.5) требует от netstack учёта живых потоков, которого у него нет.
+		// Это известная дыра регистра — W8 и W14 в нём красные, — а не новая:
+		// см. «Deviations» в implementation-notes.md.
+	})
+
+	tr := newTransport(cl, tokenFile, beat, log)
+	defer tr.close()
+
+	a, err = agent.New(agent.Config{
+		Store:  st,
+		Health: hm,
+		Trans:  tr,
+		Params: p,
+		Clock:  clock.System{},
+		Log:    log,
+	})
+	if err != nil {
+		return err
+	}
+	defer a.Close()
+
+	a.Start()
+	if err := a.Up(); err != nil {
+		return err
+	}
+	log.Info("туннель поднят", "интерфейс", p.Name, "uid агента", p.AgentUID)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	go drain(ctx, res, *mtu, log)
-	heartbeat(ctx, cl, *beat, log)
+	// Наблюдаемость до этапа 9: без неё «трафик пошёл» и «трафик в никуда»
+	// выглядят в логе одинаково — молчанием.
+	go watch(ctx, a, log, 3*time.Second)
 
-	// Плановый уход: сервис узнаёт причину и показывает её в status. Окно
-	// отказа схлопывается до времени respawn (§6.2).
-	if err := cl.Detach(tunnel.ReasonRestart); err != nil {
-		log.Debug("Detach", "err", err)
-	}
-}
+	<-ctx.Done()
 
-// acquire сначала пробует реаттач: если сервис в orphaned и токен от прошлого
-// сеанса ещё жив, туннель забирается целиком — тот же интерфейс, тот же
-// дескриптор (T24).
-func acquire(cl *ipc.Client, store string, p tunnel.Params, log *slog.Logger) (ipc.Result, error) {
-	if tok, err := loadToken(store); err == nil {
-		res, err := cl.Attach(tok)
-		if err == nil {
-			log.Info("реаттач по токену удался")
-			return res, nil
-		}
-		log.Debug("реаттач не удался, поднимаем заново", "err", err)
-	}
-
-	res, err := cl.Start(p)
-	if err != nil {
-		return ipc.Result{}, err
-	}
-	if err := saveToken(store, res.Token); err != nil {
-		return ipc.Result{}, err
-	}
-	return res, nil
-}
-
-func heartbeat(ctx context.Context, cl *ipc.Client, every time.Duration, log *slog.Logger) {
-	t := clock.System{}.NewTicker(every)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C():
-			if err := cl.Heartbeat(); err != nil {
-				log.Error("heartbeat", "err", err)
-				return
-			}
-		}
-	}
+	// Плановый уход: сервис узнаёт причину и показывает её в status, а окно
+	// отказа схлопывается до времени respawn (§6.2). Detach, а не Stop:
+	// интерфейс обязан пережить перезапуск агента (T24).
+	tr.detach()
+	return nil
 }
 
 func fail(err error) {
+	if err == nil {
+		return
+	}
 	fmt.Fprintln(os.Stderr, "hop:", err)
 	os.Exit(1)
 }
