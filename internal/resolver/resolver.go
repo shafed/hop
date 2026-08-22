@@ -265,7 +265,13 @@ func (r *Resolver) serve(query []byte, tr Transport) ([]byte, error) {
 // servfail — отказ кодом, а не молчанием (§5.6, У2).
 func (r *Resolver) servfail(q dnsmsg.Msg, tr Transport) ([]byte, error) {
 	r.cnt.servFail.Add(1)
-	return r.fitRaw(q, dnsmsg.ServFail(q), tr)
+	raw, err := dnsmsg.ServFail(q)
+	if err != nil {
+		// Собрать отказ не из чего: вопроса в сообщении нет. Это тот же
+		// случай, что D8, и ответ здесь — молчание, а не битые байты.
+		return nil, fmt.Errorf("%w: %w", ErrRefused, err)
+	}
+	return r.fitRaw(q, raw, tr)
 }
 
 // withBudget — контекст, истекающий по модельным часам.

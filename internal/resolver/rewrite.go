@@ -40,7 +40,14 @@ func (r *Resolver) synthesize(q dnsmsg.Msg) []byte {
 		// поведение, на котором negcheck обязан увидеть красные D45/D46.
 		return nil
 	}
-	return dnsmsg.NoData(q)
+	// Ошибка здесь означала бы, что вопрос не разобрался, — а спина зовёт
+	// синтез уже после успешного Parse. Молчим и отдаём вопрос наверх: это
+	// консервативнее, чем притвориться, будто IPv6-записей нет.
+	out, err := dnsmsg.NoData(q)
+	if err != nil {
+		return nil
+	}
+	return out
 }
 
 // upstreamQuery — байты нашего запроса наверх: свой идентификатор,
