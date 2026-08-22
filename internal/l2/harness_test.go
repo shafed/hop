@@ -102,7 +102,8 @@ func newHarness(t *testing.T, opt options) *harness {
 	// Движок сообщает вердикты §6.15 в health — через DialError.Report, то
 	// есть через единственное место в продукте, где это позволено.
 	eng, err := engine.NewWithConfig(engine.Config{
-		Nodes: nodes,
+		Nodes:    nodes,
+		Physical: func() (string, error) { return "lo", nil },
 		OnFailure: func(de *engine.DialError) {
 			h.mu.Lock()
 			mgr := h.mgr

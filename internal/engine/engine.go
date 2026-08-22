@@ -69,24 +69,38 @@ type Engine struct {
 	mu    sync.RWMutex
 	inst  *core.Instance
 	nodes map[string]bool // id узлов, у которых есть outbound
+	hooks map[string]*nodeDialConfig
 }
 
 // Config — как поднять движок.
 type Config struct {
 	Nodes []Node
+	// Physical возвращает текущий физический default-интерфейс для каждого
+	// нового сокета к узлу (§6.8). При непустом Nodes обязателен: непривязанный
+	// fallback может вернуться в туннель.
+	Physical InterfaceFunc
 	// OnFailure получает вердикт §6.15 по отказу соединения с узлом. Именно
 	// отсюда агент зовёт health.ReportFailure — и больше ниоткуда
 	// (TestReportFailureHasOneCallSite).
 	OnFailure func(*DialError)
 }
 
-// New поднимает движок с этими узлами. Пустой набор допустим: движок без узлов
-// умеет только отказывать, и это законное состояние (§5.6).
-func New(nodes []Node) (*Engine, error) { return NewWithConfig(Config{Nodes: nodes}) }
+// InterfaceFunc определяет физический интерфейс для нового сокета.
+type InterfaceFunc func() (string, error)
+
+// New поднимает движок с этими узлами и источником физического интерфейса.
+// Пустой набор допустим: движок без узлов умеет только отказывать, и это
+// законное состояние (§5.6).
+func New(nodes []Node, physical InterfaceFunc) (*Engine, error) {
+	return NewWithConfig(Config{Nodes: nodes, Physical: physical})
+}
 
 // NewWithConfig — то же с колбэком отказов.
 func NewWithConfig(c Config) (*Engine, error) {
 	nodes := c.Nodes
+	if len(nodes) > 0 && c.Physical == nil {
+		return nil, fmt.Errorf("engine: для узлов нужен физический интерфейс (§6.8)")
+	}
 	installDialer()
 
 	cfg, err := BuildConfig(nodes)
@@ -100,10 +114,13 @@ func NewWithConfig(c Config) (*Engine, error) {
 	if err := inst.Start(); err != nil {
 		return nil, fmt.Errorf("engine: инстанс Xray не запустился: %w", err)
 	}
-	e := &Engine{inst: inst, nodes: make(map[string]bool, len(nodes))}
+	e := &Engine{
+		inst: inst, nodes: make(map[string]bool, len(nodes)),
+		hooks: make(map[string]*nodeDialConfig, len(nodes)),
+	}
 	for _, n := range nodes {
 		e.nodes[n.ID] = true
-		watchNode(n.ID, c.OnFailure)
+		e.hooks[n.ID] = watchNode(n.ID, c.OnFailure, c.Physical)
 	}
 	return e, nil
 }
@@ -116,7 +133,7 @@ func (e *Engine) Close() error {
 		return nil
 	}
 	for id := range e.nodes {
-		unwatchNode(id)
+		unwatchNode(id, e.hooks[id])
 	}
 	err := e.inst.Close()
 	e.inst = nil

@@ -33,10 +33,10 @@ func TestT21Up(t *testing.T) {
 	}
 
 	r := rules()
-	// §6.8: правило по UID-диапазону. Оно же — единственное, что не привязано
-	// к интерфейсу, и потому предмет T29.
-	if !strings.Contains(r, fmt.Sprintf("uidrange %d-%d", os.Getuid(), os.Getuid())) {
-		t.Fatalf("нет правила защиты от петли §6.8: %s", r)
+	// §6.8 теперь биндит сокеты агента. UID-правило здесь означало бы, что
+	// весь трафик desktop-пользователя обходит туннель.
+	if strings.Contains(r, "31500:") {
+		t.Fatalf("осталось отвергнутое uid-правило защиты от петли §6.8: %s", r)
 	}
 	// §5.6: исключения выражены правилами выше туннельного, поэтому в
 	// туннельную таблицу они не заходят вовсе — ни в up, ни в orphaned.
@@ -45,6 +45,20 @@ func TestT21Up(t *testing.T) {
 			t.Fatalf("нет исключения §5.6 %q: %s", want, r)
 		}
 	}
+}
+
+// Переходная обязанность: одна версия должна убрать правило 31500, которое
+// могло пережить kill -9 старой сборки. Новая Up его уже не создаёт.
+func TestT21LegacyLoopGuardIsReclaimed(t *testing.T) {
+	requireNetns(t)
+	dropHopRules()
+	sh("ip", "rule", "add", "uidrange", "1000-1000", "lookup", "main", "priority", "31500")
+
+	s := startService(t, orphanDeadline)
+	if r := rules(); strings.Contains(r, "31500:") {
+		t.Fatalf("старт не подобрал uid-правило предыдущей сборки: %s", r)
+	}
+	s.stop()
 }
 
 // T22 — общий платформенный контракт §8.4: после down снапшот совпал с
@@ -191,9 +205,7 @@ func TestAttachWithWrongTokenIsRejected(t *testing.T) {
 }
 
 // T29 — смерть самого владельца маршрутов. §6.2 покрывает смерть агента, но не
-// смерть сервиса. Тест смотрит, что переживает `kill -9` сервиса, — и смотрит
-// именно на `ip rule` с UID-диапазоном (§6.8), который от интерфейса не
-// зависит.
+// смерть сервиса. Тест смотрит, какие правила переживают `kill -9` сервиса.
 func TestT29ServiceDeath(t *testing.T) {
 	s := startService(t, orphanDeadline)
 	s.startAgent(filepath.Join(t.TempDir(), "token"))
@@ -205,7 +217,7 @@ func TestT29ServiceDeath(t *testing.T) {
 
 	var leaked []string
 	for _, line := range strings.Split(rules(), "\n") {
-		for _, prio := range []string{"31000:", "31500:", "32000:"} {
+		for _, prio := range []string{"31000:", "32000:"} {
 			if strings.HasPrefix(strings.TrimSpace(line), prio) {
 				leaked = append(leaked, strings.TrimSpace(line))
 			}
@@ -217,10 +229,11 @@ func TestT29ServiceDeath(t *testing.T) {
 	for _, l := range leaked {
 		t.Logf("  %s", l)
 	}
-	uidRule := fmt.Sprintf("uidrange %d-%d", os.Getuid(), os.Getuid())
-	if !strings.Contains(strings.Join(leaked, "\n"), uidRule) {
-		t.Fatalf("правило §6.8 по UID-диапазону не пережило смерть сервиса — "+
-			"это меняет §6.2 и §6.8, обнови документ. Осталось: %v", leaked)
+	if strings.Contains(rules(), "31500:") {
+		t.Fatalf("новая сборка разложила отвергнутое uid-правило §6.8: %v", leaked)
+	}
+	if len(leaked) == 0 {
+		t.Fatal("ни одно правило не пережило смерть сервиса — это меняет §6.2, обнови документ")
 	}
 
 	// А раз остались — уборка обязана быть чьей-то. Она за следующим стартом

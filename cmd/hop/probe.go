@@ -22,7 +22,7 @@ import (
 //
 // Путь пробы тот же, что в продукте (§6.7): дозвон через outbound проверяемого
 // узла, те же три URL, та же сводка §5.4. Отличается только владелец движка.
-func probeNodes(ctx context.Context, st *store.Store, out io.Writer) error {
+func probeNodes(ctx context.Context, st *store.Store, out io.Writer, physical engine.InterfaceFunc) error {
 	var nodes []store.Node
 	for _, g := range st.Groups() {
 		for _, n := range st.Nodes(g.ID) {
@@ -41,7 +41,7 @@ func probeNodes(ctx context.Context, st *store.Store, out io.Writer) error {
 	}
 	// OnFailure не задаётся: живости здесь нет, а вердикт §6.15 и так вернётся
 	// вызывающему вместе с ошибкой.
-	e, err := engine.NewWithConfig(engine.Config{Nodes: en})
+	e, err := engine.NewWithConfig(engine.Config{Nodes: en, Physical: physical})
 	if err != nil {
 		return fmt.Errorf("движок не собрался: %w", err)
 	}

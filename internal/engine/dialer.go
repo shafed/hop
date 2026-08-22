@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 
@@ -38,10 +39,15 @@ var (
 	dialerOnce sync.Once
 
 	failuresMu sync.RWMutex
-	// failures — куда сообщать вердикт по узлу. Ключ — id узла; в продукте
+	// nodeDials — как дозваниваться до узла и куда сообщать его вердикт. Ключ — id узла; в продукте
 	// движок один, в тестах узлы разных движков обязаны называться по-разному.
-	failures = map[string]func(*DialError){}
+	nodeDials = map[string]*nodeDialConfig{}
 )
+
+type nodeDialConfig struct {
+	onFailure func(*DialError)
+	physical  InterfaceFunc
+}
 
 // installDialer подменяет системный диалер Xray один раз на процесс.
 //
@@ -56,27 +62,28 @@ func installDialer() {
 }
 
 // watchNode подписывает движок на отказы диала к узлу.
-func watchNode(nodeID string, onFailure func(*DialError)) {
-	if onFailure == nil {
-		return
-	}
+func watchNode(nodeID string, onFailure func(*DialError), physical InterfaceFunc) *nodeDialConfig {
+	cfg := &nodeDialConfig{onFailure: onFailure, physical: physical}
 	failuresMu.Lock()
 	defer failuresMu.Unlock()
-	failures[nodeID] = onFailure
+	nodeDials[nodeID] = cfg
+	return cfg
 }
 
-func unwatchNode(nodeID string) {
+func unwatchNode(nodeID string, cfg *nodeDialConfig) {
 	failuresMu.Lock()
 	defer failuresMu.Unlock()
-	delete(failures, nodeID)
+	if nodeDials[nodeID] == cfg {
+		delete(nodeDials, nodeID)
+	}
 }
 
 func reportDialFailure(nodeID string, err error) {
 	failuresMu.RLock()
-	fn := failures[nodeID]
+	cfg := nodeDials[nodeID]
 	failuresMu.RUnlock()
-	if fn != nil {
-		fn(classifyDial(nodeID, err))
+	if cfg != nil && cfg.onFailure != nil {
+		cfg.onFailure(classifyDial(nodeID, err))
 	}
 }
 
@@ -118,11 +125,54 @@ type nodeDialer struct {
 }
 
 func (d *nodeDialer) Dial(ctx context.Context, src xnet.Address, dest xnet.Destination, sockopt *internet.SocketConfig) (xnet.Conn, error) {
-	conn, err := d.inner.Dial(ctx, src, dest, sockopt)
-	if err != nil && !IsProbe(ctx) {
-		if id, ok := nodeFromContext(ctx); ok {
+	id, ok := nodeFromContext(ctx)
+	if !ok {
+		// Альтернативный диалер общий на процесс. Тесты поднимают в нём же сервер
+		// Xray с freedom-outbound; его сокет не является соединением агента с
+		// узлом и не имеет атрибуции node-*. Боевые сокеты узлов всегда несут тег
+		// по той же границе, на которой стоит §6.15.
+		return d.inner.Dial(ctx, src, dest, sockopt)
+	}
+
+	failuresMu.RLock()
+	cfg := nodeDials[id]
+	failuresMu.RUnlock()
+	var physical InterfaceFunc
+	if cfg != nil {
+		physical = cfg.physical
+	}
+	if physical == nil {
+		err := fmt.Errorf("engine: узел %s: не задан источник физического интерфейса (§6.8)", id)
+		if !IsProbe(ctx) {
 			reportDialFailure(id, err)
 		}
+		return nil, err
+	}
+	iface, err := physical()
+	if err != nil || iface == "" {
+		if err == nil {
+			err = fmt.Errorf("физический интерфейс пуст")
+		}
+		err = fmt.Errorf("engine: узел %s: защита от петли: %w", id, err)
+		if !IsProbe(ctx) {
+			reportDialFailure(id, err)
+		}
+		return nil, err
+	}
+
+	// Чужой SocketConfig не меняется: транспорт может переиспользовать его в
+	// параллельных дозвонах. Xray сам переводит Interface в опцию нужной ОС.
+	if sockopt == nil {
+		sockopt = &internet.SocketConfig{}
+	} else {
+		copy := *sockopt
+		sockopt = &copy
+	}
+	sockopt.Interface = iface
+
+	conn, err := d.inner.Dial(ctx, src, dest, sockopt)
+	if err != nil && !IsProbe(ctx) {
+		reportDialFailure(id, err)
 	}
 	return conn, err
 }

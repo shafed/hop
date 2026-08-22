@@ -20,8 +20,10 @@ import (
 
 	"github.com/shafed/hop/internal/agent"
 	"github.com/shafed/hop/internal/clock"
+	"github.com/shafed/hop/internal/engine"
 	"github.com/shafed/hop/internal/health"
 	"github.com/shafed/hop/internal/ipc"
+	"github.com/shafed/hop/internal/outbound"
 	"github.com/shafed/hop/internal/store"
 	"github.com/shafed/hop/internal/tunnel"
 )
@@ -59,8 +61,13 @@ func main() {
 	// при неподнятом hopd, и требовать сокет ради записи на диск незачем.
 	switch {
 	case *subURL != "":
+		physical, err := outbound.New(*name)
+		if err != nil {
+			fail(err)
+		}
+		defer physical.Close()
 		fail(withStore(func(st *store.Store) error {
-			return addSubscription(context.Background(), st, *subURL, os.Stdout)
+			return addSubscription(context.Background(), st, *subURL, os.Stdout, physical.HTTPClient())
 		}))
 		return
 	case *link != "":
@@ -74,8 +81,13 @@ func main() {
 		}))
 		return
 	case *probe:
+		physical, err := outbound.New(*name)
+		if err != nil {
+			fail(err)
+		}
+		defer physical.Close()
 		fail(withStore(func(st *store.Store) error {
-			return probeNodes(context.Background(), st, os.Stdout)
+			return probeNodes(context.Background(), st, os.Stdout, physical.Interface)
 		}))
 		return
 	case *list:
@@ -109,22 +121,22 @@ func main() {
 		return
 	}
 
-	if err := run(log, cl, *tok, *beat, tunnelParams(*name, *addr, *mtu, *table)); err != nil {
+	physical, err := outbound.New(*name)
+	if err != nil {
+		fail(err)
+	}
+	defer physical.Close()
+
+	if err := run(log, cl, *tok, *beat, tunnelParams(*name, *addr, *mtu, *table), physical.Interface); err != nil {
 		fail(err)
 	}
 }
 
-// tunnelParams собирает параметры туннеля.
-//
-// Отдельной функцией ради одного поля: AgentUID. §6.8 выводит трафик агента
-// мимо туннеля правилом по UID-диапазону, и до этапа С здесь стоял ноль по
-// умолчанию — то есть правило защищало root, а не агента. При заглушке это
-// было незаметно (агент никуда не ходил), при живом датаплейне трафик Xray к
-// узлу возвращался бы в туннель петлёй. Проверяется W36.
+// tunnelParams собирает только параметры привилегированной поверхности.
+// Защита от петли §6.8 теперь остаётся в агенте и через IPC не проходит.
 func tunnelParams(name, addr string, mtu, table int) tunnel.Params {
 	return tunnel.Params{
 		Name: name, MTU: mtu, Addr: addr, Table: table,
-		AgentUID: os.Getuid(),
 	}
 }
 
@@ -154,7 +166,7 @@ func withStore(fn func(*store.Store) error) error {
 // узла (§6.7), дозвон живёт в связке, а связке нужна живость, которой нужен
 // пробер. Круг разрывается замыканием — пробер зовёт дозвон лениво, к моменту
 // первой пробы связка уже собрана.
-func run(log *slog.Logger, cl control, tokenFile string, beat time.Duration, p tunnel.Params) error {
+func run(log *slog.Logger, cl control, tokenFile string, beat time.Duration, p tunnel.Params, physical engine.InterfaceFunc) error {
 	root, err := storeRoot()
 	if err != nil {
 		return err
@@ -181,12 +193,13 @@ func run(log *slog.Logger, cl control, tokenFile string, beat time.Duration, p t
 	defer tr.close()
 
 	a, err = agent.New(agent.Config{
-		Store:  st,
-		Health: hm,
-		Trans:  tr,
-		Params: p,
-		Clock:  clock.System{},
-		Log:    log,
+		Store:    st,
+		Health:   hm,
+		Trans:    tr,
+		Params:   p,
+		Clock:    clock.System{},
+		Log:      log,
+		Physical: physical,
 	})
 	if err != nil {
 		return err
@@ -197,7 +210,7 @@ func run(log *slog.Logger, cl control, tokenFile string, beat time.Duration, p t
 	if err := a.Up(); err != nil {
 		return err
 	}
-	log.Info("туннель поднят", "интерфейс", p.Name, "uid агента", p.AgentUID)
+	log.Info("туннель поднят", "интерфейс", p.Name)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

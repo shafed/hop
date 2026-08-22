@@ -204,17 +204,6 @@ func TestW45AcquireStopsTunnelWhenTokenSaveFails(t *testing.T) {
 	}
 }
 
-// TestW36AgentUIDIsTheAgentsOwn — правило §6.8 защищает агента, а не root.
-func TestW36AgentUIDIsTheAgentsOwn(t *testing.T) {
-	p := tunnelParams("hop0", "10.255.0.1/24", 1400, 8420)
-	if p.AgentUID != os.Getuid() {
-		t.Errorf("AgentUID %d, ожидался uid агента %d", p.AgentUID, os.Getuid())
-	}
-	if p.AgentUID == 0 && os.Getuid() != 0 {
-		t.Error("AgentUID нулевой: правило §6.8 защитило бы root, а трафик Xray вернулся бы в туннель петлёй")
-	}
-}
-
 // unwritableTokenPath — путь, по которому saveToken честно не запишет: каталог
 // подменён файлом, и MkdirAll упрётся в него так же, как упёрся бы в
 // недоступный на запись /run/user/<uid>/hop. Подменять saveToken ради проверки

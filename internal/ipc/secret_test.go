@@ -23,7 +23,7 @@ func TestS34TunnelParamsCarryNoNodeFields(t *testing.T) {
 	// больше. Список закрыт намеренно — новое поле обязано попасть сюда через
 	// ревью, а не мимо него.
 	want := map[string]bool{
-		"Name": true, "MTU": true, "Addr": true, "Table": true, "AgentUID": true,
+		"Name": true, "MTU": true, "Addr": true, "Table": true,
 	}
 	rt := reflect.TypeOf(tunnel.Params{})
 	got := make(map[string]bool, rt.NumField())
@@ -56,7 +56,7 @@ func TestS34StartRequestCarriesNoNodeFields(t *testing.T) {
 	raw, err := encode(Request{
 		Op: OpStart,
 		Params: &tunnel.Params{
-			Name: "hop0", MTU: 1420, Addr: "10.255.0.1/24", Table: 1042, AgentUID: 1000,
+			Name: "hop0", MTU: 1420, Addr: "10.255.0.1/24", Table: 1042,
 		},
 	})
 	if err != nil {

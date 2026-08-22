@@ -24,10 +24,10 @@ import (
 // Вся логика — в subscription.Updater, включая Р7: любой отказ до последнего
 // шага оставляет группу ровно такой, какой она была. Здесь только выбор группы
 // и вывод.
-func addSubscription(ctx context.Context, st *store.Store, url string, out io.Writer) error {
+func addSubscription(ctx context.Context, st *store.Store, url string, out io.Writer, doer subscription.Doer) error {
 	u := &subscription.Updater{
 		Store:      st,
-		Downloader: subscription.NewDownloader(nil, clock.System{}),
+		Downloader: subscription.NewDownloader(doer, clock.System{}),
 	}
 
 	// Группа именуется по ссылке, а не случайно: повторный `-sub` с той же

@@ -16,13 +16,15 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Приоритеты правил. Порядок — часть контракта: исключения §5.6 и правило
-// защиты от петли §6.8 обязаны стоять выше правила туннеля, иначе туннельная
-// таблица заберёт их первой.
+// Приоритеты правил. Порядок — часть контракта: исключения §5.6 обязаны стоять
+// выше правила туннеля, иначе туннельная таблица заберёт их первой.
 const (
 	prioExclusions = 31000 // §5.6: локальные сети, DHCP, NTP
-	prioLoopGuard  = 31500 // §6.8: трафик самого агента мимо туннеля
 	prioTunnel     = 32000 // всё остальное — в таблицу туннеля
+	// legacyPrioLoopGuard больше не раскладывается: uid-правило выводило мимо
+	// туннеля весь трафик desktop-пользователя. Одна версия Reclaim обязана
+	// всё ещё подобрать его после обновления со старой сборки (§6.8).
+	legacyPrioLoopGuard = 31500
 )
 
 // Linux — привилегированная поверхность на Linux.
@@ -166,18 +168,6 @@ func (l *Linux) Up(p tunnel.Params) (tunnel.Device, error) {
 			ip("rule", "del", "ipproto", "udp", "dport", port, "lookup", "main", "priority", fmt.Sprint(prioExclusions)),
 		})
 	}
-	// §6.8: агенту не требуется ничего — правило по UID-диапазону выводит его
-	// трафик мимо туннеля и переживает смену интерфейса. Оно же — единственное,
-	// что не привязано к интерфейсу и потому переживает смерть сервиса (T29).
-	uid := fmt.Sprintf("%d-%d", p.AgentUID, p.AgentUID)
-	steps = append(steps, struct {
-		name     string
-		add, del []string
-	}{
-		"loop guard uid " + uid,
-		ip("rule", "add", "uidrange", uid, "lookup", "main", "priority", fmt.Sprint(prioLoopGuard)),
-		ip("rule", "del", "uidrange", uid, "lookup", "main", "priority", fmt.Sprint(prioLoopGuard)),
-	})
 	steps = append(steps, struct {
 		name     string
 		add, del []string
@@ -262,16 +252,16 @@ func (l *Linux) tunnelRoute(verb string) []string {
 
 // Reclaim снимает правила, оставшиеся от предыдущего воплощения сервиса.
 //
-// T29 показал, что смерть сервиса переживают **все** его правила, а не только
-// правило §6.8 по UID-диапазону: интерфейс уходит с последним дескриптором и
-// уносит свои маршруты, но правила к интерфейсу не привязаны. Значит, у §6.2
+// T29 показал, что смерть сервиса переживают его правила: интерфейс уходит с
+// последним дескриптором и уносит свои маршруты, но правила к интерфейсу не
+// привязаны. Значит, у §6.2
 // появляется ещё одна обязанность — убрать за собой на старте, до того как
 // будет снят снапшот. Иначе «восстановление до снапшота» закрепит мусор.
 //
 // Опознаются правила по приоритетам, которые раскладывает только hopd.
 func Reclaim() (int, error) {
 	dropped := 0
-	for _, prio := range []int{prioExclusions, prioLoopGuard, prioTunnel} {
+	for _, prio := range []int{prioExclusions, legacyPrioLoopGuard, prioTunnel} {
 		for i := 0; i < 64; i++ {
 			if err := run(ip("rule", "del", "priority", fmt.Sprint(prio)))(); err != nil {
 				break // правил с этим приоритетом больше нет

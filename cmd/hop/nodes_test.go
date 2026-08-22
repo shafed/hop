@@ -48,7 +48,7 @@ func TestW41SubReachesDisk(t *testing.T) {
 	defer srv.Close()
 
 	if err := withStore(func(st *store.Store) error {
-		return addSubscription(context.Background(), st, srv.URL, io.Discard)
+		return addSubscription(context.Background(), st, srv.URL, io.Discard, srv.Client())
 	}); err != nil {
 		t.Fatalf("подписка не доехала: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestW41SubTwiceKeepsOneGroup(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		if err := withStore(func(st *store.Store) error {
-			return addSubscription(context.Background(), st, srv.URL, io.Discard)
+			return addSubscription(context.Background(), st, srv.URL, io.Discard, srv.Client())
 		}); err != nil {
 			t.Fatalf("подписка %d: %v", i+1, err)
 		}
@@ -123,7 +123,7 @@ func TestW42FailedSubLeavesStoreAlone(t *testing.T) {
 	defer good.Close()
 
 	if err := withStore(func(st *store.Store) error {
-		return addSubscription(context.Background(), st, good.URL, io.Discard)
+		return addSubscription(context.Background(), st, good.URL, io.Discard, good.Client())
 	}); err != nil {
 		t.Fatalf("первая подписка: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestW42FailedSubLeavesStoreAlone(t *testing.T) {
 
 	before := nodeIDs(t, root)
 	err := withStore(func(st *store.Store) error {
-		return addSubscription(context.Background(), st, empty.URL, io.Discard)
+		return addSubscription(context.Background(), st, empty.URL, io.Discard, empty.Client())
 	})
 	if err == nil {
 		t.Fatal("пустая подписка принята молча: группа была бы стёрта вместе с историей проб")
@@ -227,7 +227,7 @@ func TestRemoveNodeDropsOne(t *testing.T) {
 	defer srv.Close()
 
 	if err := withStore(func(st *store.Store) error {
-		return addSubscription(context.Background(), st, srv.URL, io.Discard)
+		return addSubscription(context.Background(), st, srv.URL, io.Discard, srv.Client())
 	}); err != nil {
 		t.Fatalf("подписка: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestRemoveGroupEmptiesIt(t *testing.T) {
 	defer srv.Close()
 
 	if err := withStore(func(st *store.Store) error {
-		return addSubscription(context.Background(), st, srv.URL, io.Discard)
+		return addSubscription(context.Background(), st, srv.URL, io.Discard, srv.Client())
 	}); err != nil {
 		t.Fatalf("подписка: %v", err)
 	}

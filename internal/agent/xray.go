@@ -32,11 +32,6 @@ type xray interface {
 // onFailure — и это единственный путь до health.ReportFailure (§6.15, D10).
 type xrayFactory func(nodes []engine.Node, onFailure func(*engine.DialError)) (xray, error)
 
-// realXray — фабрика поверх настоящего движка.
-func realXray(nodes []engine.Node, onFailure func(*engine.DialError)) (xray, error) {
-	return engine.NewWithConfig(engine.Config{Nodes: nodes, OnFailure: onFailure})
-}
-
 // instance — один инстанс Xray и счётчик выданных им незакрытых соединений.
 //
 // Счётчик нужен дренажу (Р32): инстанс держат, пока через него кто-то говорит,

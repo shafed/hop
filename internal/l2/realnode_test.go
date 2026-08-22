@@ -15,6 +15,7 @@ import (
 
 	"github.com/shafed/hop/internal/engine"
 	"github.com/shafed/hop/internal/health"
+	"github.com/shafed/hop/internal/outbound"
 )
 
 // xrayLog ловит сообщения Xray. Без него смоук бесполезен как диагностика:
@@ -63,6 +64,11 @@ func TestRealNodeSmoke(t *testing.T) {
 	if link == "" {
 		t.Skip("HOP_TEST_NODE не задан — смоук против настоящего узла пропущен")
 	}
+	physical, err := outbound.New("")
+	if err != nil {
+		t.Fatalf("физический интерфейс: %v", err)
+	}
+	defer physical.Close()
 
 	node, err := parseVLESS(link)
 	if err != nil {
@@ -74,6 +80,7 @@ func TestRealNodeSmoke(t *testing.T) {
 	eng, err := engine.NewWithConfig(engine.Config{
 		Nodes:     []engine.Node{node},
 		OnFailure: func(de *engine.DialError) { verdicts <- de },
+		Physical:  physical.Interface,
 	})
 	if err != nil {
 		t.Fatalf("движок не собрался: %v", err)

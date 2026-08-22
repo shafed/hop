@@ -41,6 +41,9 @@ type Config struct {
 	Params tunnel.Params
 	Clock  clock.Clock
 	Log    *slog.Logger
+	// Physical resolves the physical default interface for sockets Xray opens
+	// to nodes (§6.8). It is consulted for every new socket.
+	Physical engine.InterfaceFunc
 
 	// Resolver — этап 6. nil означает заглушку Р31: SERVFAIL, а не молчание.
 	Resolver Resolver
@@ -90,7 +93,11 @@ func New(cfg Config) (*Agent, error) {
 		cfg.Log = slog.Default()
 	}
 	if cfg.NewXray == nil {
-		cfg.NewXray = realXray
+		cfg.NewXray = func(nodes []engine.Node, onFailure func(*engine.DialError)) (xray, error) {
+			return engine.NewWithConfig(engine.Config{
+				Nodes: nodes, OnFailure: onFailure, Physical: cfg.Physical,
+			})
+		}
 	}
 	res := cfg.Resolver
 	if res == nil {

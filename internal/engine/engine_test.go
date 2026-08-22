@@ -15,6 +15,8 @@ import (
 // Настоящее время в этом файле — это сетевые дедлайны стенда, а не логика
 // продукта: живость и расписание живут в internal/health на фейковых часах.
 
+func loopbackPhysical() (string, error) { return "lo", nil }
+
 // echoServer — «интернет» стенда: отдаёт назад то, что получил.
 func echoServer(t *testing.T) string {
 	t.Helper()
@@ -59,7 +61,7 @@ func TestDialGoesThroughTheNode(t *testing.T) {
 	}
 	t.Cleanup(func() { srv.Close() })
 
-	e, err := New([]Node{nodeFor(srv, "A")})
+	e, err := New([]Node{nodeFor(srv, "A")}, loopbackPhysical)
 	if err != nil {
 		t.Fatalf("движок не поднялся: %v", err)
 	}
@@ -102,7 +104,7 @@ func TestDialPicksTheRequestedNode(t *testing.T) {
 	}
 	t.Cleanup(func() { srvB.Close() })
 
-	e, err := New([]Node{nodeFor(srvA, "A"), nodeFor(srvB, "B")})
+	e, err := New([]Node{nodeFor(srvA, "A"), nodeFor(srvB, "B")}, loopbackPhysical)
 	if err != nil {
 		t.Fatalf("движок: %v", err)
 	}
@@ -122,7 +124,7 @@ func TestDialPicksTheRequestedNode(t *testing.T) {
 // TestDialThroughUnknownNodeIsNotFatal — вызов с чужим id это ошибка
 // вызывающего, а не смерть узла: иначе опечатка убивала бы живой узел.
 func TestDialThroughUnknownNodeIsNotFatal(t *testing.T) {
-	e, err := New(nil)
+	e, err := New(nil, nil)
 	if err != nil {
 		t.Fatalf("движок: %v", err)
 	}
@@ -159,6 +161,7 @@ func TestDeadNodeGivesFatalVerdict(t *testing.T) {
 			Params: map[string]string{"uuid": xraytest.DefaultUUID},
 		}},
 		OnFailure: func(de *DialError) { verdicts <- de },
+		Physical:  loopbackPhysical,
 	})
 	if err != nil {
 		t.Fatalf("движок: %v", err)
@@ -206,11 +209,11 @@ func TestStreamErrorIsNotFatal(t *testing.T) {
 	dead := l.Addr().(*net.TCPAddr)
 	l.Close()
 
-	e, err := New([]Node{{
+	e, err := NewWithConfig(Config{Nodes: []Node{{
 		ID: "dead", Protocol: "vless", Server: "127.0.0.1", Port: dead.Port,
 		Transport: "raw", Security: "none",
 		Params: map[string]string{"uuid": xraytest.DefaultUUID},
-	}})
+	}}, Physical: loopbackPhysical})
 	if err != nil {
 		t.Fatalf("движок: %v", err)
 	}
@@ -286,6 +289,7 @@ func TestProbeDialDoesNotReportTraffic(t *testing.T) {
 			Params: map[string]string{"uuid": xraytest.DefaultUUID},
 		}},
 		OnFailure: func(de *DialError) { verdicts <- de },
+		Physical:  loopbackPhysical,
 	})
 	if err != nil {
 		t.Fatalf("движок: %v", err)
