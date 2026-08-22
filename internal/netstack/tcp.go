@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -154,6 +155,22 @@ func (t *tcpStack) pipe(a, b net.Conn) {
 	}()
 }
 
+// Границы одного соединения DNS поверх TCP.
+const (
+	// dnsStreamIdle — сколько соединение живёт без запросов. RFC 7766 §6.2.1
+	// требует закрывать простаивающие соединения и называет «несколько секунд»
+	// разумным сроком для сервера без сигнала edns-tcp-keepalive.
+	dnsStreamIdle = 10 * time.Second
+	// dnsStreamInFlight — сколько запросов одного соединения обслуживается
+	// параллельно. Потолок есть потому, что конвейер RFC 7766 позволяет клиенту
+	// прислать сколько угодно запросов, не читая ответов; сверх потолка мы
+	// просто перестаём читать, и дальше клиента тормозит TCP-окно.
+	dnsStreamInFlight = 64
+	// dnsStreamMax — потолок сообщения: префикс длины двухбайтовый
+	// (RFC 1035 §4.2.2).
+	dnsStreamMax = 0xFFFF
+)
+
 // dnsOverTCP — §3.4 говорит «dst-порт 53 (UDP или TCP)». Поток надо
 // терминировать, чтобы добраться до запроса: DNS поверх TCP несёт запрос с
 // двухбайтовым префиксом длины (RFC 1035 §4.2.2).
@@ -166,29 +183,142 @@ func (t *tcpStack) dnsOverTCP(r *tcp.ForwarderRequest, f flow) {
 	if !ok {
 		return
 	}
-	t.s.wg.Add(1)
+	t.serveDNSStream(conn, f)
+}
+
+// serveDNSStream обслуживает одно соединение DNS поверх TCP. Возвращается
+// сразу: работа живёт в горутинах, привязанных к wg стека.
+//
+// Три свойства, и каждое стоит своей сложности.
+//
+// Конвейер (RFC 7766 §6.2.1.1, D6). Ответы разрешено возвращать не в порядке
+// запросов, и каждый запрос обслуживается своей горутиной, а не ждёт
+// предыдущего: строгий порядок означал бы, что одно медленное имя держит всё
+// соединение, то есть одно зависшее имя превращается в зависший DNS целиком.
+// Цена — писателей в conn несколько, поэтому запись под замком и одним вызовом
+// Write: два ответа, перемешанные в потоке байт, необратимо ломают разбор по
+// префиксу длины у клиента.
+//
+// Таймаут простоя по clock.Clock, а не через SetReadDeadline (D7). Дедлайн
+// сокета живёт в настоящем времени, и модельные часы его не двигают — §8.1 и
+// требование 4 регистра. Отсюда разделение на читателя и распорядителя: чтение
+// блокирующее и живёт в отдельной горутине, а срок выбирается селектом вместе с
+// прочитанным; из блокирующего чтения читателя будит только закрытие conn — им
+// таймаут и заканчивается.
+//
+// Порядок завода таймера. Первый срок ставится здесь, до старта горутин, а
+// следующий — на приёме запроса и **до** того, как ответ уйдёт клиенту. Это не
+// косметика: проверка на фейковых часах, дождавшаяся ответа, тем самым знает,
+// что новый срок уже поставлен, и её Advance не пролетает мимо незаведённого
+// таймера. Запрос в полёте срок не продлевает — бюджет клиентского запроса 5 с
+// (§4 регистра), и десятисекундный срок его перекрывает.
+func (t *tcpStack) serveDNSStream(conn net.Conn, f flow) {
+	// Транспорт резолверу сообщается один раз на соединение, а не на запрос.
+	stream, _ := t.s.cfg.Resolver.(StreamResolver)
+
+	var once sync.Once
+	closed := make(chan struct{})
+	stop := func() {
+		once.Do(func() {
+			close(closed)
+			_ = conn.Close()
+		})
+	}
+
+	idle := t.s.cfg.Clock.After(dnsStreamIdle)
+	queries := make(chan []byte) // без буфера: читатель не забегает вперёд
+
+	t.s.wg.Add(2)
+	go t.readDNSStream(conn, queries, closed, stop)
 	go func() {
 		defer t.s.wg.Done()
-		defer conn.Close()
-		var hdr [2]byte
+		defer stop()
+
+		var wmu sync.Mutex
+		slots := make(chan struct{}, dnsStreamInFlight)
 		for {
-			if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+			select {
+			case query := <-queries:
+				idle = t.s.cfg.Clock.After(dnsStreamIdle)
+				select {
+				case slots <- struct{}{}:
+				case <-closed:
+					return
+				case <-t.s.done:
+					return
+				}
+				t.s.wg.Add(1)
+				go func() {
+					defer t.s.wg.Done()
+					defer func() { <-slots }()
+					t.answerDNSStream(conn, &wmu, stream, query, f, stop)
+				}()
+			case <-idle:
+				return // stop() в defer: простой освобождает и горутины, и conn
+			case <-closed:
 				return
-			}
-			query := make([]byte, binary.BigEndian.Uint16(hdr[:]))
-			if _, err := io.ReadFull(conn, query); err != nil {
-				return
-			}
-			answer, err := t.s.cfg.Resolver.Query(query, f.src, f.dst)
-			if err != nil {
-				return
-			}
-			binary.BigEndian.PutUint16(hdr[:], uint16(len(answer)))
-			if _, err := conn.Write(append(hdr[:], answer...)); err != nil {
+			case <-t.s.done:
 				return
 			}
 		}
 	}()
+}
+
+// readDNSStream разбирает поток на сообщения. Отдельная горутина именно потому,
+// что ReadFull блокирующий: селект распорядителя с ним не совмещается.
+func (t *tcpStack) readDNSStream(conn net.Conn, queries chan<- []byte, closed <-chan struct{}, stop func()) {
+	defer t.s.wg.Done()
+	defer stop()
+
+	var hdr [2]byte
+	for {
+		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+			return
+		}
+		query := make([]byte, binary.BigEndian.Uint16(hdr[:]))
+		if _, err := io.ReadFull(conn, query); err != nil {
+			return
+		}
+		select {
+		case queries <- query:
+		case <-closed:
+			return
+		}
+	}
+}
+
+// answerDNSStream отвечает на один запрос и кладёт ответ в поток целиком.
+func (t *tcpStack) answerDNSStream(conn net.Conn, wmu *sync.Mutex, stream StreamResolver, query []byte, f flow, stop func()) {
+	var (
+		answer []byte
+		err    error
+	)
+	if stream != nil {
+		answer, err = stream.QueryStream(query, f.src, f.dst)
+	} else {
+		answer, err = t.s.cfg.Resolver.Query(query, f.src, f.dst)
+	}
+	if err != nil || len(answer) == 0 || len(answer) > dnsStreamMax {
+		// Резолвер выражает отказ кодом ответа, а не ошибкой (§5.6), поэтому
+		// ошибка здесь — поломка, а не ответ, и сказать её клиенту в потоке
+		// нечем. Закрываем соединение: обрыв клиент заметит и повторит, а
+		// молчание в открытом потоке он от медленного ответа не отличит. Цена —
+		// вместе с этим ответом теряются и соседние, ещё летящие.
+		stop()
+		return
+	}
+
+	out := make([]byte, 2+len(answer))
+	binary.BigEndian.PutUint16(out[:2], uint16(len(answer)))
+	copy(out[2:], answer)
+
+	// Один Write на сообщение и под замком: см. цену конвейера в serveDNSStream.
+	wmu.Lock()
+	_, werr := conn.Write(out)
+	wmu.Unlock()
+	if werr != nil {
+		stop()
+	}
 }
 
 // linkEndpoint — stack.LinkEndpoint поверх PacketDevice. Своя реализация, а не

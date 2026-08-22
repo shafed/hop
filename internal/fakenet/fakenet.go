@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -220,6 +221,14 @@ type Resolver struct {
 	// того, что запрос дошёл до резолвера, а не ушёл в сеть.
 	Answer []byte
 
+	// Gate — если задан, вызывается после того, как запрос записан, и до того,
+	// как ответ вернулся. Им проверка держит один запрос дольше другого: сна на
+	// фейковых часах не бывает, а «отвечается дольше» в конвейере DNS поверх
+	// TCP (D6) означает порядок ответов, а не длительность. Замок резолвера на
+	// время вызова не удерживается — иначе задержанный запрос запер бы Asks и
+	// остальные запросы заодно.
+	Gate func(query []byte)
+
 	mu   sync.Mutex
 	seen []Asked
 }
@@ -235,7 +244,11 @@ func (r *Resolver) Query(query []byte, client, server netip.AddrPort) ([]byte, e
 	r.mu.Lock()
 	r.seen = append(r.seen, Asked{append([]byte(nil), query...), client, server})
 	answer := r.Answer
+	gate := r.Gate
 	r.mu.Unlock()
+	if gate != nil {
+		gate(query)
+	}
 	if len(answer) == 0 {
 		return query, nil
 	}
@@ -248,6 +261,24 @@ func (r *Resolver) Asks() []Asked {
 	defer r.mu.Unlock()
 	return append([]Asked(nil), r.seen...)
 }
+
+// StreamResolver — тот же фейк, но объявивший netstack.StreamResolver: им
+// проверяется, что клиента, пришедшего потоком, резолвер видит именно потоком
+// (иначе ответ длиннее буфера EDNS0 уехал бы с флагом TC там, где TCP позволяет
+// отдать полный RRset).
+type StreamResolver struct {
+	Resolver
+
+	streamed atomic.Uint64
+}
+
+func (r *StreamResolver) QueryStream(query []byte, client, server netip.AddrPort) ([]byte, error) {
+	r.streamed.Add(1)
+	return r.Resolver.Query(query, client, server)
+}
+
+// Streamed — сколько запросов пришло потоком.
+func (r *StreamResolver) Streamed() uint64 { return r.streamed.Load() }
 
 // Bypass — приёмник того, что ушло мимо туннеля (§6.10).
 type Bypass struct {

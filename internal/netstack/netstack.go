@@ -67,6 +67,19 @@ type Resolver interface {
 	Query(query []byte, client, server netip.AddrPort) ([]byte, error)
 }
 
+// StreamResolver — резолвер, знающий, что клиент пришёл потоком.
+//
+// Клиенту по UDP ответ длиннее его буфера EDNS0 вернуть нельзя — ему уходит
+// флаг TC (§5.7, У4 регистра); клиенту по TCP тот же ответ можно и нужно отдать
+// целым RRset. Различить эти два случая обязан резолвер, а Query транспорта не
+// несёт. Интерфейс Resolver заморожен с этапа 3, поэтому знание о транспорте
+// приезжает отдельным интерфейсом: объявил метод — зовём его, не объявил —
+// прежний Query. Тот же приём, что у FlushableResolver в связке.
+type StreamResolver interface {
+	Resolver
+	QueryStream(query []byte, client, server netip.AddrPort) ([]byte, error)
+}
+
 // BypassSink — то, что уходит мимо туннеля, в локальную сеть (§6.10).
 //
 // В продукте таких пакетов на устройстве нет вовсе: исключения выражены
