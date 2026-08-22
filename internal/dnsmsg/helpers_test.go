@@ -3,6 +3,7 @@ package dnsmsg
 import (
 	"encoding/binary"
 	"strings"
+	"testing"
 )
 
 // Сообщения в тестах собираются здесь, по байтам, а не функциями пакета:
@@ -101,4 +102,15 @@ func aResponse(id uint16, ttl uint32) []byte {
 		question("example.com", TypeA),
 		[][]byte{record("example.com", TypeA, ClassIN, ttl, []byte{203, 0, 113, 7})},
 		nil, nil)
+}
+
+// mustParse — разбор фикстуры, которая обязана разбираться. Ошибка здесь —
+// сломанная фикстура, а не проверяемое поведение.
+func mustParse(t *testing.T, raw []byte) Msg {
+	t.Helper()
+	m, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("фикстура не разбирается: %v", err)
+	}
+	return m
 }

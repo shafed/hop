@@ -100,6 +100,7 @@ var (
 	ErrOption      = errors.New("dnsmsg: опция EDNS0 выходит за границу RDATA")
 	ErrOptNotLast  = errors.New("dnsmsg: OPT не последняя запись сообщения")
 	ErrLimit       = errors.New("dnsmsg: заголовок с вопросом не влезает в лимит")
+	ErrQuestionLen = errors.New("dnsmsg: секции вопроса клиента и апстрима разной длины")
 )
 
 // Header — двенадцать байт заголовка как есть. Счётчики хранятся сырыми: по
@@ -260,6 +261,22 @@ func Parse(msg []byte) (Msg, error) {
 			End:   nameEnd + 4,
 		},
 	}, nil
+}
+
+// checkParsed отказывает на Msg, не прошедшем Parse.
+//
+// Parse при ошибке возвращает именно Msg{}, и самый естественный обработчик
+// «не-DNS на :53» подаёт этот Msg дальше — в отказ клиенту (D8). Границы
+// нулевого Msg не годятся ни для среза, ни для записи, и обещание пакета
+// («любая функция на любом входе возвращает ошибку») держится только на этой
+// проверке: паниковать здесь значит снять туннель на пакете, который прислал
+// любой локальный процесс.
+func (m Msg) checkParsed() error {
+	if m.Question.End < HeaderLen || m.Question.End > len(m.Raw) {
+		return fmt.Errorf("%w: сообщение не разобрано — вопрос кончается на %d при буфере %d байт",
+			ErrShort, m.Question.End, len(m.Raw))
+	}
+	return nil
 }
 
 // QuestionBytes — заголовок и секция вопроса байт в байт (D3).

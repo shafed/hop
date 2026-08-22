@@ -3,12 +3,110 @@ package dnsmsg
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"strings"
 	"testing"
 )
 
-// D3, D47. Ответ клиенту отличается от ответа апстрима ровно идентификатором:
+// D3, D30, D47, Р23. Ответ клиенту несёт идентификатор и написание имени из
+// ЕГО запроса, а секции — апстримовые байт в байт, включая TTL.
+//
+// Написание в ответе апстрима отличается от клиентского не по экзотике, а по
+// устройству: кэш общий и ключуется именем без учёта регистра (Р23), значит
+// в нём лежит написание того клиента, который промахнулся первым. Стаб с
+// 0x20-рандомизацией сверяет написание байт в байт и чужое молча отбросит —
+// снаружи это «DNS не работает» при рабочем резолвере.
+func TestD30ReplyToTakesQuestionFromClient(t *testing.T) {
+	// В ANSWER — сжатое имя: указатель на 12-й байт, то есть на секцию
+	// вопроса. После склейки оно обязано разворачиваться в клиентское
+	// написание, а не уехать на середину чужого имени.
+	compressed := []byte{0xC0, HeaderLen, 0, 1, 0, 1, 0, 0, 1, 44, 0, 4, 203, 0, 113, 7}
+	upstreamRaw := assemble(0xBEEF, FlagResponse|FlagRecursionAvailable,
+		question("example.com", TypeA),
+		[][]byte{compressed},
+		[][]byte{record("example.com", TypeNS, ClassIN, 900, wireName("ns.example.com"))},
+		[][]byte{optRecord(4096, true)})
+	upstream, err := Parse(upstreamRaw)
+	if err != nil {
+		t.Fatalf("Parse апстрима: %v", err)
+	}
+	before := append([]byte(nil), upstreamRaw...)
+
+	clientQuestion := question("eXaMpLe.CoM", TypeA)
+	queryRaw := assemble(0x1234, FlagRecursionDesired, clientQuestion, nil, nil, nil)
+	query, err := Parse(queryRaw)
+	if err != nil {
+		t.Fatalf("Parse запроса: %v", err)
+	}
+
+	reply, err := ReplyTo(query, upstream)
+	if err != nil {
+		t.Fatalf("ReplyTo: %v", err)
+	}
+
+	if reply.Header.ID != 0x1234 || binary.BigEndian.Uint16(reply.Raw[0:2]) != 0x1234 {
+		t.Fatalf("идентификатор клиента не подставлен: %#x", reply.Header.ID)
+	}
+	if !bytes.Equal(reply.QuestionBytes(), clientQuestion) {
+		t.Fatalf("секция вопроса не клиентская: %q", reply.Question.Name)
+	}
+	if !bytes.Equal(reply.Question.Name, wireName("eXaMpLe.CoM")) {
+		t.Fatalf("написание имени не клиентское: %q", reply.Question.Name)
+	}
+	if !bytes.Equal(reply.Sections(), upstream.Sections()) {
+		t.Fatal("секции разошлись с апстримовыми: У6 разрешает менять только идентификатор и вопрос")
+	}
+	if reply.Header.Flags != upstream.Header.Flags {
+		t.Fatalf("флаги %#x, у апстрима %#x", reply.Header.Flags, upstream.Header.Flags)
+	}
+	if reply.Header.ANCount != upstream.Header.ANCount || reply.Header.ARCount != upstream.Header.ARCount {
+		t.Fatal("счётчики разошлись с апстримовыми")
+	}
+	if !bytes.Equal(upstreamRaw, before) {
+		t.Fatal("буфер апстрима переписан на месте: он общий, в кэше он один на всех")
+	}
+	if &reply.Raw[0] == &upstream.Raw[0] || &reply.Question.Name[0] == &query.Question.Name[0] {
+		t.Fatal("ответ делит память с чужим буфером")
+	}
+	// Собранное обязано разбираться обратно: смещения перенесены, а не
+	// пересчитаны, и разъехавшиеся границы видно только так.
+	back, err := Parse(reply.Raw)
+	if err != nil {
+		t.Fatalf("собранный ответ не разбирается: %v", err)
+	}
+	if back.Question.End != reply.Question.End {
+		t.Fatalf("границы вопроса разъехались: %d против %d", back.Question.End, reply.Question.End)
+	}
+	if _, err := back.Facts(); err != nil {
+		t.Fatalf("секции собранного ответа не проходятся: %v", err)
+	}
+}
+
+// Разная длина секций вопроса — отказ. Указатели сжатия в секциях апстрима
+// считают смещения от его собственной секции вопроса; склейка кусков разной
+// длины сдвинет всё, что за вопросом, и клиент получит синтаксически
+// безупречное сообщение с поехавшими именами — то есть ошибку, которую он не
+// заметит. При 0x20-рандомизации длины совпадают всегда.
+func TestReplyToRefusesDifferentQuestionLength(t *testing.T) {
+	upstream := mustParse(t, aResponse(1, 300)) // example.com
+	long := mustParse(t, assemble(2, FlagRecursionDesired,
+		question("very-long-example.com", TypeA), nil, nil, nil))
+
+	if _, err := ReplyTo(long, upstream); !errors.Is(err, ErrQuestionLen) {
+		t.Fatalf("ошибка %v, ожидалась ErrQuestionLen: склеены куски разной длины", err)
+	}
+	// Msg{} — то, что Parse возвращает при ошибке (D8): отказ, а не паника.
+	if _, err := ReplyTo(Msg{}, upstream); err == nil {
+		t.Fatal("собран ответ на неразобранный запрос")
+	}
+	if _, err := ReplyTo(upstream, Msg{}); err == nil {
+		t.Fatal("собран ответ из неразобранного апстрима")
+	}
+}
+
+// D47. Устаревшая Reply отличается от ответа апстрима ровно идентификатором:
 // секция вопроса и все три секции записей проходят байт в байт, включая TTL.
+// Вопрос она берёт апстримовый — ровно то, из-за чего её сменяет ReplyTo.
 func TestD47ReplyChangesOnlyID(t *testing.T) {
 	upstreamRaw := assemble(0xBEEF, FlagResponse|FlagRecursionAvailable,
 		question("example.com", TypeA),
