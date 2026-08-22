@@ -3,6 +3,7 @@ package dnstest
 import (
 	"encoding/binary"
 	"net/netip"
+	"strings"
 	"testing"
 )
 
@@ -14,6 +15,68 @@ func TestNameEncodesLabels(t *testing.T) {
 	}
 	if string(Name("")) != string([]byte{0}) {
 		t.Fatal("Name(\"\") должно кодировать корневое имя")
+	}
+}
+
+// Слишком длинное — паника, а не валидное сообщение другой структуры.
+// Стенд собирает мусор для D15 нарочно, и мусор обязан быть тем самым, каким
+// его задумали: молчаливое усечение делает проверку зелёной, ничего не
+// проверив.
+func TestFixtureBuildersRefuseOversizedInput(t *testing.T) {
+	cases := []struct {
+		name  string
+		build func()
+	}{
+		{"метка длиннее 63", func() { Name(strings.Repeat("x", 64) + ".example.com") }},
+		{"имя длиннее 255", func() {
+			Name(strings.TrimSuffix(strings.Repeat(strings.Repeat("x", 63)+".", 5), "."))
+		}},
+		{"RDATA длиннее 65535", func() {
+			RR{Name: "example.com", Type: TypeTXT, TTL: 300, Data: make([]byte, 65536)}.encode()
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("фикстура собрана молча: сообщение стало валидным, но не тем")
+				}
+			}()
+			c.build()
+		})
+	}
+
+	// Ровно на потолке — всё ещё законная фикстура.
+	Name(strings.Repeat("x", 63) + ".com")
+	RR{Name: "example.com", Type: TypeTXT, TTL: 300, Data: make([]byte, 65535)}.encode()
+}
+
+// SourcePrefix у ECS — uint8, и округление вверх обязано считаться в int:
+// uint8(255+7) даёт 6, то есть ноль байт адреса вместо всех. Фикстура «битый
+// ECS» должна быть битой тем способом, каким её задумали.
+func TestECSPrefixRoundingDoesNotOverflow(t *testing.T) {
+	ip := netip.MustParseAddr("203.0.113.9")
+	cases := []struct {
+		name   string
+		prefix uint8
+		want   int // байт адреса в опции
+	}{
+		{"нулевой префикс", 0, 0},
+		{"/24 — три байта", 24, 3},
+		{"/32 — четыре байта", 32, 4},
+		{"/255 — весь адрес, а не ноль байт", 255, 4},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			opt := ECS{Family: 1, SourcePrefix: c.prefix, Address: ip}.encode()
+			// код, длина опции, семейство, два префикса — дальше адрес
+			if got := len(opt) - 8; got != c.want {
+				t.Fatalf("байт адреса %d, хочу %d (опция %v)", got, c.want, opt)
+			}
+			if l := int(binary.BigEndian.Uint16(opt[2:4])); l != len(opt)-4 {
+				t.Fatalf("длина опции %d не сходится с телом %d", l, len(opt)-4)
+			}
+		})
 	}
 }
 

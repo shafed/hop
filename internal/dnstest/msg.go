@@ -34,6 +34,14 @@ const DefaultEDNS0BufSize = 4096
 // optECS — код опции EDNS Client Subnet (RFC 7871).
 const optECS = 8
 
+// Потолки проводного формата (RFC 1035 §2.3.4, §4.1.1). Фикстура, которая их
+// перешагнула, — сломанная фикстура, а не проверяемый вход.
+const (
+	maxLabel    = 63
+	maxName     = 255
+	maxRDLength = 65535
+)
+
 // Flags — биты заголовка DNS-сообщения (RFC 1035 §4.1.1).
 type Flags struct {
 	QR, AA, TC, RD, RA, AD, CD bool
@@ -72,16 +80,31 @@ func (f Flags) encode() uint16 {
 // Name кодирует доменное имя в формат меток DNS. Без сжатия указателями —
 // фикстурам оно не нужно, а лишний код здесь был бы кодом, который сам
 // потребовал бы проверки.
+//
+// Слишком длинное — паника, а не молчаливое усечение. byte(len(label)) на
+// метке в 300 байт даёт не битое сообщение, а валидное сообщение другой
+// структуры: длина уезжает по модулю 256, остаток метки читается как
+// следующие метки. Стенд собирает мусор для D15 намеренно, и мусор обязан
+// быть тем самым, каким его задумали, — иначе проверка зеленеет, ничего не
+// проверив. Паника видна из-под go test сразу и указывает на сломанную
+// фикстуру, а не на разбор.
 func Name(name string) []byte {
 	name = strings.TrimSuffix(name, ".")
 	var buf []byte
 	if name != "" {
 		for _, label := range strings.Split(name, ".") {
+			if len(label) > maxLabel {
+				panic("dnstest: метка длиннее 63 байт — byte(len) её молча урежет: " + label)
+			}
 			buf = append(buf, byte(len(label)))
 			buf = append(buf, label...)
 		}
 	}
-	return append(buf, 0)
+	buf = append(buf, 0)
+	if len(buf) > maxName {
+		panic("dnstest: имя длиннее 255 байт в проводном виде: " + name)
+	}
+	return buf
 }
 
 func putUint16(b []byte, v uint16) []byte { return binary.BigEndian.AppendUint16(b, v) }
@@ -98,7 +121,11 @@ type ECS struct {
 
 func (e ECS) encode() []byte {
 	addr := e.Address.AsSlice()
-	n := int(e.SourcePrefix+7) / 8
+	// Округление вверх считается в int, а не в uint8: при SourcePrefix=255
+	// выражение uint8(255+7) даёт 6, n=0, и опция уехала бы вовсе без байтов
+	// адреса. Фикстура «битый ECS» оказалась бы битой не тем способом, каким
+	// её задумали, — а именно такие значения в неё и кладут нарочно.
+	n := (int(e.SourcePrefix) + 7) / 8
 	if n > len(addr) {
 		n = len(addr)
 	}
@@ -183,6 +210,12 @@ type RR struct {
 }
 
 func (rr RR) encode() []byte {
+	// uint16(len(rr.Data)) на 70-килобайтном RDATA уехал бы по модулю 65536:
+	// запись стала бы валидной записью другой длины, а за ней разъехалось бы
+	// всё остальное сообщение.
+	if len(rr.Data) > maxRDLength {
+		panic("dnstest: RDATA длиннее 65535 байт — uint16(len) его молча урежет")
+	}
 	var b []byte
 	b = append(b, Name(rr.Name)...)
 	b = putUint16(b, rr.Type)
