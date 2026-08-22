@@ -9,17 +9,30 @@ import (
 // Сообщения в тестах собираются здесь, по байтам, а не функциями пакета:
 // иначе разбор проверялся бы собственной сборкой и совпадал бы с ней даже
 // тогда, когда оба неверны.
+//
+// Слишком длинное — паника, а не молчаливое усечение. byte(len(label)) на
+// метке в 300 байт даёт валидное сообщение другой структуры, и фикстура
+// «битое сообщение» окажется битой не тем способом, каким её задумали:
+// проверка станет зелёной, ничего не проверив. Из-под go test паника видна
+// сразу и указывает на сломанную фикстуру, а не на разбор.
 
 func wireName(s string) []byte {
 	out := []byte{}
 	s = strings.TrimSuffix(s, ".")
 	if s != "" {
 		for _, l := range strings.Split(s, ".") {
+			if len(l) > MaxLabel {
+				panic("фикстура: метка длиннее 63 байт — byte(len) её молча урежет: " + l)
+			}
 			out = append(out, byte(len(l)))
 			out = append(out, l...)
 		}
 	}
-	return append(out, 0)
+	out = append(out, 0)
+	if len(out) > MaxName {
+		panic("фикстура: имя " + s + " длиннее 255 байт")
+	}
+	return out
 }
 
 func question(name string, qtype uint16) []byte {
@@ -29,6 +42,9 @@ func question(name string, qtype uint16) []byte {
 }
 
 func record(name string, rtype, class uint16, ttl uint32, rdata []byte) []byte {
+	if len(rdata) > 65535 {
+		panic("фикстура: RDATA длиннее 65535 байт — uint16(len) его молча урежет")
+	}
 	out := wireName(name)
 	out = binary.BigEndian.AppendUint16(out, rtype)
 	out = binary.BigEndian.AppendUint16(out, class)
@@ -52,6 +68,9 @@ func optRecord(udpSize uint16, do bool, opts ...[]byte) []byte {
 }
 
 func option(code uint16, value []byte) []byte {
+	if len(value) > 65535 {
+		panic("фикстура: значение опции длиннее 65535 байт")
+	}
 	out := binary.BigEndian.AppendUint16(nil, code)
 	out = binary.BigEndian.AppendUint16(out, uint16(len(value)))
 	return append(out, value...)
