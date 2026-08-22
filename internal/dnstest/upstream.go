@@ -18,6 +18,7 @@ package dnstest
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -27,6 +28,15 @@ import (
 
 	"github.com/shafed/hop/internal/clock"
 )
+
+// errDeadlinesUnsupported — SetDeadline/SetReadDeadline/SetWriteDeadline
+// поддельных сокетов отдают эту ошибку, а не молчат nil. Дедлайн сокета —
+// настоящее время (§8.1, «правила дома»), а таймауты стенда строятся на
+// Upstream.clk (Behavior.Delay ждёт clk.After). Апстрим волны 2, который
+// (вопреки правилу дома) построит таймаут попытки на дедлайне сокета вместо
+// clk.After, на этом стенде обязан узнать об ошибке сразу, а не выглядеть
+// рабочим здесь и повиснуть в продукте на настоящем сокете.
+var errDeadlinesUnsupported = errors.New("dnstest: дедлайны не поддерживаются, время берётся из clock.Clock")
 
 // Via — каким из трёх диалеров ушёл запрос. Три числа, а не два (через
 // узел/мимо), потому что через узел ходят двумя разными диалерами — UDP и
@@ -318,10 +328,11 @@ func (c *udpPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	return n, net.UDPAddrFromAddrPort(c.dst), err
 }
 
-func (c *udpPacketConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
-func (c *udpPacketConn) SetDeadline(time.Time) error      { return nil }
-func (c *udpPacketConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *udpPacketConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *udpPacketConn) LocalAddr() net.Addr { return &net.UDPAddr{} }
+
+func (c *udpPacketConn) SetDeadline(time.Time) error      { return errDeadlinesUnsupported }
+func (c *udpPacketConn) SetReadDeadline(time.Time) error  { return errDeadlinesUnsupported }
+func (c *udpPacketConn) SetWriteDeadline(time.Time) error { return errDeadlinesUnsupported }
 
 // udpStreamConn — net.Conn от DialDirect по "udp": та же логика, но без
 // WriteTo/ReadFrom, потому что мимо туннеля резолвер ходит на один заранее
@@ -331,11 +342,12 @@ type udpStreamConn struct{ *udpCore }
 func (c *udpStreamConn) Write(p []byte) (int, error) { c.send(p); return len(p), nil }
 func (c *udpStreamConn) Read(p []byte) (int, error)  { return c.recv(p) }
 
-func (c *udpStreamConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
-func (c *udpStreamConn) RemoteAddr() net.Addr             { return net.UDPAddrFromAddrPort(c.dst) }
-func (c *udpStreamConn) SetDeadline(time.Time) error      { return nil }
-func (c *udpStreamConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *udpStreamConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *udpStreamConn) LocalAddr() net.Addr  { return &net.UDPAddr{} }
+func (c *udpStreamConn) RemoteAddr() net.Addr { return net.UDPAddrFromAddrPort(c.dst) }
+
+func (c *udpStreamConn) SetDeadline(time.Time) error      { return errDeadlinesUnsupported }
+func (c *udpStreamConn) SetReadDeadline(time.Time) error  { return errDeadlinesUnsupported }
+func (c *udpStreamConn) SetWriteDeadline(time.Time) error { return errDeadlinesUnsupported }
 
 // newTCPConn возвращает клиентский конец соединения; сервер обслуживает
 // другой конец в отдельной горутине — тот же приём, которым xraytest поднимает
