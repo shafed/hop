@@ -1,18 +1,17 @@
 # hop
 
 VPN-утилита поверх Xray-core: TUN, набор узлов, автопереключение по живости.
-Спека — `SPEC.md`, она источник истины.
 
 ## Лицензии референсов — читать можно, копировать нельзя
 
 `refs/` — чужие исходники для чтения. Копирование кода оттуда меняет лицензию
 всего продукта:
 
-| Копировать нельзя (GPL-3.0) | Копировать можно                |
-| --------------------------- | ------------------------------- |
-| sing-box, sing-tun          | wireguard-go (MIT)              |
-| nekoray                     | Xray-core (MPL-2.0)             |
-| hiddify-app, hiddify-core   | gvisor.dev/gvisor (Apache-2.0)  |
+| Копировать нельзя (GPL-3.0) | Копировать можно               |
+| --------------------------- | ------------------------------ |
+| sing-box, sing-tun          | wireguard-go (MIT)             |
+| nekoray                     | Xray-core (MPL-2.0)            |
+| hiddify-app, hiddify-core   | gvisor.dev/gvisor (Apache-2.0) |
 
 netstack брать из `gvisor.dev/gvisor`, не из `sing-tun/gtcpip` — это форк под
 GPL-3.0.
