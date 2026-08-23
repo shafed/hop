@@ -31,7 +31,7 @@ func watch(ctx context.Context, a *agent.Agent, log *slog.Logger, every time.Dur
 	t := time.NewTicker(every) //hop:realtime
 	defer t.Stop()
 
-	var last string
+	var last, lastDNS string
 	for {
 		select {
 		case <-ctx.Done():
@@ -52,6 +52,30 @@ func watch(ctx context.Context, a *agent.Agent, log *slog.Logger, every time.Dur
 			}
 			log.Debug("живость", "фаза", snap.Traffic, "узел", orNone(snap.Active),
 				"узлы", nodesLine(snap.Nodes))
+
+			// DNS печатается отдельно от фазы трафика, потому что отвечает на
+			// другой вопрос. Приложение, получившее SERVFAIL, видит «сайт не
+			// найден» — неотличимо от сломавшегося интернета, и цена этой
+			// неразличимости названа прямо в Р15 регистра. Здесь она и
+			// платится: пока `hop` работает на переднем плане, это
+			// единственное окно наружу (`hop status` спрашивает сервис, а
+			// резолвер живёт в агенте).
+			if ds, ok := a.DNSStats(); ok {
+				// На INFO — только край: начали или перестали отказывать.
+				// Тикер иначе забил бы лог одной строкой, и настоящая смена в
+				// нём потерялась бы, ровно как у фазы выше.
+				if cur := dnsEdge(snap.Traffic); cur != lastDNS {
+					lastDNS = cur
+					log.Info("DNS", "состояние", cur, "отказов", ds.ServFail)
+				}
+				log.Debug("DNS", "записей", ds.Entries, "из них отрицательных", ds.Negative,
+					"попаданий", ds.Hits, "промахов", ds.Misses,
+					"наверх", ds.Upstream, "мимо туннеля", ds.UpstreamDirect,
+					"в полёте", ds.InFlight, "удержано", ds.Held,
+					"склеено", ds.Coalesced, "повторов по TCP", ds.TCPRetry,
+					"усечено клиенту", ds.TruncToClient, "отказов", ds.ServFail,
+					"поколение кэша", ds.Generation)
+			}
 		}
 	}
 }
@@ -88,6 +112,22 @@ func nodesLine(ns []health.NodeHealth) string {
 		return "нет узлов"
 	}
 	return b.String()
+}
+
+// dnsEdge — то, что резолвер сейчас делает с клиентскими запросами. Это
+// функция фазы трафика, а не отдельное состояние: fail-close и удержание
+// задаются ею целиком (Р15, Р16, Р25).
+func dnsEdge(p agent.TrafficPhase) string {
+	switch p {
+	case agent.PhaseFailing:
+		return "отказывает: живых узлов нет"
+	case agent.PhaseWaiting:
+		return "придерживает запросы: узлы ещё не проверены"
+	case agent.PhaseBypass:
+		return "резолвит мимо туннеля"
+	default:
+		return "резолвит через узел"
+	}
 }
 
 func orNone(s string) string {

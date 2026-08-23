@@ -138,14 +138,15 @@ func (r *Resolver) watchSwitches() {
 			if !ok {
 				return
 			}
-			if !policy.DNSCacheFlushOnSwitch.On() {
-				// dns_cache_flush_on_switch выключена — подписка есть, а
-				// сброса нет: после переключения трафик уходит в CDN чужого
-				// региона по адресу, добытому через прежний узел. Краснит
-				// T14, D19, D20.
-				continue
+			if policy.DNSCacheFlushOnSwitch.On() {
+				r.flush()
 			}
-			r.flush()
+			// dns_cache_flush_on_switch выключена — подписка есть, а сброса
+			// нет: после переключения трафик уходит в CDN чужого региона по
+			// адресу, добытому через прежний узел. Краснит T14, D19, D20.
+			if r.cfg.Acked != nil {
+				r.cfg.Acked()
+			}
 		}
 	}
 }

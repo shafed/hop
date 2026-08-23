@@ -3,6 +3,7 @@ package agent
 import (
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"sync"
 
 	"github.com/shafed/hop/internal/clock"
@@ -11,6 +12,7 @@ import (
 	"github.com/shafed/hop/internal/netstack"
 	"github.com/shafed/hop/internal/packet"
 	"github.com/shafed/hop/internal/policy"
+	"github.com/shafed/hop/internal/resolver"
 	"github.com/shafed/hop/internal/store"
 	"github.com/shafed/hop/internal/tunnel"
 )
@@ -45,8 +47,18 @@ type Config struct {
 	// to nodes (§6.8). It is consulted for every new socket.
 	Physical engine.InterfaceFunc
 
-	// Resolver — этап 6. nil означает заглушку Р31: SERVFAIL, а не молчание.
+	// Resolver — подставить готовый резолвер вместо собираемого связкой.
+	// Тесты этапа С подставляют сюда заглушку; в продукте поле пустое, и
+	// связка собирает настоящий резолвер §5.7 сама.
 	Resolver Resolver
+	// DNSUpstreams — §5.7. Пусто означает стартовые 1.1.1.1:53 и 8.8.8.8:53.
+	DNSUpstreams []netip.AddrPort
+	// DialDirect — путь мимо туннеля (§6.8): им ходят bootstrap и
+	// перехваченный DNS в фазе bypass. Даётся снаружи, потому что привязка
+	// сокета к физическому интерфейсу — платформенный код, живущий в
+	// internal/outbound. nil означает, что настоящий резолвер не собирается:
+	// без прямого пути bootstrap даёт петлю §5.7(а).
+	DialDirect resolver.DialDirectFunc
 	// Bypass — куда уходит то, что выпущено мимо туннеля (§6.10). Этап 8.
 	Bypass netstack.BypassSink
 	// NewXray — фабрика инстансов. nil означает настоящий Xray; тесты шагов 3
@@ -65,6 +77,13 @@ type Agent struct {
 	react  *reactionLog
 	engine *holder
 	res    Resolver
+
+	// dns — настоящий резолвер §5.7, если связка его собрала. Отдельно от res:
+	// res — то, что видит netstack, а по dns связка кормит подписку и ждёт
+	// подтверждения сброса.
+	dns       *resolver.Resolver
+	dnsEvents chan health.SwitchEvent
+	dnsAcked  chan struct{}
 
 	mu      sync.Mutex
 	up      bool
@@ -99,10 +118,6 @@ func New(cfg Config) (*Agent, error) {
 			})
 		}
 	}
-	res := cfg.Resolver
-	if res == nil {
-		res = &servfailResolver{}
-	}
 
 	a := &Agent{
 		cfg:    cfg,
@@ -112,7 +127,6 @@ func New(cfg Config) (*Agent, error) {
 		st:     cfg.Store,
 		ring:   newEventRing(),
 		react:  &reactionLog{},
-		res:    res,
 		tphase: tunnel.Down,
 		done:   make(chan struct{}),
 	}
@@ -121,7 +135,79 @@ func New(cfg Config) (*Agent, error) {
 	a.engine = newHolder(cfg.Clock, cfg.NewXray, func(de *engine.DialError) {
 		de.Report(a.hm)
 	})
+
+	if err := a.buildResolver(); err != nil {
+		return nil, err
+	}
 	return a, nil
+}
+
+// Стартовые апстримы §5.7. Настраиваются, но умолчание названо в спеке.
+var defaultUpstreams = []netip.AddrPort{
+	netip.MustParseAddrPort("1.1.1.1:53"),
+	netip.MustParseAddrPort("8.8.8.8:53"),
+}
+
+// buildResolver собирает перехваченный DNS §5.7.
+//
+// Три провода, и каждый ведёт в своё место. Путь наверх — через активный узел,
+// тем же движком, что носит трафик. Прямой путь — мимо туннеля, и его связка
+// не строит сама: привязка сокета к физическому интерфейсу платформенна и
+// живёт в internal/outbound. Фаза — функцией, а не битом Healthy: waiting,
+// failing и bypass суть три разных ответа резолвера, и свести их к одному биту
+// нельзя.
+//
+// Подписка на события отдаётся резолверу, а сброс кэша делает он сам (§5.7).
+// Связка только дожидается подтверждения — Р33 требует, чтобы кэш был выкинут
+// раньше, чем событие ушло наружу.
+func (a *Agent) buildResolver() error {
+	if a.cfg.Resolver != nil {
+		a.res = a.cfg.Resolver
+		return nil
+	}
+	if a.cfg.DialDirect == nil {
+		// Прямого пути нет — настоящий резолвер собирать нельзя: bootstrap без
+		// него даёт петлю §5.7(а), а тихо ходить за именами узлов через
+		// туннель хуже, чем честно отказывать (Р31 заглушки).
+		a.res = &servfailResolver{}
+		return nil
+	}
+
+	ups := a.cfg.DNSUpstreams
+	if len(ups) == 0 {
+		ups = defaultUpstreams
+	}
+
+	d := newDialer(a.hm, a.engine)
+	a.dnsEvents = make(chan health.SwitchEvent)
+	a.dnsAcked = make(chan struct{}, 1)
+
+	r, err := resolver.New(resolver.Config{
+		Upstreams:  ups,
+		DialUDP:    d.resolverDialUDP,
+		Dial:       d.resolverDialTCP,
+		DialDirect: a.cfg.DialDirect,
+		Phase:      a.trafficPhaseNow,
+		Events:     a.dnsEvents,
+		Acked:      func() { a.dnsAcked <- struct{}{} },
+		Clock:      a.clk,
+	})
+	if err != nil {
+		return fmt.Errorf("agent: резолвер не собрался: %w", err)
+	}
+	a.dns, a.res = r, r
+	return nil
+}
+
+// trafficPhaseNow — фаза трафика для резолвера. Считается той же чистой
+// функцией, что и в Snapshot: два ответа на один вопрос разъехались бы.
+func (a *Agent) trafficPhaseNow() TrafficPhase {
+	hs := a.hm.Snapshot()
+	healthy := a.hm.Healthy()
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return trafficPhase(a.bypass, a.up, healthy, hs.Active)
 }
 
 // Up поднимает туннель и датаплейн.
@@ -390,6 +476,33 @@ func (a *Agent) onSwitch(ev health.SwitchEvent) {
 	a.refreshPhase()
 }
 
+// flushResolver доводит событие до резолвера и дожидается, что оно обработано.
+//
+// Ждёт намеренно: §5.7 велит, чтобы кэш сбрасывал сам резолвер, а Р33 — чтобы
+// сброс случился раньше рассылки события. Без ожидания эти два требования
+// противоречат друг другу, потому что подписчик живёт в своей горутине.
+// Подтверждение приходит и тогда, когда сброса не было (политика выключена):
+// иначе выключенный флаг подвешивал бы связку вместо того, чтобы покраснить
+// проверку.
+func (a *Agent) flushResolver() {
+	if a.dns == nil {
+		// Заглушка или подставленный тестом резолвер: старый провод.
+		if f, ok := a.res.(FlushableResolver); ok {
+			f.Flush()
+		}
+		return
+	}
+	select {
+	case a.dnsEvents <- health.SwitchEvent{}:
+	case <-a.done:
+		return
+	}
+	select {
+	case <-a.dnsAcked:
+	case <-a.done:
+	}
+}
+
 // persistHealth — тикер сохранения среза живости (Р36).
 func (a *Agent) persistHealth() {
 	defer a.wg.Done()
@@ -454,6 +567,13 @@ func (a *Agent) refreshPhase() {
 	a.mu.Lock()
 	a.tphase = ph
 	a.mu.Unlock()
+
+	// Резолверу фаза приходит функцией, то есть опрашивается. О том, что
+	// опрашивать пора, знает только тот, кто фазу поменял: отсюда — сигнал.
+	// Что считать краем и что при этом сбросить, решает сам резолвер (Р25).
+	if a.dns != nil {
+		a.dns.PhaseChanged()
+	}
 }
 
 // trafficPhase — §2. Чистая функция от трёх наблюдений, а не от полей: иначе
@@ -509,6 +629,16 @@ func (a *Agent) Snapshot() Snapshot {
 	return s
 }
 
+// DNSStats — срез перехваченного DNS (§5.7). Второе значение ложно, когда
+// настоящий резолвер не собран: показывать нули за него значило бы врать, что
+// DNS работает и просто ничего не спросили.
+func (a *Agent) DNSStats() (resolver.Stats, bool) {
+	if a.dns == nil {
+		return resolver.Stats{}, false
+	}
+	return a.dns.Snapshot(), true
+}
+
 // Events отдаёт накопленное кольцо и подписку на будущее — одним вызовом
 // (§2 регистра): двумя было бы окно, в котором событие уже не в истории и ещё
 // не в канале.
@@ -550,6 +680,9 @@ func (a *Agent) Close() error {
 
 	a.hm.Close()
 	a.wg.Wait()
+	if a.dns != nil {
+		_ = a.dns.Close()
+	}
 	a.engine.close()
 	a.ring.closeAll()
 

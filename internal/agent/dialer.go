@@ -145,3 +145,41 @@ func (a *Agent) ProbeDial(ctx context.Context, nodeID, network, addr string) (ne
 	}
 	return &countedConn{Conn: c, in: in}, nil
 }
+
+// Диалеры перехваченного DNS (§5.7). Отдельные от netstack.Dialer по двум
+// причинам: у них другая форма (контекст и адрес назначения, а не ключ NAT), и
+// путь наверх у резолвера — не тот же объект, что путь трафика, хотя узел и
+// один. Смешать их значило бы, что счётчик «резолв ушёл через узел» перестанет
+// отличаться от «трафик ушёл через узел» (D1, D51).
+
+// resolverDialUDP — датаграммный путь наверх через активный узел.
+//
+// Адрес назначения здесь не нужен: core.DialUDP отдаёт PacketConn на исходный
+// порт, а куда писать, решает сам резолвер через WriteTo. То же полное конусное
+// отображение §5.3, что у обычного UDP.
+func (d *dialer) resolverDialUDP(ctx context.Context, _ netip.AddrPort) (net.PacketConn, error) {
+	in, node, err := d.route()
+	if err != nil {
+		return nil, err
+	}
+	pc, err := in.x.DialUDP(ctx, node)
+	if err != nil {
+		in.release()
+		return nil, err
+	}
+	return &countedPacketConn{PacketConn: pc, in: in}, nil
+}
+
+// resolverDialTCP — потоковый путь наверх: повтор запроса на флаг TC (§5.7).
+func (d *dialer) resolverDialTCP(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+	in, node, err := d.route()
+	if err != nil {
+		return nil, err
+	}
+	c, err := in.x.DialTCP(ctx, node, dst.String())
+	if err != nil {
+		in.release()
+		return nil, err
+	}
+	return &countedConn{Conn: c, in: in}, nil
+}

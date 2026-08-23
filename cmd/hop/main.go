@@ -24,6 +24,7 @@ import (
 	"github.com/shafed/hop/internal/health"
 	"github.com/shafed/hop/internal/ipc"
 	"github.com/shafed/hop/internal/outbound"
+	"github.com/shafed/hop/internal/resolver"
 	"github.com/shafed/hop/internal/store"
 	"github.com/shafed/hop/internal/tunnel"
 )
@@ -127,7 +128,8 @@ func main() {
 	}
 	defer physical.Close()
 
-	if err := run(log, cl, *tok, *beat, tunnelParams(*name, *addr, *mtu, *table), physical.Interface); err != nil {
+	if err := run(log, cl, *tok, *beat, tunnelParams(*name, *addr, *mtu, *table),
+		physical.Interface, physical.DialDirect); err != nil {
 		fail(err)
 	}
 }
@@ -166,7 +168,7 @@ func withStore(fn func(*store.Store) error) error {
 // узла (§6.7), дозвон живёт в связке, а связке нужна живость, которой нужен
 // пробер. Круг разрывается замыканием — пробер зовёт дозвон лениво, к моменту
 // первой пробы связка уже собрана.
-func run(log *slog.Logger, cl control, tokenFile string, beat time.Duration, p tunnel.Params, physical engine.InterfaceFunc) error {
+func run(log *slog.Logger, cl control, tokenFile string, beat time.Duration, p tunnel.Params, physical engine.InterfaceFunc, dialDirect resolver.DialDirectFunc) error {
 	root, err := storeRoot()
 	if err != nil {
 		return err
@@ -200,6 +202,10 @@ func run(log *slog.Logger, cl control, tokenFile string, beat time.Duration, p t
 		Clock:    clock.System{},
 		Log:      log,
 		Physical: physical,
+		// Прямой путь §6.8: им ходят bootstrap и перехваченный DNS в фазе
+		// bypass. Строится из селектора, а не из net.Dialer: непривязанный
+		// сокет вернулся бы в туннель, и §5.7(а) дал бы петлю на старте.
+		DialDirect: dialDirect,
 	})
 	if err != nil {
 		return err

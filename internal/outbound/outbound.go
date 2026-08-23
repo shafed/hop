@@ -3,9 +3,11 @@
 package outbound
 
 import (
+	"context"
 	"errors"
 	"net"
 	"net/http"
+	"net/netip"
 )
 
 // ErrNoInterface означает, что остался только непривязанный сокет. В таком
@@ -20,4 +22,20 @@ func (s *Selector) HTTPClient() *http.Client {
 	d := &net.Dialer{Control: s.Control}
 	tr.DialContext = d.DialContext
 	return &http.Client{Transport: tr}
+}
+
+// DialDirect открывает соединение мимо туннеля, привязав сокет к текущему
+// физическому интерфейсу (§6.8).
+//
+// Этим ходят bootstrap-резолвер (§5.7а) и перехваченный DNS в фазе bypass.
+// Голый net.Dialer здесь запрещён: на Linux он ушёл бы в туннель по общим
+// маршрутам, а на macOS и Windows петлю закрывает sockopt.interface, который
+// ставит Xray, — то есть непривязанный сокет вернулся бы обратно в TUN.
+//
+// Интерфейс не определён — Control отказывает, и отказывает весь дозвон. Это
+// намеренно: непривязанный fallback здесь и есть петля, ради предотвращения
+// которой §6.8 написан.
+func (s *Selector) DialDirect(ctx context.Context, network string, dst netip.AddrPort) (net.Conn, error) {
+	d := &net.Dialer{Control: s.Control}
+	return d.DialContext(ctx, network, dst.String())
 }
