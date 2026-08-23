@@ -275,6 +275,19 @@ var (
 		},
 	}
 
+	// BypassSink — вердикт bypass выпускается настоящим NAT-путём через сокет,
+	// привязанный к физическому интерфейсу (§6.10, §6.8). Выключение возвращает
+	// молчаливый дроп: пакет уходит в никуда. T17 при этом остаётся зелёным —
+	// он проверяет только вердикт, а не доставку.
+	BypassSink = &Policy{
+		Name: "bypass_sink",
+		Doc:  "вердикт bypass уходит настоящим NAT-путём (§6.10, §6.8)",
+		Guards: []Guard{
+			{Pkg: "./internal/bypass", Test: "^TestBypassSendsDatagramFromBoundSocket$"},
+			{Pkg: "./internal/bypass", Test: "^TestBypassReplyReturnsToClient$"},
+		},
+	}
+
 	// XrayDrain — дренаж прежнего инстанса Xray при смене набора узлов
 	// (§5.8, Р32 регистра связки, этап С). Выключение убивает прежний инстанс
 	// сразу, и обновление подписки рвёт живые соединения — а §5.5 обещает
@@ -473,6 +486,7 @@ func All() []*Policy {
 		SnapshotRestore,
 		VerdictOrder,
 		RejectMode,
+		BypassSink,
 		NATKey,
 		KOfN,
 		Tolerance,
