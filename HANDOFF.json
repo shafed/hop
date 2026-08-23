@@ -1,85 +1,90 @@
 {
   "status": "machine-readable — only for the next AI session, not for human reading. Human-readable history/decisions live in PLAN.md and implementation-notes.md.",
-  "branch": "claude/pass0-decisions-registry",
-  "plan_order": "6 -> 8 (remainder) -> 9",
-  "branch_diverged_from_main": {
-    "severity": "BLOCKING — resolve before any merge/push-to-main attempt",
-    "fact": "This branch is built on the internal/resolver + health/manager.go architecture. main explicitly superseded that architecture on 2026-08-21 (commit 1d9d1f1, \"слить main: этапы 4-6 сделаны здесь, версия main вытеснена\") in favor of internal/dns + health/{schedule,select,monitor}.go. Both lines forked from the same commit (39aaa445, 2026-08-14) and independently rebuilt stages 4-6.",
-    "evidence": "git merge main<-claude/pass0-decisions-registry produces delete/modify conflicts on internal/health/manager.go, internal/engine/dialer.go, internal/l2/harness_test.go, internal/l2/realnode_test.go, plus content conflicts in PLAN.md, SPEC.md, cmd/hop/main.go, internal/netstack/*.go, internal/policy/policies.go, internal/store/*.",
-    "status": "unresolved. Branch NOT merged into main. main untouched.",
-    "do_not": "merge or push this branch's history into main without an explicit human decision on which architecture wins going forward."
-  },
+  "branch": "worktree-bypass-sink-nat",
+  "branch_note": "Git worktree branch, based on 8d7d163 (the current HEAD of both main and origin/main). Not merged, not pushed — merging is the human's call, not a pass automation. Verified: `git rev-parse main origin/main 8d7d163` all equal 8d7d163392b92eb9317507282b1bf891fb0c8132; `git merge-base --is-ancestor 8d7d163 HEAD` succeeds.",
+  "plan_order": "8 (remainder) -> 9",
+  "stale_block_removed": "The previous branch_diverged_from_main block warned that this line of work (originally on claude/pass0-decisions-registry) was not merged into main and would conflict on merge. That is no longer true: claude/pass0-decisions-registry was merged into main by commit 8d7d163 (\"Merge branch 'claude/pass0-decisions-registry'\"), and this worktree's branch is built directly on top of that merge commit. Verified with git log/git rev-parse, not assumed. The block is removed rather than kept as a corrected-but-still-BLOCKING entry, because nothing blocking remains — a plain merge/rebase of this branch onto current main is a fast-forward-style continuation, not a conflict resolution.",
   "closed_this_pass": {
-    "what": "connection teardown on node death (SPEC §5.5)",
-    "closes_registry_rows": ["W8", "W14"],
-    "registry_ref": "docs/verification-agent.md:310,321",
-    "decision_log": "implementation-notes.md, section 'Этап 8 — реестр релеев netstack и разрыв соединений'",
+    "what": "BypassSink as a real UDP NAT path for verdict Bypass (SPEC §6.10, §6.8)",
+    "closes_registry_rows": ["SPEC.md §8.4 table: new row T31"],
+    "decision_log": "implementation-notes.md, section 'Этап 8 — BypassSink: настоящий NAT-путь для bypass (§6.10, §6.8)'",
     "changed_files": [
       {
-        "path": "internal/netstack/tcp.go",
-        "what": "tcpStack.relays: map[*tcpRelay]struct{} under relayMu. Entry added in pipe() before the io.Copy goroutines start, removed inside the same once-wrapped stop(). closeAll() snapshots under lock, calls stop() outside it, returns count."
+        "path": "internal/packet/parse.go",
+        "what": "ParseUDP4(pkt []byte) (src, dst netip.AddrPort, payload []byte, ok bool) — standalone IPv4/UDP parse, deliberately not sharing code with netstack.parse so internal/bypass does not import internal/netstack."
+      },
+      {
+        "path": "internal/bypass/bypass.go",
+        "what": "New package. NAT — full-cone UDP NAT keyed only by client src addr:port (never dst, unlike netstack's natTable — full-cone is why mDNS replies from a unicast responder address still reach the client). Sockets opened via (&net.ListenConfig{Control: cfg.Control}).ListenPacket(ctx, \"udp4\", \":0\") so every socket is bound to the physical interface (§6.8) the same way Xray/health-probe/subscription sockets already are. Send(pkt) returns ErrDisabled when policy.BypassSink is off, ErrUnsupported when the packet is not IPv4/UDP. Idle sweep is lazy (on Send and on Stats()), no background ticker."
       },
       {
         "path": "internal/netstack/netstack.go",
-        "what": "Stack.InterruptTCP() int -> s.tcp.closeAll()"
+        "what": "Stack.Deliver(pkt []byte) — the reply path back into the TUN device, through the same s.write single-writer that natTable/tcpStack already use. netstack.go:259 handle() calls s.cfg.Bypass.Send(pkt) for verdict Bypass and discards the error (same silent-drop shape as before when Bypass is nil or disabled)."
       },
       {
         "path": "internal/agent/wire.go",
-        "what": "Agent.InterruptConnections() int — locks a.mu, reads a.stack, returns 0 if nil (Down/not-yet-Up), else stack.InterruptTCP()"
+        "what": "Config.BypassControl bypass.ControlFunc (nil in tests that don't want a real sink; Config.Bypass stays as the older test substitution point). Agent.bypassNAT *bypass.NAT, built in Up() when Config.Bypass is nil and BypassControl is set, torn down symmetrically in Down() and watchService(), same lifetime as a.stack. Agent.deliverBypass(pkt []byte) — same deferred-closure-over-a.stack trick already used by InterruptConnections and Prober."
       },
       {
         "path": "cmd/hop/main.go",
-        "what": "health.Config.Interrupt: func() int { return a.InterruptConnections() } — same deferred-closure trick already used for Prober (var a *agent.Agent declared before health.New)"
+        "what": "run() takes a third function parameter bypassControl bypass.ControlFunc, symmetric to the existing dialDirect parameter; main() passes physical.Control (the same *outbound.Selector already used for Interface()/DialDirect)."
+      },
+      {
+        "path": "internal/policy/policies.go",
+        "what": "New policy BypassSink (bypass_sink). It gates the real sink's construction/use inside internal/bypass (ErrDisabled from NAT.Send), not the call site in netstack.handle — turning off the call site would also redden TestT17MDNSGoesToLocalNetwork, which must stay green (verdict-only, unaffected by delivery)."
       }
     ],
-    "new_tests": {
-      "file": "internal/netstack/interrupt_test.go",
-      "note": "Real gvisor client stack (gstack.Stack + custom clientLink) bridged over the same packettest.FakeDevice the rest of the package uses (not internal/bench's OS-boundary rig). Does a real TCP 3-way handshake through tcpStack's forwarder, not a fake callback — this is what A18 (health) and T9/T10 (l2) do NOT cover: both interrupt via harness.interrupt(), a stand-in, per internal/l2/harness_test.go's own comment (\"в продукте это делает netstack; здесь — стенд\").",
-      "tests": [
-        "TestInterruptTCPClosesLiveConnection",
-        "TestInterruptTCPCountsAllOpenRelays",
-        "TestInterruptTCPWithNoConnectionsReturnsZero"
-      ]
-    },
-    "deferred_scope": "UDP not registered — natTable untouched. SPEC + registry (T9, T10, W8) speak only of TCP.",
-    "small_test_addition": {
-      "file": "internal/agent/wire_test.go",
-      "test": "TestInterruptConnectionsDelegatesToStack",
-      "scope": "wiring only (nil-stack -> 0, delegates when up) — behavior contract is netstack-level, tested above"
-    },
-    "infra_addition": {
-      "file": "internal/packettest/fake.go",
-      "what": "FakeDevice.Written() <-chan struct{} — exposes the existing write-signal channel for stands that need a continuous pump (used by interrupt_test.go's client bridge), not just WaitEmitted's one-shot wait"
-    }
+    "new_tests": [
+      {
+        "file": "internal/bypass/bypass_test.go",
+        "tests": ["TestBypassSendsDatagramFromBoundSocket", "TestBypassReplyReturnsToClient", "TestBypassAcceptsReplyFromAnotherAddress", "TestBypassRefusesTCP", "TestBypassIdleClosesSocket", "TestBypassCloseStopsGoroutines"],
+        "note": "Real UDP sockets on loopback, no transport mocks. The first two are the negcheck guards for policy bypass_sink."
+      },
+      {
+        "file": "internal/agent/bypass_test.go",
+        "tests": ["TestBypassSinkCarriesDatagramAndReply"],
+        "note": "Agent-level, over a loopback listener, on a fake device (no netns/privileges) — proves the wiring (Up builds the sink, packet round-trips through netstack.Deliver) without proving physical-interface binding, which is L3's job. Fix round 1 (post-review): the test must build its Agent with NewXray set to the package's fake xray factory, matching every other test in internal/agent — the first version accidentally used a real xray-core instance and only worked by the accident of an empty node list."
+      },
+      {
+        "file": "internal/l3/bypass_test.go",
+        "tests": ["TestBypassMDNSReachesPhysicalInterfaceAndReturnsViaNAT"],
+        "note": "linux-only, real netns + veth pair, registered in SPEC.md §8.4 as T31. Forces mDNS (224.0.0.251:5353) into the TUN with an ip rule at priority 20000 (below hopd's own prioExclusions=31000, so it doesn't fight hopd's rules) — the §6.10 case where the ordinary exclusion rule didn't hold. A responder added to internal/l3/routecache_test.go's peerMain joins the mDNS group and echoes both the payload and the source address it observed. Three separate assertions: the peer received the request; the source address it saw is the physical interface's address (10.9.9.1, veth0), not the tunnel client's (10.255.0.1) — this positive+negative pair is what catches a transparent-forward regression; the client received the reply from the responder's address."
+      }
+    ],
+    "measurements": [
+      "ip rule add to 224.0.0.251/32 lookup <table> priority N with N < prioExclusions(31000) pulls exactly that multicast group into the tunnel table without touching hopd's own rules (31000/31500/32000) or other multicast (verified against SSDP, 239.255.255.250 unaffected). Verified with TX packet counters on a dummy interface before/after sendto, not just `ip route get` (route cache can be mistaken for the actual routing decision).",
+      "Sending to a multicast address does not require IGMP group membership (that's only needed to receive); receiving on the peer side does require IP_ADD_MEMBERSHIP (net.ListenMulticastUDP) — without it the kernel drops the inbound datagram at the IP layer even though the frame physically arrived on veth1. Standard host IGMP membership behavior, not veth-specific.",
+      "net.ListenPacket(\"udp4\", ...) on Linux (go1.26.3) returns a *net.UDPConn whose ReadFrom yields a *net.UDPAddr (not a string) — bypass.socket's direct type assertion a.(*net.UDPAddr) is sufficient; the netip.ParseAddrPort(a.String()) fallback that netstack.addrPort carries wasn't needed for sockets opened this way. Recorded in implementation-notes.md, not just the task report."
+    ],
+    "deviations": [
+      "Only UDP. bypass.NAT.Send returns ErrUnsupported for anything that isn't IPv4/UDP; TCP to a LAN address (RFC1918/loopback/link-local, verdict Bypass via isBypass, internal/netstack/verdict.go:119) is still silently dropped by netstack.handle, exactly as before this pass. Reason: §6.10's exceptions are for service discovery, which is entirely UDP; §6.8 names UDP full-cone (§5.3) as bypass's own return path; an honest TCP path would need stream termination inside gvisor, and that relay would land in the §5.5 interrupt registry, whose 'tear the connection down when the node dies' semantics are wrong for traffic that never went through a node. This was a decision taken before task 1 started (constraints.md), not discovered during implementation — queued as future work, not an open question.",
+      "DHCP through a NAT socket cannot be faithful. The client's source port 68 gets rewritten to an ephemeral port (bypass.NAT keys only on source address via the socket, not on preserving the source port), and binding a port below 1024 is unavailable to an unprivileged agent. §6.10 lists DHCP among the exceptions routed to bypass, but a real DHCP exchange through this NAT path will not work correctly. In practice this rarely bites: the machine's own DHCP lease is handled by the OS before hop up runs, outside netstack's verdicts entirely. What remains genuinely open is DHCP-relay or any other transit traffic on port 67/68 originating from inside the tunnel."
+    ]
   },
   "next_task": {
     "priority": 1,
-    "name": "BypassSink as a real NAT path (SPEC §6.10)",
-    "why_first": "Only remaining piece that lies about observable behavior (packet silently dropped) rather than simply missing a feature.",
+    "name": "bypass/block lists from configuration (SPEC §6.10)",
+    "why_first": "First item of the queue that was already deferred behind BypassSink; now that BypassSink delivers packets for real, a fixed hardcoded list is the next thing standing between the spec's routing description and what the config can actually express.",
     "current_state": [
-      "agent.Config.Bypass is nil in production",
-      "netstack.Config.Bypass: interface { Send(pkt []byte) error } — internal/netstack/netstack.go:90",
-      "Stack.handle, internal/netstack/netstack.go:250: `if s.cfg.Bypass != nil { ... }` — always nil today, packet silently dropped"
+      "internal/netstack/verdict.go:119, isBypass(f flow) bool — hardcoded logic: RFC1918/loopback/link-local ranges plus §5.6's always-allowed exceptions (DHCP, NTP), plus mDNS (224.0.0.251:5353, [ff02::fb]:5353) and SSDP for service discovery (§6.10). None of this is configurable at runtime; the address set isn't read from any config struct.",
+      "internal/netstack/verdict.go:76, classify(f flow, healthy bool) Verdict — calls isBypass(f) directly; verdict order (bypass vs DNS hijack) is already a policy (VerdictOrder), but the bypass membership test itself is not.",
+      "BypassSink (this pass) delivers whatever verdict Bypass hands it — it has no opinion on which flows get that verdict. Wiring the actual list is entirely verdict.go's concern."
     ],
-    "goal": "mDNS/DHCP-transit and everything else the classifier routes to Bypass (SPEC §6.2, §6.10) must exit via the physical interface through the agent's own NAT, and the reply must return to the client the same way tcpStack/ natTable already return proxied traffic to Stack.write.",
+    "goal": "Whatever set of addresses/prefixes/ports isBypass currently hardcodes should instead be derived from configuration, so a user (or a future default profile) can extend or narrow what goes to the physical interface instead of the tunnel, without a code change. The always-on §5.6 exceptions (loopback, RFC1918, link-local, DHCP, NTP) are not what needs to become configurable — SPEC.md doesn't say they should be; what's hardcoded and plausibly meant to be a list is the service-discovery bypass set (mDNS/SSDP) and the general shape of 'other bypass/block lists' from the plan and HANDOFF's prior queue entry.",
     "reuse": [
-      "outbound.Selector (internal/outbound) already gives the current physical interface and is already used for SO_BINDTODEVICE on Xray/health-probe/subscription sockets — internal/agent/wire.go, cmd/hop/main.go"
+      "internal/policy already has the pattern for a guarded on/off flag (BypassSink, this pass) — a configurable list needs a different shape (a value, not a bool), so check whether internal/policy or another package already has a precedent for a configurable value (not just flag) before inventing one.",
+      "internal/bypass and the Deliver/Config.Bypass wiring from this pass are unaffected by this task — verdict.go decides membership before bypass.NAT ever sees a packet."
     ],
-    "design_note": "Send(pkt) receives an already-assembled IP packet, so the implementation must either parse it into a UDP/TCP datagram itself and dial a socket bound to the interface (NAT: rewrite src to the physical interface's address, remember the mapping, return replies the same way natTable already does for proxied UDP), or find a more direct OS-level path. A second line of defense already exists upstream: routing rules above the tunnel should keep such packets out of the TUN entirely (§6.2) — BypassSink exists only for when that rule didn't hold, which is exactly the case that needs a real path now.",
     "test_gap": {
-      "stays_green": "TestT17MDNSGoesToLocalNetwork (internal/netstack/netstack_test.go:196) — verdict-only, uses fakenet.Bypass, unaffected",
-      "missing_and_needed": "L3 test: mDNS request from the tunnel is visible on the physical interface, reply returns to the client via NAT. Symmetric to how internal/netstack/interrupt_test.go became the missing check for W8/W14."
+      "stays_green": "TestT17MDNSGoesToLocalNetwork, TestBypassMDNSReachesPhysicalInterfaceAndReturnsViaNAT (T31) — both exercise the hardcoded default set, which should keep working once it's config-driven with the same defaults.",
+      "missing_and_needed": "A test proving the list is actually read from configuration — e.g. a custom bypass entry added via config causes a previously-tunneled flow to get verdict Bypass, and/or removing a default entry from config makes a previously-bypassed flow (like mDNS) go into the tunnel instead. Needs both a unit-level (verdict_test.go style) and possibly an L3 case if the claim is about real routing, not just the verdict function."
     },
     "flag_to_add": {
-      "name": "bypass_sink",
-      "note": "name already reserved in PLAN.md. Register in internal/policy with a negcheck guard BEFORE writing the implementation — registry rule: every new policy needs a test that's red without it."
+      "name": "not yet chosen — no name reserved anywhere (PLAN.md, HANDOFF.json's prior entry for this task said only 'bypass/block lists from config', no flag name)",
+      "note": "Constraints.md's registry rule item 4 applies: every new policy needs a guard test that's red without it (HOP_DISABLE=<name>). Register in internal/policy before writing the implementation, same order task 1 followed for bypass_sink."
     }
   },
-  "queue_after_bypass_sink": [
-    {
-      "task": "bypass/block lists from config (SPEC §6.10)",
-      "blocker": "currently hardcoded in internal/netstack/verdict.go; pointless before BypassSink exists — the Bypass address set never changes at runtime yet"
-    },
+  "queue_after_bypass_config_lists": [
     {
       "task": "IPv6 blocking under ipv6_block",
       "red_without_it": "T28, internal/l3/tunnel_test.go"
@@ -102,8 +107,10 @@
       "go run ./cmd/realtimelint ."
     ],
     "notes": {
-      "negcheck": "runs every guard twice (with/without its policy) via `go test -count=1`, ~20+ min wall clock on this machine across 35 policies — this is expected, not a hang; don't rely on go test's cache",
-      "realtimelint": "does not accept ./... as an argument — pass literally `.`"
+      "negcheck": "runs every guard twice (with/without its policy) via `go test -count=1`, ~20+ min wall clock on this machine across the current policy count — this is expected, not a hang; don't rely on go test's cache. Per-task gate only needs the new policy's own guard under HOP_DISABLE=<name>, not a full negcheck run — the controller runs the full one at the end of the pass.",
+      "realtimelint": "does not accept ./... as an argument — pass literally `.`",
+      "l3_how_to_run": "Build once, run under an unprivileged user namespace: `go test -c -o /tmp/l3.test ./internal/l3` then `HOP_L3=1 unshare -Urn /tmp/l3.test` (add `-test.v -test.run '<pattern>'` to scope it). This works without root — unshare -Urn grants CAP_NET_ADMIN inside the fresh netns. Building the test binary once and reusing it across repeated unshare invocations is much faster than `go test` per run when iterating.",
+      "gate_correction": "go run ./cmd/realtimelint . is already red on main (not something this pass introduced): 3 hits in internal/dnstest/realserver_test.go, from commit 7916b55. go vet ./internal/... is already red too, at internal/engine/dialer.go:168 (assignment copies lock value). Both predate this pass and are outside internal/bypass/internal/packet/internal/l3/internal/agent/internal/netstack (the packages this pass touched). The honest gate for the next session is 'no *new* findings', verified by diffing against these two pre-existing hits — not a clean run of either command."
     },
     "rule": "every new policy must ship with a test that is red without it"
   }
