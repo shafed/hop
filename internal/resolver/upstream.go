@@ -452,6 +452,16 @@ func (r *Resolver) fit(q dnsmsg.Msg, answer dnsmsg.Msg, tr Transport) ([]byte, e
 	}
 	if truncated {
 		r.cnt.truncToClient.Add(1)
+		// D34б: Fit не видит запрос клиента и потому не может решить, был ли
+		// у него EDNS0 (RFC 6891 §6.1.1). Здесь — на руках и то, и другое.
+		// Ошибку разбора клиентского EDNS0 глотаем тем же способом, что и
+		// clientLimit: полученный TC уже честен сам по себе, OPT — довесок,
+		// а не условие корректности ответа.
+		if opt, ok, err := q.EDNS(); err == nil && ok {
+			if withOPT, err := dnsmsg.AppendOPT(fitted, opt.UDPSize, opt.DO); err == nil {
+				fitted = withOPT
+			}
+		}
 	}
 	return fitted, nil
 }

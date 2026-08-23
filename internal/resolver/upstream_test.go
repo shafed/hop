@@ -563,6 +563,57 @@ func TestD34TruncatedToUDPClientCarriesTC(t *testing.T) {
 	}
 }
 
+// D34б. Клиент объявил буфер EDNS0 512, ответ не влез: усечённый ответ несёт
+// OPT, отражающую EDNS0 клиента (RFC 6891 §6.1.1), не апстримовскую.
+func TestD34bTruncatedResponseCarriesClientOPT(t *testing.T) {
+	const name = "big.example"
+	s := newUpstreamStand(t, 1)
+	s.up.Program(s.addrs[0], oversizedAfterTC(name, 600))
+
+	query := dnstest.BuildQuery(dnstest.QueryOpts{
+		ID: 0x0D3B, Name: name, Type: dnstest.TypeA,
+		EDNS0: true, BufSize: 512,
+	})
+	resp := s.query(query, TransportUDP)
+
+	m := parseAnswer(t, resp)
+	if !m.Header.Truncated() {
+		t.Fatal("флаг TC не поднят — подготовка теста сломана")
+	}
+	if m.Header.ARCount != 1 {
+		t.Fatalf("ARCOUNT = %d, хотим 1 (одна OPT)", m.Header.ARCount)
+	}
+	opt, ok, err := m.EDNS()
+	if err != nil {
+		t.Fatalf("разбор OPT: %v", err)
+	}
+	if !ok {
+		t.Fatal("в усечённом ответе нет OPT: клиент с EDNS0 сочтёт нас не понимающими EDNS0")
+	}
+	if opt.UDPSize != 512 {
+		t.Fatalf("UDPSize в OPT = %d, хотим 512 — то, что объявил клиент", opt.UDPSize)
+	}
+}
+
+// D34б, отрицательный случай: клиент без EDNS0 не получает OPT — ему нечего
+// отражать, и вставлять OPT в ответ клиенту, который её не заявлял, само по
+// себе искажение (У6).
+func TestD34bClientWithoutEDNS0GetsNoOPT(t *testing.T) {
+	const name = "big.example"
+	s := newUpstreamStand(t, 1)
+	s.up.Program(s.addrs[0], oversizedAfterTC(name, 600))
+
+	resp := s.query(clientQuery(0x0D3C, name), TransportUDP)
+
+	m := parseAnswer(t, resp)
+	if !m.Header.Truncated() {
+		t.Fatal("флаг TC не поднят — подготовка теста сломана")
+	}
+	if m.Header.ARCount != 0 {
+		t.Fatalf("ARCOUNT = %d, хотим 0: клиент EDNS0 не объявлял", m.Header.ARCount)
+	}
+}
+
 // D35. То же, клиент объявил буфер EDNS0 4096, ответ 1200 байт: ушёл целиком,
 // без TC.
 func TestD35AnswerWithinClientBufferGoesWhole(t *testing.T) {
