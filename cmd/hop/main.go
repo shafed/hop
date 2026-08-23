@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/shafed/hop/internal/agent"
+	"github.com/shafed/hop/internal/bypass"
 	"github.com/shafed/hop/internal/clock"
 	"github.com/shafed/hop/internal/engine"
 	"github.com/shafed/hop/internal/health"
@@ -129,7 +130,7 @@ func main() {
 	defer physical.Close()
 
 	if err := run(log, cl, *tok, *beat, tunnelParams(*name, *addr, *mtu, *table),
-		physical.Interface, physical.DialDirect); err != nil {
+		physical.Interface, physical.DialDirect, physical.Control); err != nil {
 		fail(err)
 	}
 }
@@ -168,7 +169,7 @@ func withStore(fn func(*store.Store) error) error {
 // узла (§6.7), дозвон живёт в связке, а связке нужна живость, которой нужен
 // пробер. Круг разрывается замыканием — пробер зовёт дозвон лениво, к моменту
 // первой пробы связка уже собрана.
-func run(log *slog.Logger, cl control, tokenFile string, beat time.Duration, p tunnel.Params, physical engine.InterfaceFunc, dialDirect resolver.DialDirectFunc) error {
+func run(log *slog.Logger, cl control, tokenFile string, beat time.Duration, p tunnel.Params, physical engine.InterfaceFunc, dialDirect resolver.DialDirectFunc, bypassControl bypass.ControlFunc) error {
 	root, err := storeRoot()
 	if err != nil {
 		return err
@@ -203,6 +204,11 @@ func run(log *slog.Logger, cl control, tokenFile string, beat time.Duration, p t
 		// bypass. Строится из селектора, а не из net.Dialer: непривязанный
 		// сокет вернулся бы в туннель, и §5.7(а) дал бы петлю на старте.
 		DialDirect: dialDirect,
+		// BypassControl — тот же селектор, тот же механизм §6.8, что у
+		// DialDirect: привязка свежего сокета к физическому интерфейсу.
+		// Разница только в том, кто сокет открывает — здесь bypass.NAT,
+		// а не резолвер.
+		BypassControl: bypassControl,
 	})
 	if err != nil {
 		return err

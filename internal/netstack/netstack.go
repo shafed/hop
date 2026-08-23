@@ -282,6 +282,11 @@ func (s *Stack) handle(pkt []byte) {
 	}
 }
 
+// Deliver отдаёт клиенту готовый пакет из обратного пути bypass-NAT (§6.10).
+// Единственный писатель в устройство остаётся один: Deliver идёт через тот же
+// s.write, что ответы natTable и релеи gvisor.
+func (s *Stack) Deliver(pkt []byte) { s.write(pkt) }
+
 // write — единственный путь в устройство: писателей несколько (насос, релеи
 // gvisor, ответы NAT), устройство одно.
 func (s *Stack) write(pkts ...[]byte) {

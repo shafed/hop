@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"sync"
 
+	"github.com/shafed/hop/internal/bypass"
 	"github.com/shafed/hop/internal/clock"
 	"github.com/shafed/hop/internal/engine"
 	"github.com/shafed/hop/internal/health"
@@ -61,6 +62,12 @@ type Config struct {
 	DialDirect resolver.DialDirectFunc
 	// Bypass — куда уходит то, что выпущено мимо туннеля (§6.10). Этап 8.
 	Bypass netstack.BypassSink
+	// BypassControl — привязка сокетов bypass к физическому интерфейсу (§6.8).
+	// nil означает, что настоящий приёмник не собирается и вердикт bypass
+	// остаётся дропом; в продукте сюда приходит outbound.Selector.Control.
+	// Config.Bypass старше: он остаётся подстановкой для тестов, ровно как
+	// Config.Resolver старше собираемого связкой резолвера.
+	BypassControl bypass.ControlFunc
 	// NewXray — фабрика инстансов. nil означает настоящий Xray; тесты шагов 3
 	// и 4 подставляют фейк, потому что проверяется в них не Xray.
 	NewXray xrayFactory
@@ -86,15 +93,21 @@ type Agent struct {
 	dnsEvents chan health.SwitchEvent
 	dnsAcked  chan struct{}
 
-	mu      sync.Mutex
-	up      bool
-	bypass  bool
-	tphase  tunnel.Phase
-	detach  string
-	dev     packet.PacketDevice
-	stack   *netstack.Stack
-	last    health.SwitchEvent
-	stackWG sync.WaitGroup
+	mu     sync.Mutex
+	up     bool
+	bypass bool
+	tphase tunnel.Phase
+	detach string
+	dev    packet.PacketDevice
+	stack  *netstack.Stack
+	// bypassNAT — настоящий приёмник bypass §6.10, собранный связкой (когда
+	// Config.Bypass пуст, а Config.BypassControl задан). Живёт ровно как
+	// стек: заводится в Up, закрывается там же, где стек — в Down и
+	// watchService, — переживший Down приёмник унёс бы с собой сокеты,
+	// привязанные к прежнему физическому интерфейсу.
+	bypassNAT *bypass.NAT
+	last      health.SwitchEvent
+	stackWG   sync.WaitGroup
 
 	wg     sync.WaitGroup
 	done   chan struct{}
@@ -287,21 +300,43 @@ func (a *Agent) Up() error {
 		return fmt.Errorf("agent: туннель не поднялся: %w", err)
 	}
 
+	// Настоящий приёмник bypass собирается здесь, а не в New: ему нужен
+	// a.deliverBypass, а тому — стек, которого до Up ещё нет. Config.Bypass
+	// остаётся старше — тесты подставляют его напрямую и настоящий приёмник
+	// тогда не заводится (см. Config.BypassControl).
+	var sink netstack.BypassSink = a.cfg.Bypass
+	var nat *bypass.NAT
+	if sink == nil && a.cfg.BypassControl != nil {
+		nat, err = bypass.New(bypass.Config{
+			Control: a.cfg.BypassControl,
+			Reply:   a.deliverBypass,
+			Clock:   a.clk,
+		})
+		if err != nil {
+			_ = a.cfg.Trans.Release()
+			return fmt.Errorf("agent: bypass-NAT не собрался: %w", err)
+		}
+		sink = nat
+	}
+
 	stack, err := netstack.New(netstack.Config{
 		Device:   dev,
 		Dialer:   newDialer(a.hm, a.engine),
 		Resolver: a.res,
-		Bypass:   a.cfg.Bypass,
+		Bypass:   sink,
 		Clock:    a.clk,
 		Healthy:  a.hm.Healthy,
 	})
 	if err != nil {
+		if nat != nil {
+			nat.Close()
+		}
 		_ = a.cfg.Trans.Release()
 		return fmt.Errorf("agent: стек не собрался: %w", err)
 	}
 
 	a.mu.Lock()
-	a.dev, a.stack, a.up = dev, stack, true
+	a.dev, a.stack, a.bypassNAT, a.up = dev, stack, nat, true
 	a.detach = ""
 	a.mu.Unlock()
 
@@ -326,11 +361,15 @@ func (a *Agent) Down() error {
 		return nil
 	}
 	stack := a.stack
-	a.stack, a.dev, a.up = nil, nil, false
+	nat := a.bypassNAT
+	a.stack, a.dev, a.bypassNAT, a.up = nil, nil, nil, false
 	a.mu.Unlock()
 
 	if stack != nil {
 		stack.Close()
+	}
+	if nat != nil {
+		nat.Close()
 	}
 	// Release закрывает и устройство: PacketDevice (§3.2) умеет читать, писать
 	// и назвать MTU, и не умеет закрываться — им владеет тот, кто его выдал.
@@ -354,6 +393,19 @@ func (a *Agent) InterruptConnections() int {
 		return 0
 	}
 	return stack.InterruptTCP()
+}
+
+// deliverBypass — обратный путь bypass-NAT в устройство (§6.10). Тот же приём
+// отложенного замыкания, что у InterruptConnections: приёмнику нужен стек, а
+// стеку — приёмник (bypass.Config.Reply), и разорвать цикл можно только через
+// a.mu. Стека может не быть (гонка с Down) — тогда пакету деваться некуда.
+func (a *Agent) deliverBypass(pkt []byte) {
+	a.mu.Lock()
+	stack := a.stack
+	a.mu.Unlock()
+	if stack != nil {
+		stack.Deliver(pkt)
+	}
 }
 
 // Bypass включает и выключает обход (§1/С6).
@@ -609,11 +661,15 @@ func (a *Agent) watchService() {
 	a.mu.Lock()
 	a.detach = "связь с сервисом потеряна"
 	stack := a.stack
-	a.stack, a.dev, a.up = nil, nil, false
+	nat := a.bypassNAT
+	a.stack, a.dev, a.bypassNAT, a.up = nil, nil, nil, false
 	a.mu.Unlock()
 
 	if stack != nil {
 		stack.Close()
+	}
+	if nat != nil {
+		nat.Close()
 	}
 	// Release здесь почти наверняка откажет — сервиса нет, — и это законно:
 	// вместе с ним ушло и устройство, и маршруты (T29).

@@ -79,6 +79,15 @@ func (f *fakeTransport) counts() (int, int) {
 	return f.acquired, f.released
 }
 
+// device — устройство, выданное последним Acquire. Нужен тестам, которые
+// гоняют пакеты через устройство напрямую, а не только проверяют арифметику
+// владения (Acquire/Release).
+func (f *fakeTransport) device() *packettest.FakeDevice {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.dev
+}
+
 // fakeXray — инстанс движка. Считает выданные соединения и умеет сказать, был
 // ли закрыт: на этом держатся W20, W21 и W23.
 type fakeXray struct {
