@@ -173,6 +173,14 @@ type Resolver struct {
 	cache  *cache
 	flight *flightGroup
 
+	// mu защищает наблюдение за фазой. Фаза приходит функцией, то есть
+	// опрашивается, а не приезжает событием; чтобы удержание в waiting не
+	// превращалось в опрос по таймеру, связка обязана сказать PhaseChanged,
+	// и здесь лежит то, чем ждущие об этом узнают.
+	mu       sync.Mutex
+	wake     chan struct{} // закрывается на каждом PhaseChanged
+	inBypass bool          // последняя увиденная сторона края bypass (Р25)
+
 	wg        sync.WaitGroup
 	done      chan struct{}
 	closeOnce sync.Once
@@ -200,8 +208,10 @@ func New(cfg Config) (*Resolver, error) {
 		clk:    cfg.Clock,
 		cache:  newCache(cfg.Clock),
 		flight: newFlightGroup(),
+		wake:   make(chan struct{}),
 		done:   make(chan struct{}),
 	}
+	r.inBypass = cfg.Phase() == phase.Bypass
 	r.cnt.upstream = make([]atomic.Uint64, len(cfg.Upstreams))
 
 	if cfg.Events != nil {
@@ -255,9 +265,30 @@ func (r *Resolver) serve(query []byte, tr Transport) ([]byte, error) {
 		return r.fitRaw(q, synth, tr)
 	}
 
+	gen := r.cnt.generation.Load()
 	answer, err := r.lookup(ctx, q, rt)
 	if err != nil {
-		return r.servfail(q, tr)
+		// Р20: запрос, застигнутый переключением узла, повторяется ровно один
+		// раз — уже через нового активного. Признак «переключение состоялось» —
+		// выросшая Generation: её двигает сброс кэша по подписке, то есть тот
+		// самый сигнал, ради которого подписка и заведена.
+		//
+		// Ровно один раз, а не до победного: узел, умирающий на каждом
+		// запросе, иначе умножал бы каждый клиентский вопрос на длину
+		// подписки. И только внутри общего бюджета: истёкший ctx повтору не
+		// даст ничего, кроме лишнего сокета.
+		if !r.switched(gen) {
+			return r.servfail(q, tr)
+		}
+		// Живых узлов могло не остаться вовсе — тогда gate откажет сразу, без
+		// ожидания бюджета (D17).
+		rt, gerr := r.gate(ctx, q)
+		if gerr != nil {
+			return r.servfail(q, tr)
+		}
+		if answer, err = r.lookup(ctx, q, rt); err != nil {
+			return r.servfail(q, tr)
+		}
 	}
 	return r.fit(q, answer, tr)
 }
