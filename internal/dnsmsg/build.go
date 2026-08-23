@@ -192,6 +192,36 @@ func Fit(m Msg, limit int) (out []byte, truncated bool, err error) {
 	return out, true, nil
 }
 
+// AppendOPT дописывает псевдозапись OPT в ADDITIONAL: без RDATA (RFC 6891
+// §6.1.2, опций нет — только объявленный размер буфера и бит DO), поднимая
+// ARCOUNT на единицу.
+//
+// Рассчитана на то, что вызывающий сам решает, когда и с каким размером её
+// приписывать (D34б: резолвер знает EDNS0 клиента, Fit — нет), и не трогает
+// уже присутствующую OPT — двух OPT в одном сообщении быть не должно, и
+// вызывающий обязан не звать AppendOPT на сообщении, где она уже есть.
+func AppendOPT(msg []byte, udpSize uint16, do bool) ([]byte, error) {
+	if len(msg) < HeaderLen {
+		return nil, fmt.Errorf("%w: заголовок %d байт из %d", ErrShort, len(msg), HeaderLen)
+	}
+	out := make([]byte, len(msg), len(msg)+11)
+	copy(out, msg)
+
+	out = append(out, 0) // корневое имя владельца OPT
+	out = binary.BigEndian.AppendUint16(out, TypeOPT)
+	out = binary.BigEndian.AppendUint16(out, udpSize) // CLASS несёт буфер (RFC 6891 §6.1.2)
+	var ttl uint32
+	if do {
+		ttl |= optDOBit
+	}
+	out = binary.BigEndian.AppendUint32(out, ttl)
+	out = binary.BigEndian.AppendUint16(out, 0) // RDLENGTH — опций нет
+
+	arcount := binary.BigEndian.Uint16(out[10:12])
+	binary.BigEndian.PutUint16(out[10:12], arcount+1)
+	return out, nil
+}
+
 // NewQuery собирает запрос: заголовок с RD, один вопрос, ничего больше.
 //
 // Пакету он нужен ради bootstrap (§5.7а), который резолвит имена узлов и

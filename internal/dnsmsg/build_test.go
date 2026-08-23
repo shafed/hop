@@ -268,6 +268,70 @@ func TestD8BuildersRefuseUnparsedMsg(t *testing.T) {
 	}
 }
 
+// D34б. AppendOPT дописывает OPT в ADDITIONAL и поднимает ARCOUNT на
+// единицу, отражая заданный размер буфера и бит DO.
+func TestAppendOPTAddsRecordAndBumpsARCount(t *testing.T) {
+	q := mustParse(t, assemble(1, FlagRecursionDesired, question("example.com", TypeA), nil, nil, nil))
+	resp, err := Respond(q, RcodeNoError)
+	if err != nil {
+		t.Fatalf("Respond: %v", err)
+	}
+
+	out, err := AppendOPT(resp, 512, false)
+	if err != nil {
+		t.Fatalf("AppendOPT: %v", err)
+	}
+	m, err := Parse(out)
+	if err != nil {
+		t.Fatalf("разбор результата: %v", err)
+	}
+	if m.Header.ARCount != 1 {
+		t.Fatalf("ARCOUNT = %d, хотим 1", m.Header.ARCount)
+	}
+	opt, ok, err := m.EDNS()
+	if err != nil || !ok {
+		t.Fatalf("OPT не нашлась: ok=%v err=%v", ok, err)
+	}
+	if opt.UDPSize != 512 {
+		t.Fatalf("UDPSize = %d, хотим 512", opt.UDPSize)
+	}
+	if opt.DO {
+		t.Fatal("DO поднят, хотя не просили")
+	}
+}
+
+// D34б. DO проходит насквозь, когда его просят.
+func TestAppendOPTSetsDOBit(t *testing.T) {
+	q := mustParse(t, assemble(1, FlagRecursionDesired, question("example.com", TypeA), nil, nil, nil))
+	resp, err := Respond(q, RcodeNoError)
+	if err != nil {
+		t.Fatalf("Respond: %v", err)
+	}
+
+	out, err := AppendOPT(resp, 4096, true)
+	if err != nil {
+		t.Fatalf("AppendOPT: %v", err)
+	}
+	m, err := Parse(out)
+	if err != nil {
+		t.Fatalf("разбор результата: %v", err)
+	}
+	opt, ok, err := m.EDNS()
+	if err != nil || !ok {
+		t.Fatalf("OPT не нашлась: ok=%v err=%v", ok, err)
+	}
+	if !opt.DO {
+		t.Fatal("DO не поднят")
+	}
+}
+
+// D34б. Сообщение короче заголовка — отказ, а не паника или мусор.
+func TestAppendOPTRejectsShortMessage(t *testing.T) {
+	if _, err := AppendOPT([]byte{0x00, 0x01}, 512, false); !errors.Is(err, ErrShort) {
+		t.Fatalf("err = %v, хотим ErrShort", err)
+	}
+}
+
 // D34, D35. Не влезло в буфер клиента — заголовок с вопросом и TC, а не
 // урезанные байты RRset.
 func TestD34Fit(t *testing.T) {
