@@ -185,10 +185,7 @@ func run(log *slog.Logger, cl control, tokenFile string, beat time.Duration, p t
 		Prober: newProber(func(ctx context.Context, nodeID, network, addr string) (net.Conn, error) {
 			return a.ProbeDial(ctx, nodeID, network, addr)
 		}),
-		// Interrupt не выставлен: разрыв активных соединений при смерти узла
-		// (§5.5) требует от netstack учёта живых потоков, которого у него нет.
-		// Это известная дыра регистра — W8 и W14 в нём красные, — а не новая:
-		// см. «Deviations» в implementation-notes.md.
+		Interrupt: func() int { return a.InterruptConnections() },
 	})
 
 	tr := newTransport(cl, tokenFile, beat, log)

@@ -32,6 +32,17 @@ type tcpStack struct {
 	s    *Stack
 	gv   *stack.Stack
 	link *linkEndpoint
+
+	relayMu sync.Mutex
+	relays  map[*tcpRelay]struct{}
+}
+
+// tcpRelay — одна проксируемая связь: запись реестра ровно на время жизни
+// pipe (§5.5, W8/W14). stop — тот же once-обёрнутый закрыватель, что и у
+// самого pipe: закрыть релей можно и естественным концом потока, и разрывом
+// извне, и оба пути обязаны сходиться в одном месте.
+type tcpRelay struct {
+	stop func()
 }
 
 func newTCPStack(s *Stack) (*tcpStack, error) {
@@ -40,7 +51,7 @@ func newTCPStack(s *Stack) (*tcpStack, error) {
 		mtu = 1500
 	}
 
-	t := &tcpStack{s: s}
+	t := &tcpStack{s: s, relays: make(map[*tcpRelay]struct{})}
 	t.link = &linkEndpoint{s: s, mtu: uint32(mtu)}
 	t.gv = stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
@@ -134,14 +145,23 @@ func (t *tcpStack) accept(r *tcp.ForwarderRequest) (net.Conn, bool) {
 
 // pipe перекладывает байты в обе стороны и закрывает обе стороны, как только
 // умолкла любая из них.
+//
+// Реле встаёт в реестр tcpStack на время жизни pipe (§5.5): closeAll рвёт
+// отсюда ровно то, что сейчас открыто, не трогая NAT и не закрывая всю
+// виртуальную сеть, как это делал бы Stack.Close.
 func (t *tcpStack) pipe(a, b net.Conn) {
+	relay := &tcpRelay{}
 	var once sync.Once
 	stop := func() {
 		once.Do(func() {
+			t.removeRelay(relay)
 			_ = a.Close()
 			_ = b.Close()
 		})
 	}
+	relay.stop = stop
+	t.addRelay(relay)
+
 	t.s.wg.Add(2)
 	go func() {
 		defer t.s.wg.Done()
@@ -153,6 +173,36 @@ func (t *tcpStack) pipe(a, b net.Conn) {
 		defer stop()
 		_, _ = io.Copy(b, a)
 	}()
+}
+
+func (t *tcpStack) addRelay(r *tcpRelay) {
+	t.relayMu.Lock()
+	t.relays[r] = struct{}{}
+	t.relayMu.Unlock()
+}
+
+func (t *tcpStack) removeRelay(r *tcpRelay) {
+	t.relayMu.Lock()
+	delete(t.relays, r)
+	t.relayMu.Unlock()
+}
+
+// closeAll рвёт все сейчас открытые релеи и возвращает их число (§5.5,
+// W8/W14). Снимок под локом, а сами stop() — вне его: stop сам берёт
+// relayMu через removeRelay, повторный захват того же мьютекса в том же
+// потоке был бы взаимной блокировкой.
+func (t *tcpStack) closeAll() int {
+	t.relayMu.Lock()
+	relays := make([]*tcpRelay, 0, len(t.relays))
+	for r := range t.relays {
+		relays = append(relays, r)
+	}
+	t.relayMu.Unlock()
+
+	for _, r := range relays {
+		r.stop()
+	}
+	return len(relays)
 }
 
 // Границы одного соединения DNS поверх TCP.

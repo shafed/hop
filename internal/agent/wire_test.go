@@ -73,6 +73,27 @@ func TestW3CloseIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestInterruptConnectionsDelegatesToStack — InterruptConnections не паникует
+// без поднятого стека (Down/ещё не Up отдаёт 0, рвать нечего) и делегирует в
+// netstack.Stack.InterruptTCP, когда стек есть. Сам контракт «разрыв закрывает
+// сокет клиента» проверен на уровне netstack (TestInterruptTCPClosesLiveConnection);
+// здесь — только сама проводка в Agent и её вызов из cmd/hop.
+func TestInterruptConnectionsDelegatesToStack(t *testing.T) {
+	r := newRig(t, "a")
+
+	if n := r.a.InterruptConnections(); n != 0 {
+		t.Fatalf("InterruptConnections без поднятого стека вернул %d, ожидался 0", n)
+	}
+
+	r.a.Start()
+	if err := r.a.Up(); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	if n := r.a.InterruptConnections(); n != 0 {
+		t.Fatalf("InterruptConnections без соединений вернул %d, ожидался 0", n)
+	}
+}
+
 // TestW5SnapshotIsRaceFree — W5: снимок из другой горутины во время Up и Down.
 // Смысл под -race: замок агента и замок живости берутся в одном порядке.
 func TestW5SnapshotIsRaceFree(t *testing.T) {

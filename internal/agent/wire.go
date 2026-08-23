@@ -341,6 +341,21 @@ func (a *Agent) Down() error {
 	return err
 }
 
+// InterruptConnections рвёт активные TCP-соединения текущего стека и
+// возвращает их число (§5.5). Это и есть health.Config.Interrupt: живость
+// зовёт его сама, ровно при reason: dead, уже после того, как Active()
+// переехал на новый узел (Р30) — внутри решать «чьи» соединения рвать не
+// нужно. Стека может не быть (Down, ещё не Up) — тогда рвать нечего.
+func (a *Agent) InterruptConnections() int {
+	a.mu.Lock()
+	stack := a.stack
+	a.mu.Unlock()
+	if stack == nil {
+		return 0
+	}
+	return stack.InterruptTCP()
+}
+
 // Bypass включает и выключает обход (§1/С6).
 //
 // Включение снимает туннель (Р35): маршруты возвращаются к снапшоту, и трафик

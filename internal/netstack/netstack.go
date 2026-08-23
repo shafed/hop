@@ -219,6 +219,15 @@ func (s *Stack) Close() {
 	s.wg.Wait()
 }
 
+// InterruptTCP рвёт все сейчас открытые проксируемые TCP-соединения и
+// возвращает их число (§5.5). Живость зовёт его через health.Config.Interrupt
+// ровно при reason: dead, после того как Active() уже отдаёт новый узел —
+// внутри решать «чьи» соединения рвать не нужно: узел соединения фиксирован
+// на дозвоне и не меняется (Р30, internal/agent/dialer.go).
+func (s *Stack) InterruptTCP() int {
+	return s.tcp.closeAll()
+}
+
 // Stats — снимок счётчиков.
 func (s *Stack) Stats() Stats {
 	s.mu.Lock()
