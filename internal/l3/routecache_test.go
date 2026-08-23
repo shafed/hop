@@ -191,6 +191,10 @@ func peerMain() {
 		}
 	}
 
+	// mDNS-респондер — задача 3 (bypass_test.go): тот же пир, ещё один
+	// протокол на другом порту, TCP-эхо не трогает.
+	startMDNSResponder()
+
 	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", peerAddr, peerPort))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "пир: listen:", err)
