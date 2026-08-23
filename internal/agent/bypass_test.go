@@ -77,7 +77,10 @@ func TestBypassSinkCarriesDatagramAndReply(t *testing.T) {
 	tr := newFakeTransport()
 
 	// Без Config.Bypass — приёмник обязана собрать сама связка из
-	// Config.BypassControl (задача 2).
+	// Config.BypassControl (задача 2). NewXray — фейк, тот же, что заводит
+	// newRig: связка в этом пакете не поднимает настоящий Xray нигде
+	// (harness_test.go), а нулевой набор узлов, при котором реальный Xray
+	// сегодня стартовал бы тихо и дёшево, — случайность, а не гарантия.
 	a, err := New(Config{
 		Store:         st,
 		Health:        health.New(health.Config{Clock: clk}),
@@ -85,6 +88,7 @@ func TestBypassSinkCarriesDatagramAndReply(t *testing.T) {
 		Clock:         clk,
 		Params:        tunnel.Params{Name: "hop0", MTU: 1400, Addr: "10.255.0.1/24", Table: 8420},
 		BypassControl: control,
+		NewXray:       (&xrayLog{}).factory(),
 	})
 	if err != nil {
 		t.Fatalf("связка не собралась: %v", err)
