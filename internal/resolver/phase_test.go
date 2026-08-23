@@ -190,7 +190,9 @@ func TestD12WaitingHoldsUntilNodeAppears(t *testing.T) {
 		if got.Header.ANCount == 0 {
 			t.Fatal("ответ пуст: дождались, но резолв не случился")
 		}
-	case <-time.After(5 * time.Second):
+	// Сторожевой срок настоящими часами: модельные здесь не годятся — если
+	// удержание не отпустило, двигать их некому, и тест повис бы навсегда.
+	case <-time.After(5 * time.Second): //hop:realtime
 		t.Fatal("удержанный запрос не отпустило после появления живого узла")
 	}
 }
@@ -237,7 +239,8 @@ func TestD13WaitingGivesUpAtFourSeconds(t *testing.T) {
 		if rc := got.Header.Rcode(); rc != dnsmsg.RcodeServFail {
 			t.Fatalf("rcode = %d, хотим SERVFAIL по истечении удержания", rc)
 		}
-	case <-time.After(5 * time.Second):
+	// Сторожевой срок настоящими часами, по той же причине, что выше.
+	case <-time.After(5 * time.Second): //hop:realtime
 		t.Fatal("удержание не кончилось на четвёртой секунде модельного времени")
 	}
 	wantUpstream(t, g.up, 0, "удержание истекло, живого узла так и не было")
