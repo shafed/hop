@@ -156,51 +156,6 @@ func TestNoReplyToRST(t *testing.T) {
 	}
 }
 
-// TestDNSInOrphanedRefusesEvenToLocalRouter — T23c, стык §5.7б с §6.2.
-//
-// hijack-dns ставит перехват :53 выше bypass (§3.4, правило prioDNS в
-// internal/platform), поэтому в нормальной работе запрос на локальный роутер
-// уходит через активный узел, а не провайдеру. В orphaned запрос приходит уже
-// на устройство, и по адресу это RFC1918 — то есть по буквальному чтению
-// isLocal() исключение §5.6. Считать его исключением нельзя: приложение
-// получило бы не отказ, а полный таймаут резолвера на каждое имя вместо
-// мгновенного ICMP/RST — ровно то молчание, против которого §5.6 написан.
-//
-// Excluded() поэтому отводит :53 раньше проверки адреса.
-func TestDNSInOrphanedRefusesEvenToLocalRouter(t *testing.T) {
-	router := ap("192.168.1.1:53")
-
-	dev := packettest.NewFake(1400)
-	done := make(chan error, 1)
-	go func() { done <- Serve(dev) }()
-
-	dev.Inject(
-		packettest.UDP(client, router, []byte("query")),
-		packettest.TCPSyn(client, router, 1000),
-	)
-
-	emitted := dev.WaitEmitted(t, 2)
-	dev.Close()
-	if err := <-done; err != nil {
-		t.Fatalf("Serve: %v", err)
-	}
-
-	icmp := header.ICMPv4(header.IPv4(emitted[0]).Payload())
-	if icmp.Type() != header.ICMPv4DstUnreachable || icmp.Code() != header.ICMPv4PortUnreachable {
-		t.Fatalf("на DNS по UDP ответ не ICMP port unreachable: % x", emitted[0])
-	}
-	rst := header.IPv4(emitted[1])
-	if header.TCP(rst.Payload()).Flags()&header.TCPFlagRst == 0 {
-		t.Fatalf("на DNS по TCP ответ не RST: % x", emitted[1])
-	}
-
-	// Остальной локальный трафик исключением быть не перестал: иначе в
-	// orphaned ломается печать, Bonjour и всё, ради чего §6.10 их выпускает.
-	if !Excluded(packettest.TCPSyn(client, ap("192.168.1.1:80"), 1)) {
-		t.Fatal("локальный трафик перестал быть исключением §5.6")
-	}
-}
-
 // Мусор с границы не должен ронять привилегированный процесс.
 func TestGarbageIsIgnored(t *testing.T) {
 	for _, pkt := range [][]byte{

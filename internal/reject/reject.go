@@ -31,7 +31,6 @@ const (
 	portDHCPServer = 67
 	portDHCPClient = 68
 	portNTP        = 123
-	portDNS        = 53
 )
 
 // Reply строит ответ на пакет, которому отказано, или возвращает nil, если
@@ -69,20 +68,6 @@ func Excluded(pkt []byte) bool {
 	if !ok {
 		return false
 	}
-	// :53 не исключение никогда, даже на локальный адрес. Причина — стык
-	// §5.7б с §6.2.
-	//
-	// Системный DNS обычно и есть локальный роутер, поэтому §3.4 ставит
-	// hijack-dns выше bypass, а маршруты заводят :53 в туннель прежде
-	// исключений §5.6 (правило prioDNS в internal/platform). В orphaned такой
-	// запрос приходит на устройство, и если считать его исключением — по
-	// адресу он ровно RFC1918, — ответа не будет вовсе. Приложение получит не
-	// отказ, а полный таймаут резолвера на каждое имя: то самое молчание,
-	// против которого написан §5.6, и прямое нарушение §5.7б, требующего
-	// от DNS отказывать вместе со всем остальным.
-	if dnsPort(ip) {
-		return false
-	}
 	dst, _ := netip.AddrFromSlice(ip.DestinationAddressSlice())
 	if isLocal(dst) {
 		return true
@@ -96,24 +81,6 @@ func Excluded(pkt []byte) bool {
 		case portDHCPServer, portDHCPClient, portNTP:
 			return true
 		}
-	}
-	return false
-}
-
-// dnsPort — пакет адресован в :53, по UDP или по TCP (§3.4, п. 1).
-func dnsPort(ip header.IPv4) bool {
-	payload := ip.Payload()
-	switch ip.Protocol() {
-	case uint8(header.UDPProtocolNumber):
-		if len(payload) < header.UDPMinimumSize {
-			return false
-		}
-		return header.UDP(payload).DestinationPort() == portDNS
-	case uint8(header.TCPProtocolNumber):
-		if len(payload) < header.TCPMinimumSize {
-			return false
-		}
-		return header.TCP(payload).DestinationPort() == portDNS
 	}
 	return false
 }

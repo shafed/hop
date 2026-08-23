@@ -57,6 +57,7 @@ var (
 		Doc:  "hijack-dns прежде bypass (§3.4, T16)",
 		Guards: []Guard{
 			{Pkg: "./internal/netstack", Test: "^TestT16DNSToLocalRouterIsHijacked$"},
+			{Pkg: "./internal/l2", Test: "^TestT16DNSToLocalRouterIsHijackedRealResolver$"},
 		},
 	}
 
@@ -72,6 +73,196 @@ var (
 		},
 	}
 
+	// KOfN — узел мёртв при k неудачах из n последних результатов (§6.3,
+	// этап 5). Выключение ставит k=1: одна неудачная проба стирает узел,
+	// ровно как DeleteURLTestHistory в sing-box, из-за чего на нестабильной
+	// сети выбор мечется. Краснит T2 и A3 (воскрешение стоит k успехов).
+	KOfN = &Policy{
+		Name: "k_of_n",
+		Doc:  "смерть по k из n результатов, а не по последнему (§6.3, T1, T2, A1–A3)",
+		Guards: []Guard{
+			{Pkg: "./internal/health", Test: "^TestT2SingleFailureKeepsNodeAlive$"},
+			{Pkg: "./internal/health", Test: "^TestA3DeadNodeReturnsAfterTwoSuccesses$"},
+		},
+	}
+
+	// Tolerance — гистерезис выбора (§6.4, этап 5). Выключение обнуляет
+	// порог, и два узла с 90 и 95 мс перекидывают пользователя туда-сюда на
+	// каждом цикле проб.
+	Tolerance = &Policy{
+		Name: "tolerance",
+		Doc:  "гистерезис 50 мс при выборе более быстрого узла (§6.4, T3)",
+		Guards: []Guard{
+			{Pkg: "./internal/health", Test: "^TestT3HysteresisLimitsSwitching$"},
+		},
+	}
+
+	// SwitchReason — причина переключения решает судьбу активных соединений
+	// (§5.5, этап 5). Выключение рвёт их всегда — путь sing-box, где причины
+	// нет и разрыв сделан глобальным флагом. Краснит A19: обрыв загрузки ради
+	// 30 мс выигрыша.
+	SwitchReason = &Policy{
+		Name: "switch_reason",
+		Doc:  "рвать соединения только при reason=dead (§5.5, T7, T8, A18, A19)",
+		Guards: []Guard{
+			{Pkg: "./internal/health", Test: "^TestA19FasterSwitchKeepsConnections$"},
+		},
+	}
+
+	// ForcedProbe — форс-прогон проб на событиях сети (§6.6, этап 5).
+	// Выключение оставляет только тикер: после пробуждения из сна пользователь
+	// ждёт полный интервал на заведомо мёртвом узле.
+	ForcedProbe = &Policy{
+		Name: "forced_probe",
+		Doc:  "немедленный прогон проб на событиях сети (§6.6, T6, A24)",
+		Guards: []Guard{
+			{Pkg: "./internal/health", Test: "^TestT6NetworkChangeProbesImmediately$"},
+			{Pkg: "./internal/health", Test: "^TestA24ForcedProbesCoalesce$"},
+		},
+	}
+
+	// MultiURL — несколько тестовых URL (§5.4, этап 5). Выключение оставляет
+	// один, и блокировка единственного тестового домена убивает всю подписку
+	// разом при полностью живых узлах.
+	MultiURL = &Policy{
+		Name: "multi_url",
+		Doc:  "проба по нескольким URL, успех хотя бы одного (§5.4, T5, A30–A32)",
+		Guards: []Guard{
+			{Pkg: "./internal/health", Test: "^TestT5OneBlockedURLDoesNotKillNodes$"},
+			{Pkg: "./internal/health", Test: "^TestA31RTTIsTheFastestURL$"},
+		},
+	}
+
+	// ProbeTiers — ярусное расписание проб (§6.5, этап 5). Выключение
+	// схлопывает ярусы в полный обход подписки на каждом тике: 200 узлов дают
+	// тысячи TLS-хендшейков в час к одному провайдеру. Краснит A25 и A26.
+	ProbeTiers = &Policy{
+		Name: "probe_tiers",
+		Doc:  "ярусы расписания проб и джиттер хвоста (§6.5, A25, A26)",
+		Guards: []Guard{
+			{Pkg: "./internal/health", Test: "^TestA25ProbeCostStaysBounded$"},
+			{Pkg: "./internal/health", Test: "^TestA26TailProbesAreSpread$"},
+		},
+	}
+
+	// TrafficKills — ошибки реального трафика влияют на живость (§5.4, §6.15,
+	// этап 5). Выключение оставляет только пробы, и узел, умерший под
+	// трафиком, живёт до следующей пробы — то есть до 45 с вместо 5 с.
+	TrafficKills = &Policy{
+		Name: "traffic_kills",
+		Doc:  "ошибки трафика §6.15 убивают узел наравне с пробами (A5, A29)",
+		Guards: []Guard{
+			{Pkg: "./internal/health", Test: "^TestA5TrafficFailuresKillNode$"},
+			{Pkg: "./internal/health", Test: "^TestA29SwitchUnderTrafficIsFast$"},
+		},
+	}
+
+	// ErrorClassify — классификация ошибок §6.15: смертью считаются только
+	// отказы на пути к узлу (этап 4). Выключение переводит движок в режим
+	// «убивает любой отказ», и живой узел умирает от отказа целевого сайта —
+	// ровно та ошибка, ради которой перечисление §6.15 замкнуто. Краснит T20.
+	ErrorClassify = &Policy{
+		Name: "error_classify",
+		Doc:  "смертельны только отказы на пути к узлу (§6.15, T20)",
+		// Охраняет не T20, а TestStreamErrorIsNotFatal, и вот почему.
+		// Когда целевой хост отказывает через живой узел, клиент видит
+		// обычный EOF — вердикта в этом случае нет вовсе, и T20 остаётся
+		// зелёным при любом состоянии флага. Различает флаг другой случай:
+		// ошибку потока «closed pipe», за которой может стоять и мёртвый
+		// узел, и мёртвый сайт. Именно её выключенная политика объявляет
+		// смертью — а T20 идёт спутником, проверяя, что до health при этом
+		// ничего не доехало.
+		Guards: []Guard{
+			{Pkg: "./internal/engine", Test: "^TestStreamErrorIsNotFatal$"},
+		},
+	}
+
+	// ParseCascade — каскад распознавателей §6.12: первый взявший забирает
+	// вход целиком (этап 7). Выключение переводит каскад в режим «ступени
+	// объединяют результаты»: base64-обёртка, разобравшаяся заодно и
+	// построчно, даёт узлы дважды, а тело Clash YAML вместо одной внятной
+	// ошибки уезжает в построчный разбор и превращается в шум. S22, S23, S24.
+	ParseCascade = &Policy{
+		Name: "parse_cascade",
+		Doc:  "первый взявший распознаватель забирает вход целиком (§6.12, S22–S24)",
+		Guards: []Guard{
+			{Pkg: "./internal/subscription", Test: "^TestS22Base64BodyTakenByFirstStage$"},
+			{Pkg: "./internal/subscription", Test: "^TestS23ClashBodyRejectedWithOneError$"},
+			{Pkg: "./internal/subscription", Test: "^TestS24Base64ContentIsNotParsedTwice$"},
+		},
+	}
+
+	// MergeKey — ключ слияния подписок §6.16: protocol + server + port +
+	// user_id (этап 7). Выключение переводит ключ на полный отпечаток узла —
+	// второй вариант nekoray (ProfileFilter_ent_key), который §6.16 отвергает:
+	// косметическая правка у провайдера (сменился транспорт, сменился SNI)
+	// перестаёт быть тем же узлом, узел получает новый id и теряет историю проб
+	// на ровном месте. T18, S1.
+	MergeKey = &Policy{
+		Name: "merge_key",
+		Doc:  "ключ слияния §6.16, а не полный отпечаток узла (§5.8, T18, S1)",
+		Guards: []Guard{
+			{Pkg: "./internal/subscription", Test: "^TestT18SNIChangeKeepsSameID$"},
+			{Pkg: "./internal/subscription", Test: "^TestS1TransportChangeKeepsID$"},
+		},
+	}
+
+	// MergeKeyUserID — в ключ §6.16 входит user_id по таблице протоколов (этап
+	// 7). Выключение оставляет один адрес — первый вариант nekoray, — и два
+	// узла на одном сервере и порту, различающиеся только ключом доступа,
+	// склеиваются в один: история одного приписывается другому. S3.
+	//
+	// Флаг отдельный от merge_key, а не режим внутри него: HOP_DISABLE двоичен,
+	// и одним флагом одна из двух проверок осталась бы без охранника
+	// (docs/verification-store.md §6).
+	MergeKeyUserID = &Policy{
+		Name: "merge_key_userid",
+		Doc:  "user_id по таблице §6.16 в ключе слияния, а не один адрес (S3)",
+		Guards: []Guard{
+			{Pkg: "./internal/subscription", Test: "^TestS3UserIDDistinguishesNodes$"},
+		},
+	}
+
+	// AtomicWrite — запись стора через временный файл рядом и rename (§2,
+	// этап 7). Выключение переводит запись на место, с O_TRUNC: обрыв посреди
+	// неё оставляет читаемым не прежнее состояние и не новое, а обрубок —
+	// ровно третье наблюдаемое состояние, которого У4 не допускает. S25, S26.
+	AtomicWrite = &Policy{
+		Name: "atomic_write",
+		Doc:  "запись стора временным файлом и rename, а не на месте (§2, S25, S26)",
+		Guards: []Guard{
+			{Pkg: "./internal/store", Test: "^TestS25FailureBetweenFsyncAndRenameKeepsOldState$"},
+			{Pkg: "./internal/store", Test: "^TestS26FailureWhileWritingTempKeepsMainFile$"},
+		},
+	}
+
+	// StoreLock — файловый замок каталога стора на время «прочитать —
+	// изменить — записать» (Р14, этап 7). Писателей двое по построению: агент
+	// пишет живость, процесс команды правит подписки (C12). Выключение не
+	// отсекает второго, и одновременные правки теряют одну из них — файлы
+	// пишутся целиком. S28.
+	StoreLock = &Policy{
+		Name: "store_lock",
+		Doc:  "второй писатель в стор ждёт замок и падает внятно, а не пишет поверх (Р14, S28)",
+		Guards: []Guard{
+			{Pkg: "./internal/store", Test: "^TestS28SecondWriterWaitsThenFails$"},
+		},
+	}
+
+	// HealthSlice — на диск идёт срез живости, а не вся NodeHealth (§2, этап
+	// 7). Выключение пишет и восстанавливает окно, traffic_failures и
+	// last_error: окно, пролежавшее выключенным час, воскрешает узел по §6.3 из
+	// записей, которым час, а восстановленный alive выдаёт себя за проверенный —
+	// стартовый бюджет §5.6 не отсчитывается заново. S36, S37.
+	HealthSlice = &Policy{
+		Name: "health_slice",
+		Doc:  "на диск идёт срез живости, а не окно (§2, S36, S37)",
+		Guards: []Guard{
+			{Pkg: "./internal/store", Test: "^TestS36RestoredHealthHasNoWindow$"},
+			{Pkg: "./internal/store", Test: "^TestS37RestoredAliveNodeCarriesNoProbe$"},
+		},
+	}
+
 	// NATKey — UDP full-cone: NAT по source addr:port (§5.3, этап 3).
 	// Выключение переводит ключ на пару src+dst: записей становится по одной на
 	// адрес назначения, а ответ с адреса, на который клиент не слал, теряется.
@@ -84,150 +275,191 @@ var (
 		},
 	}
 
-	// ErrorClassify — замкнутое перечисление §6.15: смертью узла считаются
-	// только отказы на пути к узлу и внутри него (этап 4). Выключение сводит
-	// классификацию к «любая ошибка убивает», и упавший сайт уносит с собой
-	// живой узел: T20.
-	ErrorClassify = &Policy{
-		Name: "error_classify",
-		Doc:  "смертью узла считаются только отказы узла, не сайта (§6.15, T20)",
+	// XrayDrain — дренаж прежнего инстанса Xray при смене набора узлов
+	// (§5.8, Р32 регистра связки, этап С). Выключение убивает прежний инстанс
+	// сразу, и обновление подписки рвёт живые соединения — а §5.5 обещает
+	// рвать только по причине dead. Краснит W18, W20, W21.
+	XrayDrain = &Policy{
+		Name: "xray_drain",
+		Doc:  "дренаж прежнего инстанса Xray при смене набора узлов (§5.8, T30, W18)",
 		Guards: []Guard{
-			{Pkg: "./internal/engine", Test: "^TestT20SiteErrorDoesNotKillNode$"},
+			{Pkg: "./internal/agent", Test: "^TestW18SubscriptionUpdateKeepsConnection$"},
+			{Pkg: "./internal/agent", Test: "^TestW20DrainEndsWithLastConnection$"},
 		},
 	}
 
-	// KOfN — окно смерти §6.3: мёртв при k неудачах из n последних проб (этап
-	// 5). Выключение схлопывает окно до одной пробы, и на нестабильной сети
-	// первая же ошибка убивает узел — путь sing-box с DeleteURLTestHistory: T2.
-	KOfN = &Policy{
-		Name: "k_of_n",
-		Doc:  "окно k-из-n вместо одной пробы (§6.3, T2)",
+	// SwitchOrder — зафиксированный порядок реакций на переключение
+	// (Р33 регистра связки). Выключение переставляет сброс кэша резолвера
+	// после рассылки события: клиент, реагирующий на событие повторным
+	// резолвом, получает адрес, добытый через мёртвый узел, и §5.7(в)
+	// оказывается выполнен формально. Краснит W11, W13, W14.
+	SwitchOrder = &Policy{
+		Name: "switch_order",
+		Doc:  "порядок реакций на переключение: кэш, разрыв, событие, диск (Р33, W11)",
 		Guards: []Guard{
-			{Pkg: "./internal/health", Test: "^TestT2SingleFailureDoesNotKill$"},
+			{Pkg: "./internal/agent", Test: "^TestW11SwitchReactionsFollowOrder$"},
+			{Pkg: "./internal/agent", Test: "^TestW13CacheFlushPrecedesEvent$"},
 		},
 	}
 
-	// Tolerance — гистерезис выбора §6.4 (этап 5). Выключение обнуляет порог, и
-	// два узла с 90 и 95 мс перекидывают пользователя туда-сюда на каждом
-	// цикле: T3.
-	Tolerance = &Policy{
-		Name: "tolerance",
-		Doc:  "переключаемся, только если кандидат быстрее на tolerance (§6.4, T3)",
+	// PhaseSplit — две фазы вместо одной (§2, D14). Выключение сводит их в
+	// одну, и «туннель поднят, живых узлов нет» перестаёт быть выразимым:
+	// снаружи видна половина правды. Краснит W24, W32.
+	PhaseSplit = &Policy{
+		Name: "phase_split",
+		Doc:  "фаза туннеля и фаза трафика — раздельно (§2, W24, W32)",
 		Guards: []Guard{
-			{Pkg: "./internal/health", Test: "^TestT3NoFlappingWithinTolerance$"},
+			{Pkg: "./internal/agent", Test: "^TestW24TunnelUpWithNoLiveNodes$"},
+			{Pkg: "./internal/agent", Test: "^TestW32StartupBudgetIsWaiting$"},
 		},
 	}
 
-	// MultiURL — пробы по нескольким URL §5.4 (этап 5). Выключение оставляет
-	// один тестовый домен, и его блокировка убивает всю подписку разом: T5.
-	MultiURL = &Policy{
-		Name: "multi_url",
-		Doc:  "пробы по нескольким URL, а не по одному (§5.4, T5)",
+	// BypassTeardown — `hop bypass --on` снимает туннель (Р35 регистра связки).
+	// Выключение оставляет туннель поднятым, и «выпустить трафик напрямую»
+	// (§1/С6) перестаёт что-либо выпускать: маршруты по-прежнему ведут в
+	// туннель. Краснит W25, W26.
+	BypassTeardown = &Policy{
+		Name: "bypass_teardown",
+		Doc:  "обход снимает туннель, а не разворачивает трафик внутри (§5.6, W25)",
 		Guards: []Guard{
-			{Pkg: "./internal/health", Test: "^TestT5OneDeadURLDoesNotKillNode$"},
+			{Pkg: "./internal/agent", Test: "^TestW25BypassTakesTunnelDown$"},
+			{Pkg: "./internal/agent", Test: "^TestW26BypassOffRaisesTunnel$"},
 		},
 	}
 
-	// ForcedProbe — форс-проверка на событиях §6.6 (этап 5). Выключение
-	// заставляет ждать тикера после смены сети, то есть держать пользователя на
-	// заведомо мёртвом узле: T6.
-	ForcedProbe = &Policy{
-		Name: "forced_probe",
-		Doc:  "немедленный прогон проб по событию смены сети (§6.6, T6)",
-		Guards: []Guard{
-			{Pkg: "./internal/health", Test: "^TestT6ForcedProbeOnEvent$"},
-		},
-	}
+	// --- Этап 6, DNS (docs/verification-dns.md §6). Десять флагов на этап —
+	// много, и это осознанно: negcheck гоняет каждый охранник дважды, а список
+	// сжат тем, что в Guards стоят только зарегистрированные охранники.
 
-	// SwitchReason — разрыв соединений зависит от причины переключения §5.5
-	// (этап 5). Выключение стирает различие и рвёт всегда, как глобальный флаг
-	// sing-box: загрузка не доживает до конца ради выигранных 30 мс: T10.
-	SwitchReason = &Policy{
-		Name: "switch_reason",
-		Doc:  "рвём соединения только при reason=dead (§5.5, T10)",
-		Guards: []Guard{
-			{Pkg: "./internal/health", Test: "^TestT10FasterSwitchKeepsConnections$"},
-		},
-	}
-
-	// DNSCacheFlushOnSwitch — сброс кэша при смене узла §5.7в (этап 6).
-	// Выключение оставляет старые адреса жить дальше, и после переключения
-	// трафик уходит в CDN чужого региона: T14.
-	DNSCacheFlushOnSwitch = &Policy{
-		Name: "dns_cache_flush_on_switch",
-		Doc:  "кэш DNS обнуляется при смене активного узла (§5.7в, T14)",
-		Guards: []Guard{
-			{Pkg: "./internal/dns", Test: "^TestT14CacheFlushedOnSwitch$"},
-		},
-	}
-
-	// Bootstrap — резолв хостнеймов узлов мимо туннеля §5.7а (этап 6).
-	// Выключение отправляет их через туннель, и старт уходит в петлю: чтобы
-	// поднять узел, надо резолвить его имя, а чтобы резолвить — поднять узел.
+	// Bootstrap — имена узлов резолвятся отдельным резолвером мимо туннеля
+	// (§5.7а, §6.8). Выключение отправляет их общим путём, через туннель, —
+	// то есть через резолвер, которому для работы нужен живой узел, которого
+	// нет, пока имя не разрешилось. Это петля старта, а не деградация.
 	Bootstrap = &Policy{
 		Name: "bootstrap",
-		Doc:  "хостнеймы узлов резолвятся мимо туннеля (§5.7а)",
+		Doc:  "имена узлов резолвит bootstrap мимо туннеля (§5.7а, D51, D52)",
 		Guards: []Guard{
-			{Pkg: "./internal/dns", Test: "^TestBootstrapGoesDirect$"},
+			{Pkg: "./internal/resolver", Test: "^TestD51NodeNameResolvesViaBootstrap$"},
+			{Pkg: "./internal/resolver", Test: "^TestD52BootstrapGoesDirect$"},
 		},
 	}
 
-	// ConfirmProbe — подтверждающая проба сразу после отказа горячего узла
-	// (§6.3, §8.3). Выключение оставляет окно k-из-n набираться по одному
-	// исходу за период яруса, и смерть активного узла признаётся через минуту
-	// вместо секунд — бюджет T9/T11 в пять секунд не берётся ни одним из двух
-	// видов отказа.
-	ConfirmProbe = &Policy{
-		Name: "confirm_probe",
-		Doc:  "подтверждающая проба после отказа, а не через период яруса (§6.3, T9, T11)",
+	// DNSUpstream — апстримов два, второй с форой 150 мс (§5.7). Выключение
+	// оставляет один, и блокировка единственного апстрима означает мёртвый DNS
+	// при полностью живом узле — та же ошибка, против которой стоит multi_url
+	// в пробах.
+	DNSUpstream = &Policy{
+		Name: "dns_upstream",
+		Doc:  "два апстрима, второй с форой 150 мс (§5.7, D41, D42)",
 		Guards: []Guard{
-			{Pkg: "./internal/supervisor", Test: "^TestT9BlackholeInterruptsConnectionWithinBudget$"},
-			{Pkg: "./internal/supervisor", Test: "^TestT11BothFailureKindsSwitchWithinBudget$"},
+			{Pkg: "./internal/resolver", Test: "^TestD41FastFirstUpstreamSkipsSecond$"},
+			{Pkg: "./internal/resolver", Test: "^TestD42SilentFirstFallsToSecond$"},
 		},
 	}
 
-	// MergeKey — ключ слияния подписок §6.16 (этап 7). Выключение переводит
-	// ключ на полный отпечаток: косметическая правка у провайдера — смена SNI —
-	// делает узел новым и обнуляет его историю проб: T18.
-	MergeKey = &Policy{
-		Name: "merge_key",
-		Doc:  "ключ слияния protocol+server+port+user_id, не полный отпечаток (§6.16, T18)",
+	// DNSTCPRetry — флаг TC от апстрима означает повтор по TCP (§5.7).
+	// Выключение отдаёт клиенту усечённое: большие RRset молча теряют записи,
+	// и приложение видит часть адресов вместо всех.
+	DNSTCPRetry = &Policy{
+		Name: "dns_tcp_retry",
+		Doc:  "повтор по TCP на флаг TC, а не усечённый ответ (§5.7, D33)",
 		Guards: []Guard{
-			{Pkg: "./internal/sub", Test: "^TestT18MergeKeepsHistoryOnSNIChange$"},
+			{Pkg: "./internal/resolver", Test: "^TestD33TruncatedAnswerRetriesOverTCP$"},
+			{Pkg: "./internal/l2", Test: "^TestD33TruncatedAnswerRetriesOverTCPRealNode$"},
 		},
 	}
 
-	// LoopGuard — защита от петли §6.8 (этап 8): исходящие сокеты агента не
-	// заходят обратно в туннель. Выключение возвращает соединение к узлу в
-	// собственный TUN, и трафик наматывается сам на себя вместо того, чтобы
-	// уйти в сеть: T25.
-	LoopGuard = &Policy{
-		Name: "loop_guard",
-		Doc:  "исходящее к узлу идёт мимо туннеля (§6.8, T25)",
+	// DNSCacheFlushOnSwitch — кэш сбрасывается при смене того, через что мы
+	// резолвим: и на событии переключения узла (§5.7в), и на краю bypass
+	// (Р25). Выключение снимает оба сброса, и после переключения трафик уходит
+	// в CDN чужого региона по адресу, добытому через прежний узел.
+	//
+	// Один флаг на два повода, а не два: Р25 говорит, что край bypass
+	// сбрасывает кэш «так же, как смена узла», — значит и выключаться они
+	// обязаны вместе. Флаг про то, сбрасываем ли мы кэш, а не про то, какой
+	// провод об этом сообщил.
+	DNSCacheFlushOnSwitch = &Policy{
+		Name: "dns_cache_flush_on_switch",
+		Doc:  "сброс кэша при смене узла и на краю bypass (§5.7в, Р25, T14, D19, D20)",
 		Guards: []Guard{
-			{Pkg: "./internal/loopguard", Test: "^TestT25NoLoopOnNodeDial$"},
+			{Pkg: "./internal/resolver", Test: "^TestD19SwitchBumpsGeneration$"},
+			{Pkg: "./internal/resolver", Test: "^TestD20BypassEdgesFlushTwice$"},
+			{Pkg: "./internal/l2", Test: "^TestT14SwitchResolvesToNewIP$"},
 		},
 	}
 
-	// IPv6Block — блокировка IPv6 §6.9 (этап 8). Выключение выпускает
-	// IPv6-трафик мимо туннеля: частично поднятый IPv6 хуже отсутствующего,
-	// потому что утечка молчаливая — пользователь узнаёт о ней постфактум: T28.
-	IPv6Block = &Policy{
-		Name: "ipv6_block",
-		Doc:  "IPv6 заблокирован, а не выпущен мимо туннеля (§6.9, T28)",
+	// DNSFailClose — нет живых узлов, нет резолва (§5.7б, Р15). Выключение
+	// заставляет резолвер отвечать и без живых узлов: приложение получает
+	// адреса и виснет на connect, то есть молчание §5.6 сдвигается на шаг
+	// дальше вместо того, чтобы стать отказом.
+	DNSFailClose = &Policy{
+		Name: "dns_failclose",
+		Doc:  "SERVFAIL без живых узлов, и кэш при этом не отдаётся (Р15, D9–D11, D17)",
 		Guards: []Guard{
-			{Pkg: "./internal/loopguard", Test: "^TestT28IPv6IsBlocked$"},
+			{Pkg: "./internal/resolver", Test: "^TestD9FailingPhaseAnswersServfail$"},
+			{Pkg: "./internal/resolver", Test: "^TestD10FailClosePreventsCacheHit$"},
 		},
 	}
 
-	// EventBroadcast — рассылка событий всем подписчикам §3.3 (этап 9).
-	// Выключение оставляет одного получателя, и второй клиент — трей рядом с
-	// CLI — не узнаёт о переключении вовсе: TestTwoClientsBothGetEvent.
-	EventBroadcast = &Policy{
-		Name: "event_broadcast",
-		Doc:  "события уходят всем подписчикам, а не одному (§3.3)",
+	// DNSWaitingHold — в стартовом окне §5.6 запрос ждёт живого узла, но не
+	// дольше 4 с (Р16). Выключение отвечает SERVFAIL сразу, и приложение,
+	// стартовавшее вместе с агентом, получает отказ там, где через секунду всё
+	// работало.
+	DNSWaitingHold = &Policy{
+		Name: "dns_waiting_hold",
+		Doc:  "удержание запроса в фазе waiting до 4 с (Р16, D12, D13)",
 		Guards: []Guard{
-			{Pkg: "./internal/events", Test: "^TestTwoClientsBothGetEvent$"},
+			{Pkg: "./internal/resolver", Test: "^TestD12WaitingHoldsUntilNodeAppears$"},
+			{Pkg: "./internal/resolver", Test: "^TestD13WaitingGivesUpAtFourSeconds$"},
+		},
+	}
+
+	// DNSAAAANodata — при заблокированном IPv6 (§6.9) на AAAA синтезируется
+	// пустой NOERROR (Р19). Выключение отправляет AAAA наверх и отдаёт адреса,
+	// которые §6.9 дропает молча, — приложение платит за это таймаутом Happy
+	// Eyeballs на каждом соединении.
+	DNSAAAANodata = &Policy{
+		Name: "dns_aaaa_nodata",
+		Doc:  "AAAA отвечается пустым NOERROR, наверх не идёт (Р19, D45, D46)",
+		Guards: []Guard{
+			{Pkg: "./internal/resolver", Test: "^TestD45AAAAIsSynthesizedNodata$"},
+			{Pkg: "./internal/resolver", Test: "^TestD46AAAANodataKeepsAWorking$"},
+		},
+	}
+
+	// DNSNegativeCache — NXDOMAIN и NODATA кэшируются (Р18). Выключение
+	// отправляет через узел каждый запрос приложения, ищущего несуществующее
+	// имя в цикле, — самый дешёвый способ превратить резолвер в источник
+	// трафика.
+	DNSNegativeCache = &Policy{
+		Name: "dns_negative_cache",
+		Doc:  "отрицательные ответы кэшируются по SOA (Р18, D26–D28)",
+		Guards: []Guard{
+			{Pkg: "./internal/resolver", Test: "^TestD26NXDomainCachedBySOAMinimum$"},
+			{Pkg: "./internal/resolver", Test: "^TestD28NodataCachedLikeNXDomain$"},
+		},
+	}
+
+	// DNSSingleFlight — одинаковые вопросы в полёте склеиваются (Р24).
+	// Выключение отправляет наверх каждый клиентский запрос своим: один старт
+	// браузера даёт десятки одинаковых вопросов и столько же ассоциаций UDP
+	// через узел — ровно та деградация, которую меряет B3.
+	DNSSingleFlight = &Policy{
+		Name: "dns_single_flight",
+		Doc:  "одинаковые вопросы в полёте склеиваются (Р24, D38)",
+		Guards: []Guard{
+			{Pkg: "./internal/resolver", Test: "^TestD38IdenticalQuestionsCoalesce$"},
+		},
+	}
+
+	// DNSSwitchRetry — запрос, застигнутый переключением узла, повторяется
+	// ровно один раз через нового активного (Р20). Выключение отдаёт SERVFAIL:
+	// каждое переключение стоит отказа тем запросам, которые как раз летели.
+	DNSSwitchRetry = &Policy{
+		Name: "dns_switch_retry",
+		Doc:  "один повтор запроса, застигнутого переключением (Р20, D16)",
+		Guards: []Guard{
+			{Pkg: "./internal/resolver", Test: "^TestD16SwitchMidResolveRetriesOnce$"},
 		},
 	}
 )
@@ -242,19 +474,34 @@ func All() []*Policy {
 		VerdictOrder,
 		RejectMode,
 		NATKey,
-		ErrorClassify,
 		KOfN,
 		Tolerance,
-		MultiURL,
-		ForcedProbe,
 		SwitchReason,
-		ConfirmProbe,
-		DNSCacheFlushOnSwitch,
-		Bootstrap,
+		ForcedProbe,
+		MultiURL,
+		ProbeTiers,
+		TrafficKills,
+		ErrorClassify,
+		ParseCascade,
 		MergeKey,
-		LoopGuard,
-		IPv6Block,
-		EventBroadcast,
+		MergeKeyUserID,
+		AtomicWrite,
+		StoreLock,
+		HealthSlice,
+		XrayDrain,
+		SwitchOrder,
+		PhaseSplit,
+		BypassTeardown,
+		Bootstrap,
+		DNSUpstream,
+		DNSTCPRetry,
+		DNSCacheFlushOnSwitch,
+		DNSFailClose,
+		DNSWaitingHold,
+		DNSAAAANodata,
+		DNSNegativeCache,
+		DNSSingleFlight,
+		DNSSwitchRetry,
 	}
 }
 

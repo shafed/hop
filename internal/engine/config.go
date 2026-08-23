@@ -1,357 +1,245 @@
-// Package engine — движок Xray-core за интерфейсом netstack.Dialer (§5.1).
-//
-// Один экземпляр Xray на всю жизнь агента, **один outbound на узел** и
-// маршрутные правила по inboundTag. Так проба идёт ровно тем же путём, что и
-// трафик (§6.7), и переключение узла не пересобирает движок: меняется тег, а не
-// конфиг.
-//
-// Классификация ошибок §6.15 живёт в classify.go и нигде больше — за этим
-// следит cmd/reportlint (D10).
 package engine
 
 import (
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 
-	"github.com/shafed/hop/internal/node"
+	"github.com/xtls/xray-core/core"
 )
 
-// tagOf — тег outbound и одноимённого маршрутного правила для узла.
-func tagOf(nodeID string) string { return "n-" + nodeID }
-
-// DirectTag — outbound «мимо узла». Нужен bootstrap-резолверу (§5.7) и
-// пробам, которым надо отличить «узел мёртв» от «сети нет вовсе».
-const DirectTag = "direct"
-
-// xrayConfig — ровно те поля конфига Xray, которые мы заполняем. Собирать
-// protobuf руками не нужно: JSON-путь Xray стабилен и разбирается его же
-// кодом, то есть расхождение конфигурации с движком невозможно по построению.
-type xrayConfig struct {
-	Log       map[string]any `json:"log"`
-	Outbounds []outbound     `json:"outbounds"`
-	Routing   routing        `json:"routing"`
+// Node — то, что движку нужно, чтобы построить outbound. Подмножество §2:
+// поля, которые не влияют на соединение (name, group_id, raw_link), сюда не
+// едут — движок не знает про подписки (§3.4).
+type Node struct {
+	ID        string
+	Protocol  string // vless | vmess | trojan | shadowsocks
+	Server    string
+	Port      int
+	Transport string // raw/tcp | ws | grpc | httpupgrade | xhttp | mkcp
+	Security  string // none | tls | reality
+	Params    map[string]string
 }
 
-type outbound struct {
-	Tag            string          `json:"tag"`
-	Protocol       string          `json:"protocol"`
-	Settings       json.RawMessage `json:"settings,omitempty"`
-	StreamSettings *stream         `json:"streamSettings,omitempty"`
-}
+// Param — значение параметра узла или пусто.
+func (n Node) Param(k string) string { return n.Params[k] }
 
-type routing struct {
-	DomainStrategy string `json:"domainStrategy"`
-	Rules          []rule `json:"rules"`
-}
-
-type rule struct {
-	Type        string   `json:"type"`
-	InboundTag  []string `json:"inboundTag"`
-	OutboundTag string   `json:"outboundTag"`
-}
-
-type stream struct {
-	Network  string `json:"network"`
-	Security string `json:"security,omitempty"`
-
-	TLSSettings     *tlsSettings     `json:"tlsSettings,omitempty"`
-	RealitySettings *realitySettings `json:"realitySettings,omitempty"`
-
-	RawSettings         *rawSettings  `json:"rawSettings,omitempty"`
-	WSSettings          *wsSettings   `json:"wsSettings,omitempty"`
-	GRPCSettings        *grpcSettings `json:"grpcSettings,omitempty"`
-	HTTPUpgradeSettings *wsSettings   `json:"httpupgradeSettings,omitempty"`
-	XHTTPSettings       *xhttpSetting `json:"xhttpSettings,omitempty"`
-	KCPSettings         *kcpSettings  `json:"kcpSettings,omitempty"`
-
-	Sockopt *sockopt `json:"sockopt,omitempty"`
-}
-
-type tlsSettings struct {
-	ServerName    string   `json:"serverName,omitempty"`
-	ALPN          []string `json:"alpn,omitempty"`
-	Fingerprint   string   `json:"fingerprint,omitempty"`
-	AllowInsecure bool     `json:"allowInsecure,omitempty"`
-}
-
-type realitySettings struct {
-	ServerName  string `json:"serverName,omitempty"`
-	Fingerprint string `json:"fingerprint,omitempty"`
-	PublicKey   string `json:"publicKey,omitempty"`
-	ShortID     string `json:"shortId,omitempty"`
-	SpiderX     string `json:"spiderX,omitempty"`
-}
-
-type rawSettings struct {
-	Header json.RawMessage `json:"header,omitempty"`
-}
-
-type wsSettings struct {
-	Path string            `json:"path,omitempty"`
-	Host string            `json:"host,omitempty"`
-	Hdr  map[string]string `json:"headers,omitempty"`
-}
-
-type grpcSettings struct {
-	ServiceName string `json:"serviceName,omitempty"`
-	MultiMode   bool   `json:"multiMode,omitempty"`
-}
-
-type xhttpSetting struct {
-	Path string `json:"path,omitempty"`
-	Host string `json:"host,omitempty"`
-	Mode string `json:"mode,omitempty"`
-}
-
-type kcpSettings struct {
-	Seed   string          `json:"seed,omitempty"`
-	Header json.RawMessage `json:"header,omitempty"`
-}
-
-// sockopt — защита от петли на macOS и Windows (§6.8). На Linux петлю режет
-// `ip rule` с UID-диапазоном, и здесь ничего не нужно.
-type sockopt struct {
-	Interface string `json:"interface,omitempty"`
-}
-
-// Options — то, от чего зависит сборка конфига.
-type Options struct {
-	// BindInterface — имя дефолтного интерфейса для sockopt.interface (§6.8).
-	// Пусто на Linux.
-	BindInterface string
-	// LogLevel — уровень логов Xray. Пусто = "none": секреты не должны
-	// попадать в логи даже на debug (§6.14).
-	LogLevel string
-}
-
-// buildConfig собирает конфиг Xray из списка узлов. Неподдерживаемые узлы
-// (§6.11) в конфиг не попадают: они не участвуют в выборе, и outbound для них
-// был бы мёртвым весом.
-func buildConfig(nodes []node.Node, opts Options) ([]byte, error) {
-	level := opts.LogLevel
-	if level == "" {
-		level = "none"
-	}
-
-	cfg := xrayConfig{
-		Log:     map[string]any{"loglevel": level},
-		Routing: routing{DomainStrategy: "AsIs"},
-	}
-
+// BuildConfig собирает конфиг Xray на набор узлов: по outbound на узел, тег
+// `node-<id>`. Инбаундов нет вовсе — трафик приходит из netstack через
+// core.Dial, а не через слушающий сокет (§5.3: граница пакетная, не SOCKS).
+func BuildConfig(nodes []Node) (*core.Config, error) {
+	out := make([]map[string]any, 0, len(nodes))
 	for _, n := range nodes {
-		if !n.Supported {
-			continue
-		}
-		if err := n.Validate(); err != nil {
-			return nil, err
-		}
-		ob, err := outboundOf(n, opts)
+		ob, err := outboundJSON(n)
 		if err != nil {
 			return nil, err
 		}
-		cfg.Outbounds = append(cfg.Outbounds, ob)
-		cfg.Routing.Rules = append(cfg.Routing.Rules, rule{
-			Type:        "field",
-			InboundTag:  []string{tagOf(n.ID)},
-			OutboundTag: tagOf(n.ID),
-		})
+		out = append(out, ob)
 	}
 
-	// direct идёт последним и не имеет правила: попасть в него можно только
-	// по явному тегу. Дефолтом маршрутизации он не станет — иначе промах по
-	// правилу молча выпускал бы трафик мимо туннеля, ровно то fail-open,
-	// которое запрещает §5.6.
-	cfg.Outbounds = append(cfg.Outbounds, outbound{
-		Tag:            DirectTag,
-		Protocol:       "freedom",
-		StreamSettings: sockoptOnly(opts),
-	})
-	cfg.Routing.Rules = append(cfg.Routing.Rules, rule{
-		Type:        "field",
-		InboundTag:  []string{DirectTag},
-		OutboundTag: DirectTag,
-	})
-
-	// Промах по всем правилам обязан упереться в blackhole, а не в первый
-	// outbound: первый outbound — это какой-то узел, и промах отправил бы
-	// туда чужой трафик.
-	cfg.Outbounds = append(cfg.Outbounds, outbound{Tag: "block", Protocol: "blackhole"})
-
-	return json.Marshal(cfg)
+	cfg := map[string]any{
+		// Логи Xray выключены: они содержат адреса узлов и запросов, а §6.14
+		// запрещает такое даже на уровне debug.
+		"log":       map[string]any{"loglevel": "none"},
+		"outbounds": out,
+	}
+	b, err := jsonConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return loadConfig(b)
 }
 
-func sockoptOnly(opts Options) *stream {
-	if opts.BindInterface == "" {
-		return nil
+// outboundJSON — один узел в виде outbound'а Xray.
+func outboundJSON(n Node) (map[string]any, error) {
+	if n.ID == "" {
+		return nil, fmt.Errorf("engine: узел без id")
 	}
-	return &stream{Network: "raw", Sockopt: &sockopt{Interface: opts.BindInterface}}
-}
+	if n.Server == "" || n.Port <= 0 || n.Port > 65535 {
+		return nil, fmt.Errorf("engine: узел %q с негодным адресом %s:%d", n.ID, n.Server, n.Port)
+	}
 
-func outboundOf(n node.Node, opts Options) (outbound, error) {
-	settings, err := protoSettings(n)
+	settings, err := protocolSettings(n)
 	if err != nil {
-		return outbound{}, err
+		return nil, err
 	}
-	st, err := streamOf(n, opts)
+	stream, err := streamSettings(n)
 	if err != nil {
-		return outbound{}, err
+		return nil, err
 	}
-	return outbound{
-		Tag:            tagOf(n.ID),
-		Protocol:       string(n.Protocol),
-		Settings:       settings,
-		StreamSettings: st,
+
+	return map[string]any{
+		"tag":            OutboundTag(n.ID),
+		"protocol":       n.Protocol,
+		"settings":       settings,
+		"streamSettings": stream,
 	}, nil
 }
 
-func protoSettings(n node.Node) (json.RawMessage, error) {
-	port := int(n.Port)
+// protocolSettings — часть конфига, специфичная для протокола.
+//
+// Неподдерживаемые протоколы (§6.11) сюда не доходят: узел с
+// `supported: false` не попадает ни в выбор, ни в конфиг. Ошибка здесь — это
+// ошибка того, кто выставил `supported`, и она обязана быть громкой.
+func protocolSettings(n Node) (map[string]any, error) {
 	switch n.Protocol {
-	case node.VLESS:
-		user := map[string]any{"id": n.UserID, "encryption": "none"}
-		if f := n.Param("flow"); f != "" {
-			user["flow"] = f
+	case "vless":
+		user := map[string]any{
+			"id": n.Param("uuid"),
+			// encryption у VLESS всегда none: шифрует транспорт, не протокол.
+			"encryption": "none",
 		}
-		return json.Marshal(map[string]any{
-			"vnext": []any{map[string]any{
-				"address": n.Server, "port": port, "users": []any{user},
-			}},
-		})
-	case node.VMess:
-		user := map[string]any{"id": n.UserID, "security": "auto"}
-		if s := n.Param("scy"); s != "" {
-			user["security"] = s
+		if flow := n.Param("flow"); flow != "" {
+			user["flow"] = flow
 		}
-		if a := n.Param("aid"); a != "" {
-			aid, err := strconv.Atoi(a)
+		return map[string]any{"vnext": []map[string]any{{
+			"address": n.Server,
+			"port":    n.Port,
+			"users":   []map[string]any{user},
+		}}}, nil
+
+	case "vmess":
+		user := map[string]any{"id": n.Param("uuid")}
+		if aid := n.Param("alterId"); aid != "" {
+			v, err := strconv.Atoi(aid)
 			if err != nil {
-				return nil, fmt.Errorf("node %s: alterId %q: %w", n.ID, a, err)
+				return nil, fmt.Errorf("engine: узел %q, негодный alterId %q", n.ID, aid)
 			}
-			user["alterId"] = aid
+			user["alterId"] = v
 		}
-		return json.Marshal(map[string]any{
-			"vnext": []any{map[string]any{
-				"address": n.Server, "port": port, "users": []any{user},
-			}},
-		})
-	case node.Trojan:
-		return json.Marshal(map[string]any{
-			"servers": []any{map[string]any{
-				"address": n.Server, "port": port, "password": n.UserID,
-			}},
-		})
-	case node.Shadowsocks:
-		return json.Marshal(map[string]any{
-			"servers": []any{map[string]any{
-				"address": n.Server, "port": port,
-				"method": n.Param("method"), "password": n.UserID,
-			}},
-		})
+		if sec := n.Param("security"); sec != "" {
+			user["security"] = sec
+		}
+		return map[string]any{"vnext": []map[string]any{{
+			"address": n.Server,
+			"port":    n.Port,
+			"users":   []map[string]any{user},
+		}}}, nil
+
+	case "trojan":
+		return map[string]any{"servers": []map[string]any{{
+			"address":  n.Server,
+			"port":     n.Port,
+			"password": n.Param("password"),
+		}}}, nil
+
+	case "shadowsocks":
+		return map[string]any{"servers": []map[string]any{{
+			"address":  n.Server,
+			"port":     n.Port,
+			"method":   n.Param("method"),
+			"password": n.Param("password"),
+		}}}, nil
+
+	default:
+		return nil, fmt.Errorf("engine: узел %q, протокол %q не собирается этой сборкой (§6.11)", n.ID, n.Protocol)
 	}
-	return nil, fmt.Errorf("node %s: протокол %q не поддержан сборкой", n.ID, n.Protocol)
 }
 
-func streamOf(n node.Node, opts Options) (*stream, error) {
-	st := &stream{Network: string(n.Transport)}
-	if st.Network == "" {
-		st.Network = string(node.Raw)
+// streamSettings — транспорт и безопасность.
+//
+// Имена транспортов нормализуются здесь, а не у вызывающего: в ссылках ходит
+// и `tcp`, и `raw` (§6.12), а Xray знает `raw`; `xhttp` у Xray называется
+// `splithttp`. Одно место перевода — одно место, где это чинить.
+func streamSettings(n Node) (map[string]any, error) {
+	network := n.Transport
+	switch network {
+	case "", "tcp", "raw":
+		network = "raw"
+	case "ws", "websocket":
+		network = "ws"
+	case "grpc", "httpupgrade", "kcp", "mkcp":
+		if network == "mkcp" {
+			network = "kcp"
+		}
+	case "xhttp", "splithttp":
+		network = "splithttp"
+	default:
+		return nil, fmt.Errorf("engine: узел %q, транспорт %q не собирается этой сборкой (§6.11)", n.ID, n.Transport)
 	}
 
-	switch n.Transport {
-	case node.Raw, "":
-		if n.Param("headerType") == "http" {
-			hdr, err := httpHeader(n)
-			if err != nil {
-				return nil, err
-			}
-			st.RawSettings = &rawSettings{Header: hdr}
-		}
-	case node.WS:
-		st.WSSettings = &wsSettings{Path: n.Param("path"), Host: n.Param("host")}
-	case node.HTTPUpgrade:
-		st.HTTPUpgradeSettings = &wsSettings{Path: n.Param("path"), Host: n.Param("host")}
-	case node.GRPC:
-		st.GRPCSettings = &grpcSettings{
-			ServiceName: n.Param("serviceName"),
-			MultiMode:   n.Param("mode") == "multi",
-		}
-	case node.XHTTP:
-		st.XHTTPSettings = &xhttpSetting{
-			Path: n.Param("path"), Host: n.Param("host"), Mode: n.Param("mode"),
-		}
-	case node.MKCP:
-		hdr, err := json.Marshal(map[string]any{"type": headerTypeOr(n, "none")})
-		if err != nil {
-			return nil, err
-		}
-		st.KCPSettings = &kcpSettings{Seed: n.Param("seed"), Header: hdr}
-	default:
-		return nil, fmt.Errorf("node %s: транспорт %q не поддержан сборкой", n.ID, n.Transport)
-	}
+	stream := map[string]any{"network": network}
 
 	switch n.Security {
-	case node.SecTLS:
-		st.Security = "tls"
-		st.TLSSettings = &tlsSettings{
-			ServerName:    sni(n),
-			ALPN:          splitALPN(n.Param("alpn")),
-			Fingerprint:   n.Param("fp"),
-			AllowInsecure: n.Param("allowInsecure") == "1",
+	case "", "none":
+		stream["security"] = "none"
+	case "tls":
+		stream["security"] = "tls"
+		stream["tlsSettings"] = tlsSettings(n)
+	case "reality":
+		stream["security"] = "reality"
+		rs := map[string]any{
+			"serverName": n.Param("sni"),
+			"publicKey":  n.Param("pbk"),
+			"shortId":    n.Param("sid"),
+			"spiderX":    n.Param("spx"),
 		}
-	case node.SecReality:
-		st.Security = "reality"
-		st.RealitySettings = &realitySettings{
-			ServerName:  sni(n),
-			Fingerprint: n.Param("fp"),
-			PublicKey:   n.Param("pbk"),
-			ShortID:     n.Param("sid"),
-			SpiderX:     n.Param("spx"),
+		if fp := n.Param("fp"); fp != "" {
+			rs["fingerprint"] = fp
 		}
-	case node.SecNone, "":
+		// pqv — постквантовая проверка REALITY. Параметр молодой: узлы без
+		// него обязаны работать, узлы с ним — не терять его по дороге.
+		if pqv := n.Param("pqv"); pqv != "" {
+			rs["mldsa65Verify"] = pqv
+		}
+		stream["realitySettings"] = rs
 	default:
-		return nil, fmt.Errorf("node %s: security %q не поддержан сборкой", n.ID, n.Security)
+		return nil, fmt.Errorf("engine: узел %q, security %q не собирается этой сборкой", n.ID, n.Security)
 	}
 
-	if opts.BindInterface != "" {
-		st.Sockopt = &sockopt{Interface: opts.BindInterface}
+	switch network {
+	case "ws":
+		ws := map[string]any{"path": pathOr(n, "/")}
+		if host := n.Param("host"); host != "" {
+			ws["host"] = host
+		}
+		stream["wsSettings"] = ws
+	case "grpc":
+		stream["grpcSettings"] = map[string]any{"serviceName": n.Param("serviceName")}
+	case "httpupgrade":
+		hu := map[string]any{"path": pathOr(n, "/")}
+		if host := n.Param("host"); host != "" {
+			hu["host"] = host
+		}
+		stream["httpupgradeSettings"] = hu
+	case "splithttp":
+		sh := map[string]any{"path": pathOr(n, "/")}
+		if host := n.Param("host"); host != "" {
+			sh["host"] = host
+		}
+		stream["splithttpSettings"] = sh
 	}
-	return st, nil
+
+	return stream, nil
 }
 
-func httpHeader(n node.Node) (json.RawMessage, error) {
-	req := map[string]any{}
-	if h := n.Param("host"); h != "" {
-		req["headers"] = map[string]any{"Host": strings.Split(h, ",")}
+func tlsSettings(n Node) map[string]any {
+	ts := map[string]any{}
+	// §6.12: если сервер задан как IP, sni пуст, а host есть — sni берётся из
+	// host. Здесь это не нормализация ссылки, а последний рубеж: без sni
+	// рукопожатие уедет на IP и упрётся в чужой сертификат.
+	sni := n.Param("sni")
+	if sni == "" {
+		sni = n.Param("host")
 	}
+	if sni != "" {
+		ts["serverName"] = sni
+	}
+	if fp := n.Param("fp"); fp != "" {
+		ts["fingerprint"] = fp
+	}
+	if alpn := n.Param("alpn"); alpn != "" {
+		ts["alpn"] = strings.Split(alpn, ",")
+	}
+	if n.Param("allowInsecure") == "true" {
+		ts["allowInsecure"] = true
+	}
+	return ts
+}
+
+func pathOr(n Node, def string) string {
 	if p := n.Param("path"); p != "" {
-		req["path"] = strings.Split(p, ",")
-	}
-	return json.Marshal(map[string]any{"type": "http", "request": req})
-}
-
-func headerTypeOr(n node.Node, def string) string {
-	if h := n.Param("headerType"); h != "" {
-		return h
+		return p
 	}
 	return def
-}
-
-// sni — §6.12: сервер задан IP, sni пуст, host есть → sni = host.
-func sni(n node.Node) string {
-	if s := n.Param("sni"); s != "" {
-		return s
-	}
-	if n.IsIP() {
-		return n.Param("host")
-	}
-	return n.Server
-}
-
-func splitALPN(v string) []string {
-	if v == "" {
-		return nil
-	}
-	return strings.Split(v, ",")
 }

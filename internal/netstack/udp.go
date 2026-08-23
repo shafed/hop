@@ -176,21 +176,6 @@ func (t *natTable) sweepLocked(now time.Time) {
 	}
 }
 
-// reset закрывает исходящие сокеты и забывает записи (§5.5). Возвращает число
-// закрытых сокетов: их по одному на исходный порт клиента, то есть это и есть
-// число разорванных потоков UDP.
-func (t *natTable) reset() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	n := len(t.socks)
-	for src, sock := range t.socks {
-		delete(t.socks, src)
-		_ = sock.conn.Close()
-	}
-	clear(t.ents)
-	return n
-}
-
 func (t *natTable) close() {
 	t.mu.Lock()
 	defer t.mu.Unlock()

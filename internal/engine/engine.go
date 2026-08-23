@@ -1,349 +1,248 @@
+// Package engine — движок Xray-core: генерация конфига, один outbound на узел,
+// исходящие соединения через выбранный узел (§5.1, §3.4).
+//
+// Пакет не знает ни про подписки, ни про TUN (§3.4). Наружу он даёт ровно две
+// вещи: соединение через конкретный узел и классификацию отказа по §6.15.
+//
+// **Один инстанс, а не инстанс на узел.** Все узлы живут в одном
+// `core.Instance` как outbound'ы с тегами `node-<id>`, а выбор узла делается
+// на каждом вызове через forced outbound tag
+// (`app/dispatcher/default.go:459`). Инстанс на узел был бы проще, но
+// подписка в 200 узлов означала бы 200 диспетчеров, 200 менеджеров политик и
+// столько же наборов горутин — при том что health опрашивает их все (§6.5).
+//
+// **Следствие для §6.7.** Проба и трафик идут одним и тем же вызовом с одним и
+// тем же тегом. «Тот же путь» здесь не соглашение, а единственный доступный
+// способ: другого пути наружу у пакета нет.
 package engine
 
 import (
-	"bytes"
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"net"
-	"net/netip"
+	"strings"
 	"sync"
-	"time" //hop:realtime
 
+	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/infra/conf/serial"
 
-	xnet "github.com/xtls/xray-core/common/net"
+	// Регистрация обработчиков: Xray собирает их через init(). Список
+	// намеренно уже, чем main/distro/all — в него не входят commander,
+	// observatory, metrics, stats и reverse: мы ими не пользуемся, а каждый
+	// тянет свой набор зависимостей в бинарь пользователя.
+	_ "github.com/xtls/xray-core/app/dispatcher"
+	_ "github.com/xtls/xray-core/app/log"
+	_ "github.com/xtls/xray-core/app/policy"
+	_ "github.com/xtls/xray-core/app/proxyman/inbound"
+	_ "github.com/xtls/xray-core/app/proxyman/outbound"
 
-	"github.com/shafed/hop/internal/clock"
-	"github.com/shafed/hop/internal/health"
-	"github.com/shafed/hop/internal/netstack"
-	"github.com/shafed/hop/internal/node"
+	// Разрывает цикл импорта core в transport/internet — так же, как в distro/all.
+	_ "github.com/xtls/xray-core/transport/internet/tagged/taggedimpl"
+
+	// Протоколы. freedom нужен не пользователю, а тестовой стороне сервера
+	// (§8.1: настоящие инбаунды в том же процессе).
+	_ "github.com/xtls/xray-core/proxy/freedom"
+	_ "github.com/xtls/xray-core/proxy/shadowsocks"
+	_ "github.com/xtls/xray-core/proxy/trojan"
+	_ "github.com/xtls/xray-core/proxy/vless/inbound"
+	_ "github.com/xtls/xray-core/proxy/vless/outbound"
+	_ "github.com/xtls/xray-core/proxy/vmess/inbound"
+	_ "github.com/xtls/xray-core/proxy/vmess/outbound"
+
+	// Транспорты §2. xhttp в Xray называется splithttp.
+	_ "github.com/xtls/xray-core/transport/internet/grpc"
+	_ "github.com/xtls/xray-core/transport/internet/httpupgrade"
+	_ "github.com/xtls/xray-core/transport/internet/kcp"
+	_ "github.com/xtls/xray-core/transport/internet/reality"
+	_ "github.com/xtls/xray-core/transport/internet/splithttp"
+	_ "github.com/xtls/xray-core/transport/internet/tcp"
+	_ "github.com/xtls/xray-core/transport/internet/tls"
+	_ "github.com/xtls/xray-core/transport/internet/udp"
+	_ "github.com/xtls/xray-core/transport/internet/websocket"
 )
 
-// Engine — движок поверх одного экземпляра Xray.
-//
-// Активный узел — это тег, а не конфиг: SetActive меняет строку, по которой
-// исходящее выбирает inboundTag, и больше ничего. Пересборка экземпляра на
-// каждом переключении рвала бы все соединения разом — ровно то, что §5.5
-// запрещает делать при переключении по причине faster.
+// Engine — запущенный Xray с набором узлов.
 type Engine struct {
-	opts Options
-	rep  health.Reporter
-	clk  clock.Clock
-
-	// cfg — конфиг, собранный buildConfig ещё в New. Узел с битым транспортом
-	// обязан уронить New, а не первое соединение через час работы.
-	cfg  []byte
-	inst *core.Instance
-
-	mu     sync.RWMutex
-	nodes  map[string]node.Node
-	active string
+	mu    sync.RWMutex
+	inst  *core.Instance
+	nodes map[string]bool // id узлов, у которых есть outbound
+	hooks map[string]*nodeDialConfig
 }
 
-// Проверка контракта §3.4: исходящее netstack — это Engine. Цикла импортов
-// нет, netstack про engine не знает и знать не должен.
-var _ netstack.Dialer = (*Engine)(nil)
+// Config — как поднять движок.
+type Config struct {
+	Nodes []Node
+	// Physical возвращает текущий физический default-интерфейс для каждого
+	// нового сокета к узлу (§6.8). При непустом Nodes обязателен: непривязанный
+	// fallback может вернуться в туннель.
+	Physical InterfaceFunc
+	// OnFailure получает вердикт §6.15 по отказу соединения с узлом. Именно
+	// отсюда агент зовёт health.ReportFailure — и больше ниоткуда
+	// (TestReportFailureHasOneCallSite).
+	OnFailure func(*DialError)
+}
 
-// errNotStarted — движок ещё не поднят. Отдельная ошибка, а не молчаливый
-// проход напрямую: молчаливый обход туннеля есть fail-open (§5.6).
-var errNotStarted = errors.New("engine: движок не запущен")
+// InterfaceFunc определяет физический интерфейс для нового сокета.
+type InterfaceFunc func() (string, error)
 
-// errNoActive — активный узел не назначен. Тоже отказ, а не direct.
-var errNoActive = errors.New("engine: активный узел не выбран")
+// New поднимает движок с этими узлами и источником физического интерфейса.
+// Пустой набор допустим: движок без узлов умеет только отказывать, и это
+// законное состояние (§5.6).
+func New(nodes []Node, physical InterfaceFunc) (*Engine, error) {
+	return NewWithConfig(Config{Nodes: nodes, Physical: physical})
+}
 
-// New собирает движок: конфиг Xray на все поддержанные узлы плюс direct.
-// Экземпляр ещё не запущен — это делает Start.
-func New(nodes []node.Node, opts Options, rep health.Reporter, clk clock.Clock) (*Engine, error) {
-	cfg, err := buildConfig(nodes, opts)
+// NewWithConfig — то же с колбэком отказов.
+func NewWithConfig(c Config) (*Engine, error) {
+	nodes := c.Nodes
+	if len(nodes) > 0 && c.Physical == nil {
+		return nil, fmt.Errorf("engine: для узлов нужен физический интерфейс (§6.8)")
+	}
+	installDialer()
+
+	cfg, err := BuildConfig(nodes)
 	if err != nil {
 		return nil, err
 	}
-	known := make(map[string]node.Node, len(nodes))
-	for _, n := range nodes {
-		// Неподдержанный узел (§6.11) в конфиг не попал, значит и outbound-а
-		// у него нет: пустить в него трафик было бы промахом по правилу.
-		if n.Supported {
-			known[n.ID] = n
-		}
-	}
-	return &Engine{opts: opts, rep: rep, clk: clk, cfg: cfg, nodes: known}, nil
-}
-
-// Start поднимает экземпляр Xray. До Start любой Dial обязан вернуть ошибку, а
-// не молча пойти напрямую: молчаливый обход туннеля — это fail-open (§5.6).
-func (e *Engine) Start() error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.inst != nil {
-		return errors.New("engine: уже запущен")
-	}
-	// JSON разбирается тем же кодом Xray, который его понимает в проде
-	// (infra/conf), поэтому расхождение нашего конфига с движком невозможно
-	// по построению. main/json взят бы вместе с загрузкой конфига по http(s).
-	pb, err := serial.LoadJSONConfig(bytes.NewReader(e.cfg))
+	inst, err := core.New(cfg)
 	if err != nil {
-		return fmt.Errorf("engine: разбор конфига: %w", err)
-	}
-	inst, err := core.New(pb)
-	if err != nil {
-		return fmt.Errorf("engine: сборка экземпляра: %w", err)
+		return nil, fmt.Errorf("engine: не собрался инстанс Xray: %w", err)
 	}
 	if err := inst.Start(); err != nil {
-		inst.Close()
-		return fmt.Errorf("engine: старт экземпляра: %w", err)
+		return nil, fmt.Errorf("engine: инстанс Xray не запустился: %w", err)
 	}
-	e.inst = inst
-	return nil
+	e := &Engine{
+		inst: inst, nodes: make(map[string]bool, len(nodes)),
+		hooks: make(map[string]*nodeDialConfig, len(nodes)),
+	}
+	for _, n := range nodes {
+		e.nodes[n.ID] = true
+		e.hooks[n.ID] = watchNode(n.ID, c.OnFailure, c.Physical)
+	}
+	return e, nil
 }
 
-// Close снимает экземпляр. Установленные соединения при этом умирают — Close
-// зовётся только на выходе агента, переключение узла его не трогает.
+// Close останавливает движок.
 func (e *Engine) Close() error {
 	e.mu.Lock()
-	inst := e.inst
-	e.inst = nil
-	e.mu.Unlock()
-	if inst == nil {
+	defer e.mu.Unlock()
+	if e.inst == nil {
 		return nil
 	}
-	return inst.Close()
+	for id := range e.nodes {
+		unwatchNode(id, e.hooks[id])
+	}
+	err := e.inst.Close()
+	e.inst = nil
+	return err
 }
 
-// SetActive назначает узел, через который пойдёт новый трафик. Уже открытые
-// соединения продолжают жить в своём outbound: рвать их или нет, решает §5.5 по
-// причине переключения, а не движок.
-func (e *Engine) SetActive(nodeID string) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.active = nodeID
+// DialTCP открывает TCP-соединение к addr через узел nodeID.
+//
+// Ошибка уже классифицирована по §6.15: см. DialError. Это единственное место
+// в продукте, где строится смертельная ошибка узла, — иначе классификация
+// расползётся по коду и однажды тихо начнёт считать смертью упавший сайт.
+func (e *Engine) DialTCP(ctx context.Context, nodeID, addr string) (net.Conn, error) {
+	e.mu.RLock()
+	inst, known := e.inst, e.nodes[nodeID]
+	e.mu.RUnlock()
+	if inst == nil {
+		return nil, &DialError{NodeID: nodeID, Kind: KindNone, Err: errClosed}
+	}
+	if !known {
+		return nil, &DialError{NodeID: nodeID, Kind: KindNone, Err: fmt.Errorf("engine: узел %q не собран в конфиг", nodeID)}
+	}
+
+	dest, err := parseDestination(addr)
+	if err != nil {
+		return nil, &DialError{NodeID: nodeID, Kind: KindNone, Err: err}
+	}
+
+	conn, err := core.Dial(withNode(ctx, nodeID), inst, dest)
+	if err != nil {
+		return nil, classifyDial(nodeID, err)
+	}
+	// Соединение отдаётся лениво, отказ узла приезжает на первом вводе-выводе
+	// — см. conn.go.
+	return &classifiedConn{Conn: conn, nodeID: nodeID}, nil
 }
 
-// Active — текущий активный узел, пусто до первого SetActive.
-func (e *Engine) Active() string {
+// DialUDP открывает UDP-сокет через узел nodeID (§5.3: UDP идёт тем же путём).
+func (e *Engine) DialUDP(ctx context.Context, nodeID string) (net.PacketConn, error) {
+	e.mu.RLock()
+	inst, known := e.inst, e.nodes[nodeID]
+	e.mu.RUnlock()
+	if inst == nil {
+		return nil, &DialError{NodeID: nodeID, Kind: KindNone, Err: errClosed}
+	}
+	if !known {
+		return nil, &DialError{NodeID: nodeID, Kind: KindNone, Err: fmt.Errorf("engine: узел %q не собран в конфиг", nodeID)}
+	}
+
+	pc, err := core.DialUDP(withNode(ctx, nodeID), inst)
+	if err != nil {
+		return nil, classifyDial(nodeID, err)
+	}
+	return &classifiedPacketConn{PacketConn: pc, nodeID: nodeID}, nil
+}
+
+// Nodes возвращает id узлов, собранных в конфиг.
+func (e *Engine) Nodes() []string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return e.active
-}
-
-// DialTCP — исходящее TCP через активный узел (netstack.Dialer).
-func (e *Engine) DialTCP(dst netip.AddrPort) (net.Conn, error) {
-	return e.DialVia(context.Background(), e.Active(), dst)
-}
-
-// DialUDP — исходящее UDP через активный узел (netstack.Dialer).
-//
-// Принимает **исходный** адрес клиента, а не назначение: core.DialUDP отдаёт
-// net.PacketConn, один на исходный порт, и из этого получается full-cone (§5.3).
-func (e *Engine) DialUDP(src netip.AddrPort) (net.PacketConn, error) {
-	nodeID := e.Active()
-	if nodeID == "" {
-		return nil, errNoActive
+	out := make([]string, 0, len(e.nodes))
+	for id := range e.nodes {
+		out = append(out, id)
 	}
-	inst, err := e.instance()
+	return out
+}
+
+// withNode заставляет диспетчер взять outbound именно этого узла.
+// Механизм — `session.SetForcedOutboundTagToContext`, тот же, которым Xray
+// обслуживает platform detour (`app/dispatcher/default.go:459`).
+func withNode(ctx context.Context, nodeID string) context.Context {
+	return session.SetForcedOutboundTagToContext(ctx, OutboundTag(nodeID))
+}
+
+// OutboundTag — тег outbound'а узла. Один узел — один тег, и обратно.
+func OutboundTag(nodeID string) string { return "node-" + nodeID }
+
+// parseDestination переводит "host:port" в адресат Xray. Домен остаётся
+// доменом: резолвить его здесь нельзя, иначе роутинг и SNI увидят не то, что
+// просило приложение.
+func parseDestination(addr string) (xnet.Destination, error) {
+	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		return nil, err
+		return xnet.Destination{}, fmt.Errorf("engine: неразборчивый адрес %q: %w", addr, err)
 	}
-	if err := e.known(nodeID); err != nil {
-		return nil, err
-	}
-
-	tr := &tracker{}
-	// Source заполняется намеренно: NAT-запись Xray ключуется исходным
-	// addr:port, и full-cone держится ровно на том, что все датаграммы одного
-	// клиентского порта идут одним PacketConn (§5.3, T15).
-	ctx := session.ContextWithInbound(context.Background(), &session.Inbound{
-		Tag:    tagOf(nodeID),
-		Source: xnet.UDPDestination(xnet.IPAddress(src.Addr().AsSlice()), xnet.Port(src.Port())),
-	})
-	ctx = session.TrackedConnectionError(ctx, tr)
-
-	start := e.clk.Now()
-	pc, err := core.DialUDP(ctx, inst)
+	port, err := xnet.PortFromString(portStr)
 	if err != nil {
-		return nil, e.report(nodeID, tr.fault(err), e.clk.Now().Sub(start))
+		return xnet.Destination{}, fmt.Errorf("engine: неразборчивый порт в %q: %w", addr, err)
 	}
-	return &trackedPacketConn{PacketConn: pc, e: e, nodeID: nodeID, tr: tr, start: start}, nil
+	return xnet.TCPDestination(xnet.ParseAddress(host), port), nil
 }
 
-// DialVia — соединение через конкретный узел, а не через активный.
-//
-// Этим ходят пробы (§6.7): тот же outbound, тот же роутинг, что и у трафика.
-// Проба в обход измеряет не то, что нужно, — узел может быть жив для пробера и
-// мёртв для трафика.
-func (e *Engine) DialVia(ctx context.Context, nodeID string, dst netip.AddrPort) (net.Conn, error) {
-	if nodeID == "" {
-		return nil, errNoActive
-	}
-	if err := e.known(nodeID); err != nil {
-		return nil, err
-	}
-	return e.dial(ctx, nodeID, tagOf(nodeID), dst)
-}
-
-// DialDirect — соединение мимо всех узлов, по тегу direct.
-//
-// Нужен bootstrap-резолверу (§5.7а): хостнеймы самих узлов резолвить через
-// туннель нельзя, иначе на старте петля. Попасть в direct можно только этим
-// вызовом — маршрутного правила, ведущего сюда по умолчанию, нет намеренно.
-func (e *Engine) DialDirect(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-	return e.dial(ctx, "", DirectTag, dst)
-}
-
-// dial — общий путь исходящего TCP. Пустой nodeID означает direct: его отказы
-// не принадлежат ни одному узлу и в health не идут.
-func (e *Engine) dial(ctx context.Context, nodeID, tag string, dst netip.AddrPort) (net.Conn, error) {
-	inst, err := e.instance()
+// jsonConfig — конфиг Xray в том же виде, в каком его читает сам Xray.
+// Генерируем JSON, а не protobuf, ровно по причине §5.1: JSON — это то, что
+// умеет отладить человек, и то, на что есть документация у апстрима.
+func jsonConfig(v any) ([]byte, error) {
+	b, err := json.Marshal(v)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("engine: конфиг не сериализуется: %w", err)
 	}
+	return b, nil
+}
 
-	tr := &tracker{}
-	ctx = session.ContextWithInbound(ctx, &session.Inbound{Tag: tag})
-	ctx = session.TrackedConnectionError(ctx, tr)
-
-	start := e.clk.Now()
-	dest := xnet.TCPDestination(xnet.IPAddress(dst.Addr().AsSlice()), xnet.Port(dst.Port()))
-	c, err := core.Dial(ctx, inst, dest)
-	if nodeID == "" {
-		return c, err
-	}
+// loadConfig собирает *core.Config из JSON.
+func loadConfig(b []byte) (*core.Config, error) {
+	cfg, err := serial.LoadJSONConfig(strings.NewReader(string(b)))
 	if err != nil {
-		return nil, e.report(nodeID, tr.fault(err), e.clk.Now().Sub(start))
+		return nil, fmt.Errorf("engine: Xray не принял конфиг: %w", err)
 	}
-	return &trackedConn{Conn: c, e: e, nodeID: nodeID, tr: tr, start: start}, nil
+	return cfg, nil
 }
 
-func (e *Engine) instance() (*core.Instance, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	if e.inst == nil {
-		return nil, errNotStarted
-	}
-	return e.inst, nil
-}
-
-func (e *Engine) known(nodeID string) error {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	if _, ok := e.nodes[nodeID]; !ok {
-		return fmt.Errorf("engine: узел %q не в конфиге", nodeID)
-	}
-	return nil
-}
-
-// tracker ловит ошибку, которую Xray отдаёт не вызывающему, а в контекст.
-//
-// Так устроен core.Dial: диспетчер уходит в горутину и возвращает трубу
-// немедленно, поэтому отказ узла (не поднялось соединение, не прошло
-// рукопожатие, TLS не сошёлся) приезжает позже и в другом месте. На самой
-// трубе от него остаётся io.ErrClosedPipe — по нему §6.15 не разложить, а
-// значит и классифицировать было бы нечего.
-type tracker struct {
-	mu  sync.Mutex
-	err error
-}
-
-// SubmitError реализует session.TrackedRequestErrorFeedback. Первая ошибка
-// выигрывает: она ближе к причине, дальнейшие — её следствия.
-func (t *tracker) SubmitError(err error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.err == nil {
-		t.err = err
-	}
-}
-
-// fault помечает ошибку как пришедшую с пути к узлу, если Xray такую сообщил.
-// Иначе отдаёт исходную как есть: труба закрылась, но узел тут ни при чём —
-// это сайт, и §6.15 узел за него не убивает.
-func (t *tracker) fault(err error) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.err == nil {
-		return err
-	}
-	return &nodeFault{err: t.err}
-}
-
-// trackedConn — соединение, доносящее исход до классификации.
-//
-// Отчётов ровно два вида и по одному каждого: первый прочитанный байт значит,
-// что узел работает, первая ошибка — что что-то сломалось. Оба нужны и оба
-// раздельны: соединение может сперва отработать, а потом оборваться, и от
-// того, чей это обрыв, зависит судьба узла.
-type trackedConn struct {
-	net.Conn
-	e      *Engine
-	nodeID string
-	tr     *tracker
-	start  time.Time
-
-	okOnce   sync.Once
-	failOnce sync.Once
-}
-
-func (c *trackedConn) Read(b []byte) (int, error) {
-	n, err := c.Conn.Read(b)
-	if n > 0 {
-		c.ok()
-	}
-	if err != nil {
-		c.fail(err)
-	}
-	return n, err
-}
-
-func (c *trackedConn) Write(b []byte) (int, error) {
-	n, err := c.Conn.Write(b)
-	if err != nil {
-		c.fail(err)
-	}
-	return n, err
-}
-
-func (c *trackedConn) ok() {
-	c.okOnce.Do(func() { c.e.report(c.nodeID, nil, c.e.clk.Now().Sub(c.start)) })
-}
-
-func (c *trackedConn) fail(err error) {
-	c.failOnce.Do(func() { c.e.report(c.nodeID, c.tr.fault(err), c.e.clk.Now().Sub(c.start)) })
-}
-
-// trackedPacketConn — то же для UDP. Без него узел, через который ходит только
-// UDP, никогда бы не подал признаков жизни в health.
-type trackedPacketConn struct {
-	net.PacketConn
-	e      *Engine
-	nodeID string
-	tr     *tracker
-	start  time.Time
-
-	okOnce   sync.Once
-	failOnce sync.Once
-}
-
-func (c *trackedPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
-	n, addr, err := c.PacketConn.ReadFrom(b)
-	if n > 0 {
-		c.okOnce.Do(func() { c.e.report(c.nodeID, nil, c.e.clk.Now().Sub(c.start)) })
-	}
-	if err != nil {
-		c.fail(err)
-	}
-	return n, addr, err
-}
-
-func (c *trackedPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
-	n, err := c.PacketConn.WriteTo(b, addr)
-	if err != nil {
-		c.fail(err)
-	}
-	return n, err
-}
-
-func (c *trackedPacketConn) fail(err error) {
-	c.failOnce.Do(func() { c.e.report(c.nodeID, c.tr.fault(err), c.e.clk.Now().Sub(c.start)) })
-}
+var errClosed = fmt.Errorf("engine: движок закрыт")

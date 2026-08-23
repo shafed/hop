@@ -7,17 +7,11 @@ import (
 	"testing"
 )
 
-// TestMain даёт тестовому бинарю ещё два лица: с HOP_L3_PEER он работает
-// эхосервером в своём netns (routecache_test.go), с HOP_L3_NETPEER — стендом
-// «интернета» и локальной сети (netguard_test.go). Отдельная программа ради
-// полусотни строк завела бы ещё один шаг сборки в CI.
+// TestMain даёт тестовому бинарю второе лицо: с HOP_L3_PEER он не гоняет
+// тесты, а работает эхосервером в своём netns (см. routecache_test.go).
 func TestMain(m *testing.M) {
-	switch {
-	case os.Getenv("HOP_L3_PEER") != "":
+	if os.Getenv("HOP_L3_PEER") != "" {
 		peerMain()
-		return
-	case os.Getenv("HOP_L3_NETPEER") != "":
-		netPeerMain()
 		return
 	}
 	os.Exit(m.Run())

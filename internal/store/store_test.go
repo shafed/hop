@@ -1,325 +1,376 @@
-package store_test
+// Персистентность стора — docs/verification-store.md §5.4. S* — номера
+// регистра. Уровень L1: диск здесь — t.TempDir(), а не привилегия.
+package store
 
 import (
-	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"testing"
-	"time" //hop:realtime
+	"time" //hop:realtime — точка отсчёта фейковых часов, обращения к настоящему времени нет
 
+	"github.com/shafed/hop/internal/clock"
 	"github.com/shafed/hop/internal/health"
-	"github.com/shafed/hop/internal/node"
-	"github.com/shafed/hop/internal/store"
 )
 
-// Узлы здесь собираются литералами, а не разбором ссылки: направление
-// store → sub запрещено (§3.4), и ключ слияния стору приносят снаружи.
-func nodeWith(name, server, user string) node.Node {
-	return node.Node{
-		Name:      name,
-		MergeKey:  "vless|" + server + "|443|" + user,
-		Protocol:  node.VLESS,
+// testEpoch — откуда стартуют фейковые часы. Значение произвольно и важно
+// только тем, что оно одно на все проверки.
+var testEpoch = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// newStore открывает стор в собственном временном каталоге.
+func newStore(t *testing.T) (*Store, string) {
+	t.Helper()
+	dir := t.TempDir()
+	return openStore(t, dir), dir
+}
+
+func openStore(t *testing.T, dir string) *Store {
+	t.Helper()
+	s, err := Open(dir, clock.NewFake(testEpoch))
+	if err != nil {
+		t.Fatalf("стор не открылся: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// seed кладёт группу с узлами прямо в состояние стора, минуя Apply: слияние —
+// шаг 5 регистра, а проверяется здесь запись, а не то, что с чем слилось.
+func seed(t *testing.T, s *Store, g Group, nodes ...Node) {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.groups[g.ID]; !ok {
+		s.groupOrder = append(s.groupOrder, g.ID)
+	}
+	for _, n := range nodes {
+		s.nodes[n.ID] = n
+		g.NodeOrder = append(g.NodeOrder, n.ID)
+	}
+	s.groups[g.ID] = g
+	s.dirty |= sectionGroups | sectionNodes
+}
+
+// addNode правит только состав узлов, не трогая группу: так следующая запись
+// касается ровно одного файла, и «прежнее состояние целиком» проверяется
+// побайтно.
+func addNode(t *testing.T, s *Store, n Node) {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nodes[n.ID] = n
+	s.dirty |= sectionNodes
+}
+
+// putHealth кладёт живость в состояние стора, минуя дебаунс PutHealth: здесь
+// проверяется запись, а не то, как часто она случается (шаг 6 — health_test.go).
+//
+// Обрезка та же, что у PutHealth: в healthByNode по построению лежит срез, а не
+// вся NodeHealth (§2), и помощник, который клал бы туда окно, проверял бы стор,
+// которого нет.
+func putHealth(t *testing.T, s *Store, h health.NodeHealth) {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.healthByNode[h.NodeID] = healthSlice(h)
+	s.dirty |= sectionHealth
+}
+
+// node — узел с ключом доступа в params: nodes.json секретен целиком именно
+// из-за них (Р12).
+func node(id, group, server string) Node {
+	return Node{
+		ID:        id,
+		GroupID:   group,
+		MergeKey:  "vless|" + server + "|443|uuid",
+		Name:      "узел " + id,
+		Protocol:  "vless",
 		Server:    server,
 		Port:      443,
-		Transport: node.WS,
-		Security:  node.SecTLS,
-		UserID:    user,
-		Params:    map[string]string{"sni": server},
+		Transport: "ws",
+		Security:  "tls",
+		Params:    map[string]string{"uuid": "11111111-1111-1111-1111-111111111111"},
 		Supported: true,
-		RawLink:   "vless://" + user + "@" + server + ":443",
+		RawLink:   "vless://11111111-1111-1111-1111-111111111111@" + server + ":443",
 	}
 }
 
-// TestPermissions — §6.14: каталог 0700, файлы 0600. В узлах лежат ключи
-// доступа, и права — единственное, что отделяет их от любого другого процесса
-// пользователя.
-func TestPermissions(t *testing.T) {
+func nodeIDs(nodes []Node) []string {
+	out := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, n.ID)
+	}
+	return out
+}
+
+func readRaw(t *testing.T, dir, name string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		t.Fatalf("не прочитать %s: %v", name, err)
+	}
+	return raw
+}
+
+// TestS27MissingRootIsCreatedWithSpecPermissions — S27: каталога стора нет.
+func TestS27MissingRootIsCreatedWithSpecPermissions(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "hop")
+	s := openStore(t, root)
+	if err := s.Flush(); err != nil {
+		t.Fatalf("пустой стор не записался: %v", err)
+	}
+
+	// Файлы создаются сразу, а не при первой записи: права, которых ещё нет,
+	// проверить нельзя, а §6.14 — не про будущее состояние каталога.
+	for _, name := range []string{groupsFile, nodesFile, healthFile} {
+		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
+			t.Fatalf("%s не создан: %v", name, err)
+		}
+	}
+
 	if runtime.GOOS == "windows" {
-		t.Skip("права POSIX на Windows не выражаются; §6.14 там закрывается ACL инсталлятора")
-	}
-	dir := filepath.Join(t.TempDir(), "hop")
-	st, err := store.Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-
-	if err := st.PutGroup(store.Group{ID: "g", Name: "g"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.PutNode(nodeWith("A", "a.example.com", "user-a")); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.PutHealth(health.NodeHealth{NodeID: "x", State: health.Alive}); err != nil {
-		t.Fatal(err)
+		// Права POSIX на Windows не выражаются: os.Chmod там управляет только
+		// признаком «только для чтения». Проверять нечего, и падать тоже не за
+		// что (§5.4, оговорка S27).
+		t.Skip("права POSIX на Windows не проверяются")
 	}
 
-	info, err := os.Stat(dir)
+	di, err := os.Stat(root)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("каталог стора не создан: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o700 {
-		t.Errorf("права каталога %o, ожидались 0700", perm)
+	if got := di.Mode().Perm(); got != dirPerm {
+		t.Errorf("права каталога %04o, а §6.14 требует %04o", got, dirPerm)
 	}
-
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var files int
-	for _, e := range entries {
-		fi, err := e.Info()
+	for _, f := range files() {
+		fi, err := os.Stat(filepath.Join(root, f.name))
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("%s: %v", f.name, err)
 		}
-		files++
-		if perm := fi.Mode().Perm(); perm != 0o600 {
-			t.Errorf("права %s: %o, ожидались 0600", e.Name(), perm)
+		if got := fi.Mode().Perm(); got != f.perm {
+			t.Errorf("права %s %04o, а §2 требует %04o", f.name, got, f.perm)
 		}
-	}
-	if files == 0 {
-		t.Fatal("стор не создал ни одного файла — проверять нечего")
 	}
 }
 
-// TestOpenTightensExistingDir — каталог, оставшийся от прошлой установки с
-// мягкими правами, доводится до 0700: §6.14 не зависит от того, кто создал
-// каталог.
-func TestOpenTightensExistingDir(t *testing.T) {
+// TestS27ExistingFilesGetSpecPermissions — продолжение S27: стор, доставшийся
+// с чужими правами (скопирован, распакован, создан прежней версией), чинится
+// при открытии. Иначе nodes.json остался бы читаемым для всех.
+func TestS27ExistingFilesGetSpecPermissions(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("права POSIX на Windows не выражаются")
+		t.Skip("права POSIX на Windows не проверяются")
 	}
-	dir := filepath.Join(t.TempDir(), "hop")
-	if err := os.Mkdir(dir, 0o755); err != nil {
-		t.Fatal(err)
+	s, dir := newStore(t)
+	seed(t, s, Group{ID: "g", Name: "подписка"}, node("n1", "g", "a.example"))
+	if err := s.Flush(); err != nil {
+		t.Fatalf("запись не прошла: %v", err)
 	}
-	st, err := store.Open(dir)
-	if err != nil {
-		t.Fatal(err)
+	if err := s.Close(); err != nil {
+		t.Fatalf("закрытие не прошло: %v", err)
 	}
-	defer st.Close()
+	if err := os.Chmod(filepath.Join(dir, nodesFile), 0o644); err != nil {
+		t.Fatalf("не испортить права: %v", err)
+	}
 
-	info, err := os.Stat(dir)
+	openStore(t, dir)
+
+	fi, err := os.Stat(filepath.Join(dir, nodesFile))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("%s: %v", nodesFile, err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o700 {
-		t.Errorf("права каталога %o, ожидались 0700", perm)
+	if got := fi.Mode().Perm(); got != secretPerm {
+		t.Errorf("права %s %04o, а §6.14 требует %04o", nodesFile, got, secretPerm)
 	}
 }
 
-// TestReopenKeepsState — стор переживает перезапуск агента: группы, узлы,
-// история и порядок узлов читаются обратно.
-func TestReopenKeepsState(t *testing.T) {
-	dir := t.TempDir()
+// TestS29BrokenHealthFileIsNotFatal — S29: health.json испорчен.
+func TestS29BrokenHealthFileIsNotFatal(t *testing.T) {
+	s, dir := newStore(t)
+	seed(t, s, Group{ID: "g", Name: "подписка"}, node("n1", "g", "a.example"))
+	putHealth(t, s, health.NodeHealth{NodeID: "n1", State: health.Alive, RTT: 42 * time.Millisecond, LastProbeAt: testEpoch})
+	if err := s.Flush(); err != nil {
+		t.Fatalf("запись не прошла: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("закрытие не прошло: %v", err)
+	}
 
-	// Сырой заголовок Subscription-UserInfo (§2, Group.quota_info) хранится
-	// как есть: §7 (вопрос 3) ещё не решил, что с ним делать, и разбирать его
-	// сейчас значило бы решить за него.
-	const quota = "upload=1024; download=2048; total=107374182400; expire=2147483647"
+	if err := os.WriteFile(filepath.Join(dir, healthFile), []byte("{это не json"), publicPerm); err != nil {
+		t.Fatalf("не испортить файл: %v", err)
+	}
 
-	st, err := store.Open(dir)
-	if err != nil {
-		t.Fatal(err)
+	s2 := openStore(t, dir)
+
+	// Живость пуста: восстановит первый же раунд проб (Р13).
+	s2.mu.Lock()
+	live := len(s2.healthByNode)
+	s2.mu.Unlock()
+	if live != 0 {
+		t.Errorf("живость восстановлена из битого файла: %d записей", live)
 	}
-	g := store.Group{
-		ID:             "sub1",
-		Name:           "провайдер",
-		SourceURL:      "https://example.invalid/sub",
-		LastUpdatedAt:  time.Unix(1700000000, 0).UTC(),
-		QuotaInfo:      quota,
-		AutoUpdate:     true,
-		UpdateInterval: 6 * time.Hour,
+
+	// Узлы и группы при этом прочитаны.
+	if got := len(s2.Groups()); got != 1 {
+		t.Errorf("групп %d, а битой была только живость", got)
 	}
-	if err := st.PutGroup(g); err != nil {
-		t.Fatal(err)
+	if _, ok := s2.Node("n1"); !ok {
+		t.Error("узел потерян из-за битой живости — цена ошибки перепутана (Р13)")
 	}
-	diff, err := st.ApplySubscription("sub1", []node.Node{
-		nodeWith("A", "a.example.com", "user-a"),
-		nodeWith("B", "b.example.com", "user-b"),
+}
+
+// TestS30BrokenNodesFileFailsOpen — S30: nodes.json испорчен. Громкий отказ, а
+// не пустой список: пустой список выглядит как исчезнувшая подписка и
+// провоцирует добавить её заново, потеряв всё окончательно (Р13).
+func TestS30BrokenNodesFileFailsOpen(t *testing.T) {
+	for _, tc := range []struct{ name, file string }{
+		{"nodes", nodesFile},
+		{"groups", groupsFile},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, dir := newStore(t)
+			seed(t, s, Group{ID: "g", Name: "подписка"}, node("n1", "g", "a.example"))
+			if err := s.Flush(); err != nil {
+				t.Fatalf("запись не прошла: %v", err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatalf("закрытие не прошло: %v", err)
+			}
+
+			broken := []byte(`{"version": 1, "узлы": обрубок`)
+			if err := os.WriteFile(filepath.Join(dir, tc.file), broken, publicPerm); err != nil {
+				t.Fatalf("не испортить файл: %v", err)
+			}
+
+			s2, err := Open(dir, clock.NewFake(testEpoch))
+			if err == nil {
+				_ = s2.Close()
+				t.Fatalf("стор открылся с битым %s — отказ обязан быть громким", tc.file)
+			}
+			if !strings.Contains(err.Error(), tc.file) {
+				t.Errorf("в ошибке нет имени файла, чинить нечего: %v", err)
+			}
+
+			// Битый файл не тронут: перезаписав его пустым, стор уничтожил бы
+			// последнее, из чего пользователь мог бы его восстановить.
+			if got := readRaw(t, dir, tc.file); string(got) != string(broken) {
+				t.Errorf("битый %s перезаписан при отказе старта", tc.file)
+			}
+		})
+	}
+}
+
+// TestOpenRestoresGroupsNodesAndHealth — то, на чём стоят шаги 5 и 6: запись и
+// чтение сходятся.
+func TestOpenRestoresGroupsNodesAndHealth(t *testing.T) {
+	s, dir := newStore(t)
+	g := Group{
+		ID:                 "g",
+		Name:               "подписка",
+		SourceURL:          "https://example.invalid/sub",
+		LastUpdatedAt:      testEpoch,
+		QuotaInfo:          "upload=1; download=2",
+		AutoUpdate:         true,
+		AutoUpdateInterval: 6 * time.Hour,
+	}
+	seed(t, s, g, node("n1", "g", "a.example"), node("n2", "g", "b.example"))
+	putHealth(t, s, health.NodeHealth{
+		NodeID:      "n1",
+		State:       health.Alive,
+		RTT:         42 * time.Millisecond,
+		Window:      []health.Outcome{health.OK, health.OK},
+		LastProbeAt: testEpoch,
 	})
-	if err != nil {
-		t.Fatal(err)
+	if err := s.Flush(); err != nil {
+		t.Fatalf("запись не прошла: %v", err)
 	}
-	if err := st.PutHealth(health.NodeHealth{
-		NodeID: diff.Added[0], State: health.Alive, RTT: 90 * time.Millisecond,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.Close(); err != nil {
-		t.Fatal(err)
+	if err := s.Close(); err != nil {
+		t.Fatalf("закрытие не прошло: %v", err)
 	}
 
-	again, err := store.Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer again.Close()
+	s2 := openStore(t, dir)
 
-	got, ok := again.Group("sub1")
+	groups := s2.Groups()
+	if len(groups) != 1 {
+		t.Fatalf("групп %d, ожидалась одна", len(groups))
+	}
+	got := groups[0]
+	if got.ID != g.ID || got.Name != g.Name || got.SourceURL != g.SourceURL ||
+		got.QuotaInfo != g.QuotaInfo || got.AutoUpdate != g.AutoUpdate ||
+		got.AutoUpdateInterval != g.AutoUpdateInterval || !got.LastUpdatedAt.Equal(g.LastUpdatedAt) {
+		t.Errorf("группа восстановлена иначе: %+v", got)
+	}
+
+	n, ok := s2.Node("n1")
 	if !ok {
-		t.Fatal("группа не прочиталась")
+		t.Fatal("узел n1 не восстановлен")
 	}
-	if got.QuotaInfo != quota {
-		t.Errorf("quota_info = %q, ожидалось %q", got.QuotaInfo, quota)
+	if n.Param("uuid") != "11111111-1111-1111-1111-111111111111" {
+		t.Errorf("params потеряны: %+v", n.Params)
 	}
-	if !got.LastUpdatedAt.Equal(g.LastUpdatedAt) || got.UpdateInterval != g.UpdateInterval {
-		t.Errorf("метаданные группы разъехались: %+v", got)
-	}
-	if len(got.NodeOrder) != 2 || got.NodeOrder[0] != diff.Added[0] {
-		t.Errorf("node_order=%v, ожидался %v", got.NodeOrder, diff.Added)
+	if n.MergeKey == "" {
+		t.Error("merge_key не восстановлен, а он хранимое поле (§2)")
 	}
 
-	nodes := again.Nodes("sub1")
-	if len(nodes) != 2 || nodes[0].Name != "A" || nodes[1].Name != "B" {
-		t.Fatalf("узлы прочитались как %+v", nodes)
+	// Срез живости переживает рестарт, окно — нет (§2). Дебаунс и флаг
+	// health_slice — шаг 6 регистра.
+	s2.mu.Lock()
+	h := s2.healthByNode["n1"]
+	s2.mu.Unlock()
+	if h.State != health.Alive || h.RTT != 42*time.Millisecond {
+		t.Errorf("срез живости восстановлен иначе: %+v", h)
 	}
-	if nodes[0].Param("sni") != "a.example.com" || nodes[0].UserID != "user-a" {
-		t.Errorf("узел прочитался неполно: %+v", nodes[0])
-	}
-	h, ok := again.Health(diff.Added[0])
-	if !ok || h.RTT != 90*time.Millisecond || h.State != health.Alive {
-		t.Errorf("история прочиталась как %+v (ok=%v)", h, ok)
+	if len(h.Window) != 0 {
+		t.Errorf("окно восстановлено, хотя после паузы оно врёт (§2): %v", h.Window)
 	}
 }
 
-// TestPutGroupKeepsNodeOrder — правка метаданных группы не трогает порядок
-// узлов: он принадлежит ApplySubscription.
-func TestPutGroupKeepsNodeOrder(t *testing.T) {
-	st, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
+// TestNodesFollowNodeOrder — Nodes отдаёт группу в порядке node_order (Р8):
+// при равных rtt выигрывает первый по порядку (§6.4), поэтому порядок —
+// наблюдаемое, а не деталь хранения.
+func TestNodesFollowNodeOrder(t *testing.T) {
+	s, dir := newStore(t)
+	seed(t, s, Group{ID: "g", Name: "подписка"},
+		node("n1", "g", "a.example"), node("n2", "g", "b.example"), node("n3", "g", "c.example"))
 
-	if err := st.PutGroup(store.Group{ID: "sub1", Name: "было"}); err != nil {
-		t.Fatal(err)
+	s.mu.Lock()
+	g := s.groups["g"]
+	g.NodeOrder = []string{"n3", "n1", "n2"}
+	s.groups["g"] = g
+	s.mu.Unlock()
+
+	if err := s.Flush(); err != nil {
+		t.Fatalf("запись не прошла: %v", err)
 	}
-	diff, err := st.ApplySubscription("sub1", []node.Node{nodeWith("A", "a.example.com", "user-a")})
-	if err != nil {
-		t.Fatal(err)
+	if err := s.Close(); err != nil {
+		t.Fatalf("закрытие не прошло: %v", err)
 	}
-	if err := st.PutGroup(store.Group{ID: "sub1", Name: "стало", QuotaInfo: "q"}); err != nil {
-		t.Fatal(err)
+
+	s2 := openStore(t, dir)
+	if got := nodeIDs(s2.Nodes("g")); !slices.Equal(got, []string{"n3", "n1", "n2"}) {
+		t.Errorf("порядок узлов %v, а node_order задавал n3, n1, n2", got)
 	}
-	g, _ := st.Group("sub1")
-	if len(g.NodeOrder) != 1 || g.NodeOrder[0] != diff.Added[0] {
-		t.Errorf("node_order=%v, ожидался %v", g.NodeOrder, diff.Added)
-	}
-	if g.Name != "стало" {
-		t.Errorf("имя не обновилось: %q", g.Name)
+	if got := s2.Nodes("нет такой группы"); len(got) != 0 {
+		t.Errorf("узлы несуществующей группы: %v", nodeIDs(got))
 	}
 }
 
-// TestApplySubscriptionRejectsEmptyKey — узел без ключа слияния отвергается:
-// пустой ключ склеил бы всю подписку в один узел, а посчитать ключ стору
-// нечем (§3.4).
-func TestApplySubscriptionRejectsEmptyKey(t *testing.T) {
-	st, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
+// TestNodesAreCopies — отданный узел не разделяет карту params со стором:
+// иначе граница держалась бы на договорённости не писать в чужое.
+func TestNodesAreCopies(t *testing.T) {
+	s, _ := newStore(t)
+	seed(t, s, Group{ID: "g", Name: "подписка"}, node("n1", "g", "a.example"))
 
-	if err := st.PutGroup(store.Group{ID: "sub1"}); err != nil {
-		t.Fatal(err)
+	n, ok := s.Node("n1")
+	if !ok {
+		t.Fatal("узел не найден")
 	}
-	n := nodeWith("A", "a.example.com", "user-a")
-	n.MergeKey = ""
-	if _, err := st.ApplySubscription("sub1", []node.Node{n}); err == nil {
-		t.Fatal("узел без ключа слияния принят")
-	}
-}
+	n.Params["uuid"] = "подменён"
 
-// TestPutNodeGoesToManualGroup — `hop node add` (§С2): узел без группы
-// попадает в manual и получает id.
-func TestPutNodeGoesToManualGroup(t *testing.T) {
-	st, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-
-	n, err := st.PutNode(nodeWith("ручной", "m.example.com", "user-m"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n.ID == "" {
-		t.Fatal("узлу не выдан id")
-	}
-	if n.GroupID != store.ManualGroup {
-		t.Errorf("группа %q, ожидалась %q", n.GroupID, store.ManualGroup)
-	}
-	if nodes := st.Nodes(store.ManualGroup); len(nodes) != 1 || nodes[0].ID != n.ID {
-		t.Errorf("в manual %d узлов", len(nodes))
-	}
-	if all := st.AllNodes(); len(all) != 1 {
-		t.Errorf("AllNodes вернул %d узлов", len(all))
-	}
-}
-
-// TestDeleteGroupRemovesNodesAndHealth — удаление группы уносит её узлы и их
-// историю: осиротевшая история копилась бы вечно.
-func TestDeleteGroupRemovesNodesAndHealth(t *testing.T) {
-	dir := t.TempDir()
-	st, err := store.Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.PutGroup(store.Group{ID: "sub1"}); err != nil {
-		t.Fatal(err)
-	}
-	diff, err := st.ApplySubscription("sub1", []node.Node{nodeWith("A", "a.example.com", "user-a")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.PutHealth(health.NodeHealth{NodeID: diff.Added[0], State: health.Alive}); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.DeleteGroup("sub1"); err != nil {
-		t.Fatal(err)
-	}
-	st.Close()
-
-	again, err := store.Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer again.Close()
-	if _, ok := again.Group("sub1"); ok {
-		t.Error("группа осталась")
-	}
-	if _, ok := again.Node(diff.Added[0]); ok {
-		t.Error("узел удалённой группы остался")
-	}
-	if _, ok := again.Health(diff.Added[0]); ok {
-		t.Error("история удалённого узла осталась")
-	}
-}
-
-// TestWriteIsAtomic — временных файлов после записи не остаётся: обрыв на
-// середине не должен оставлять стор с половиной подписки.
-func TestWriteIsAtomic(t *testing.T) {
-	dir := t.TempDir()
-	st, err := store.Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	if err := st.PutGroup(store.Group{ID: "sub1"}); err != nil {
-		t.Fatal(err)
-	}
-	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if filepath.Ext(path) == ".tmp" {
-			t.Errorf("остался временный файл %s", path)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
+	again, _ := s.Node("n1")
+	if again.Param("uuid") == "подменён" {
+		t.Error("правка отданной копии изменила стор")
 	}
 }

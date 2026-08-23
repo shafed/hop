@@ -64,6 +64,12 @@ func (f *FakeDevice) WaitEmitted(t testing.TB, n int) [][]byte {
 
 func (f *FakeDevice) MTU() int { return f.mtu }
 
+// Written сигнализирует, что в устройство что-то дописано. Ёмкость 1: сигналы
+// коалесцируются, и после каждого будильника надо слить весь Emitted(), а не
+// один пакет. Тот же канал, которым живёт WaitEmitted — для стендов, которым
+// нужен непрерывный насос, а не разовое ожидание известного числа пакетов.
+func (f *FakeDevice) Written() <-chan struct{} { return f.written }
+
 // Inject кладёт пакеты во входящую очередь.
 func (f *FakeDevice) Inject(pkts ...[]byte) {
 	f.mu.Lock()

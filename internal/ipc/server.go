@@ -77,11 +77,6 @@ func (s *Server) dispatch(c Conn, req Request) (Response, int) {
 			return Response{Error: "StartTunnel без параметров"}, -1
 		}
 		p := *req.Params
-		// UID для правила §6.8 берётся у ядра, а не со слов клиента: иначе
-		// агент выписывает себе обход туннеля для чужого UID.
-		if uid := peerUID(c.Peer()); uid >= 0 {
-			p.AgentUID = uid
-		}
 		h, err := s.m.Start(p, c.Peer())
 		if err != nil {
 			return Response{Error: err.Error()}, -1
