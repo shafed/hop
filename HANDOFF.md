@@ -1,82 +1,161 @@
-# Handoff — следующий шаг: остаток этапа 8, BypassSink как настоящий путь NAT
+```yaml
+status:
+  machine-readable — only for the next AI session, not for human reading.
+  Human-readable history/decisions live in PLAN.md and implementation-notes.md.
+branch: claude/pass0-decisions-registry
+plan_order: "6 -> 8 (remainder) -> 9"
 
-Порядок плана — `6 → 8 (остаток) → 9`. Этап 6 закрыт целиком. Linux-ядро этапа 8
-закрыто (настоящий TUN, T21–T29 в netns, привязка исходящих сокетов к
-физическому интерфейсу через `outbound.Selector`). Разрыв активных соединений
-при смерти узла (§5.5) тоже закрыт: `tcpStack` (`internal/netstack/tcp.go`)
-ведёт реестр открытых релеев, `Stack.InterruptTCP()` рвёт всё сейчас открытое и
-возвращает число, `Agent.InterruptConnections()` — провод в
-`health.Config.Interrupt`, подключённый в `cmd/hop/main.go` тем же приёмом
-отложенного замыкания, что и `Prober`. Проверено настоящим TCP-рукопожатием
-через gvisor против настоящего `tcpStack.pipe`, а не через стенд —
-`internal/netstack/interrupt_test.go`. Закрывает W8 и W14
-(`docs/verification-agent.md:310,321`). Подробности решения и почему именно
-такая форма — `implementation-notes.md`, «Этап 8 — реестр релеев netstack и
-разрыв соединений». UDP в реестр не вошёл: SPEC и регистр (T9, T10, W8) говорят
-про TCP, `natTable` этим заходом не тронут.
+branch_diverged_from_main:
+  severity: BLOCKING — resolve before any merge/push-to-main attempt
+  fact: >
+    This branch is built on the internal/resolver + health/manager.go
+    architecture. main explicitly superseded that architecture on 2026-08-21
+    (commit 1d9d1f1, "слить main: этапы 4-6 сделаны здесь, версия main
+    вытеснена") in favor of internal/dns + health/{schedule,select,monitor}.go.
+    Both lines forked from the same commit (39aaa445, 2026-08-14) and
+    independently rebuilt stages 4-6.
+  evidence: >
+    git merge main<-claude/pass0-decisions-registry produces delete/modify
+    conflicts on internal/health/manager.go, internal/engine/dialer.go,
+    internal/l2/harness_test.go, internal/l2/realnode_test.go, plus content
+    conflicts in PLAN.md, SPEC.md, cmd/hop/main.go, internal/netstack/*.go,
+    internal/policy/policies.go, internal/store/*.
+  status: unresolved. Branch NOT merged into main. main untouched.
+  do_not:
+    merge or push this branch's history into main without an explicit human
+    decision on which architecture wins going forward.
 
-## Этап 8, остаток — и с чего в нём начинать
+closed_this_pass:
+  what: "connection teardown on node death (SPEC §5.5)"
+  closes_registry_rows: [W8, W14]
+  registry_ref: "docs/verification-agent.md:310,321"
+  decision_log:
+    "implementation-notes.md, section 'Этап 8 — реестр релеев netstack и разрыв
+    соединений'"
+  changed_files:
+    - path: internal/netstack/tcp.go
+      what:
+        "tcpStack.relays: map[*tcpRelay]struct{} under relayMu. Entry added in
+        pipe() before the io.Copy goroutines start, removed inside the same
+        once-wrapped stop(). closeAll() snapshots under lock, calls stop()
+        outside it, returns count."
+    - path: internal/netstack/netstack.go
+      what: "Stack.InterruptTCP() int -> s.tcp.closeAll()"
+    - path: internal/agent/wire.go
+      what:
+        "Agent.InterruptConnections() int — locks a.mu, reads a.stack, returns 0
+        if nil (Down/not-yet-Up), else stack.InterruptTCP()"
+    - path: cmd/hop/main.go
+      what:
+        "health.Config.Interrupt: func() int { return a.InterruptConnections() }
+        — same deferred-closure trick already used for Prober (var a
+        *agent.Agent declared before health.New)"
+  new_tests:
+    file: internal/netstack/interrupt_test.go
+    note: >
+      Real gvisor client stack (gstack.Stack + custom clientLink) bridged over
+      the same packettest.FakeDevice the rest of the package uses (not
+      internal/bench's OS-boundary rig). Does a real TCP 3-way handshake through
+      tcpStack's forwarder, not a fake callback — this is what A18 (health) and
+      T9/T10 (l2) do NOT cover: both interrupt via harness.interrupt(), a
+      stand-in, per internal/l2/harness_test.go's own comment ("в продукте это
+      делает netstack; здесь — стенд").
+    tests:
+      [
+        TestInterruptTCPClosesLiveConnection,
+        TestInterruptTCPCountsAllOpenRelays,
+        TestInterruptTCPWithNoConnectionsReturnsZero,
+      ]
+  deferred_scope:
+    "UDP not registered — natTable untouched. SPEC + registry (T9, T10, W8)
+    speak only of TCP."
+  small_test_addition:
+    file: internal/agent/wire_test.go
+    test: TestInterruptConnectionsDelegatesToStack
+    scope:
+      "wiring only (nil-stack -> 0, delegates when up) — behavior contract is
+      netstack-level, tested above"
+  infra_addition:
+    file: internal/packettest/fake.go
+    what:
+      "FakeDevice.Written() <-chan struct{} — exposes the existing write-signal
+      channel for stands that need a continuous pump (used by
+      interrupt_test.go's client bridge), not just WaitEmitted's one-shot wait"
 
-Три куска остались, и `BypassSink` — самый дорогой: единственный, который
-сегодня врёт наблюдаемым поведением, а не отсутствием функции.
+next_task:
+  priority: 1
+  name: "BypassSink as a real NAT path (SPEC §6.10)"
+  why_first: >
+    Only remaining piece that lies about observable behavior (packet silently
+    dropped) rather than simply missing a feature.
+  current_state:
+    - "agent.Config.Bypass is nil in production"
+    - "netstack.Config.Bypass: interface { Send(pkt []byte) error } —
+      internal/netstack/netstack.go:90"
+    - "Stack.handle, internal/netstack/netstack.go:250: `if s.cfg.Bypass != nil
+      { ... }` — always nil today, packet silently dropped"
+  goal: >
+    mDNS/DHCP-transit and everything else the classifier routes to Bypass (SPEC
+    §6.2, §6.10) must exit via the physical interface through the agent's own
+    NAT, and the reply must return to the client the same way tcpStack/ natTable
+    already return proxied traffic to Stack.write.
+  reuse:
+    - "outbound.Selector (internal/outbound) already gives the current physical
+      interface and is already used for SO_BINDTODEVICE on
+      Xray/health-probe/subscription sockets — internal/agent/wire.go,
+      cmd/hop/main.go"
+  design_note: >
+    Send(pkt) receives an already-assembled IP packet, so the implementation
+    must either parse it into a UDP/TCP datagram itself and dial a socket bound
+    to the interface (NAT: rewrite src to the physical interface's address,
+    remember the mapping, return replies the same way natTable already does for
+    proxied UDP), or find a more direct OS-level path. A second line of defense
+    already exists upstream: routing rules above the tunnel should keep such
+    packets out of the TUN entirely (§6.2) — BypassSink exists only for when
+    that rule didn't hold, which is exactly the case that needs a real path now.
+  test_gap:
+    stays_green:
+      "TestT17MDNSGoesToLocalNetwork (internal/netstack/netstack_test.go:196) —
+      verdict-only, uses fakenet.Bypass, unaffected"
+    missing_and_needed: >
+      L3 test: mDNS request from the tunnel is visible on the physical
+      interface, reply returns to the client via NAT. Symmetric to how
+      internal/netstack/interrupt_test.go became the missing check for W8/W14.
+  flag_to_add:
+    name: bypass_sink
+    note:
+      "name already reserved in PLAN.md. Register in internal/policy with a
+      negcheck guard BEFORE writing the implementation — registry rule: every
+      new policy needs a test that's red without it."
 
-**Первым — `BypassSink` как настоящий путь NAT (§6.10).** `agent.Config.Bypass`
-в продукте пуст (`netstack.Config.Bypass` — интерфейс с одним методом
-`Send(pkt []byte) error`, `internal/netstack/netstack.go:90`), поэтому вердикт
-`bypass` в `Stack.handle` (`internal/netstack/netstack.go:250`) молча дропает
-пакет: `if s.cfg.Bypass != nil { ... }`, а `Bypass` там всегда nil. mDNS,
-DHCP-транзитный трафик и всё остальное, что классификатор относит к `Bypass`
-(§6.2, §6.10), должно выходить в локальную сеть через физический интерфейс и NAT
-самого агента, а ответ — возвращаться клиенту через тот же путь, каким
-`tcpStack`/`natTable` уже отдают проксируемый трафик обратно в `Stack.write`.
+queue_after_bypass_sink:
+  - task: "bypass/block lists from config (SPEC §6.10)"
+    blocker:
+      "currently hardcoded in internal/netstack/verdict.go; pointless before
+      BypassSink exists — the Bypass address set never changes at runtime yet"
+  - task: "IPv6 blocking under ipv6_block"
+    red_without_it: "T28, internal/l3/tunnel_test.go"
+  - task: "macOS dataplane"
+    detail: "utun via AF_SYSTEM, SIOCAIFADDR, PF_ROUTE"
+  - task: "Windows dataplane"
+    detail: >
+      Wintun + wintun.dll delivery — §7 already resolved: pull from the official
+      archive at build time, verify SHA-256 and vendor signature.
+    note:
+      "platform.New() explicitly errors on both OSes today — correct behavior; a
+      silent stub would give a green L3 with nothing actually checked"
 
-Разобрать перед тем, как писать план:
-
-- **Что уже есть.** `outbound.Selector` (`internal/outbound`) уже даёт текущий
-  физический интерфейс и уже используется для `SO_BINDTODEVICE` на исходящих
-  сокетах Xray, health-проб и HTTP-подписок (`internal/agent/wire.go`,
-  `cmd/hop/main.go`). `BypassSink` — второй потребитель того же селектора, но
-  бьёт не TCP/UDP-сокетами приложения, а сырыми пакетами клиента: интерфейс
-  `Send(pkt []byte) error` получает уже собранный IP-пакет из `netstack`, то
-  есть реализация обязана либо сама разобрать его на UDP/TCP-датаграмму и
-  сходить сокетом с привязкой к интерфейсу (то есть NAT — переписать src на
-  адрес физического интерфейса, запомнить отображение, вернуть ответ клиенту тем
-  же путём, что `natTable` уже делает для проксируемого UDP), либо найти более
-  прямой путь через ОС. Второй рубеж уже стоит: правила маршрутизации выше
-  туннельного не должны заводить такие пакеты в TUN вовсе (§6.2) — `BypassSink`
-  существует на случай, если правило не встало, и вопрос именно в том, что
-  происходит, когда всё-таки встало.
-- **Т17 не должен покраснеть.** `TestT17MDNSGoesToLocalNetwork`
-  (`internal/netstack/netstack_test.go:196`) проверяет только вердикт — пакет
-  ушёл в `fakenet.Bypass`, а не в туннель. Он остаётся зелёным и без настоящего
-  NAT-пути: это L2-тест на поддельном `BypassSink`. Красным должен стать новый
-  L3-тест, которого пока нет: mDNS-запрос из туннеля виден на физическом
-  интерфейсе, ответ возвращается клиенту через NAT — этот тест и есть
-  недостающая проверка, симметрично тому, как
-  `internal/netstack/interrupt_test.go` стал недостающей проверкой для W8/W14.
-- **Флаг.** `bypass_sink` — уже упомянут в PLAN.md как имя будущей политики;
-  завести его в `internal/policy` и обвязать `negcheck`-гвардом до того, как
-  писать реализацию (правило регистра: у каждой новой политики есть краснеющая
-  проверка).
-
-**Затем списки bypass/block §6.10 из конфигурации** (сейчас зашиты в
-классификаторе, `internal/netstack/verdict.go`) — до этого куска `BypassSink`
-своей полезности не покажет: набор адресов, уходящих в `Bypass`, не меняется
-рантаймом.
-
-**Затем блокировка IPv6** под `ipv6_block`, которую краснит T28
-(`internal/l3/tunnel_test.go`).
-
-**Последними — macOS и Windows.** utun через `AF_SYSTEM`, `SIOCAIFADDR`,
-`PF_ROUTE`; Wintun и поставка `wintun.dll` (вопрос §7 закрыт: тянем при сборке
-из официального архива со сверкой SHA-256 и вендорской подписи).
-`platform.New()` на этих ОС сегодня отказывает явно — молчаливая заглушка дала
-бы зелёный L3 там, где не проверено ничего.
-
-## Гейт
-
-`go test ./...`, `go test -race` для затронутых пакетов, `go run ./cmd/negcheck`
-(гоняет каждый охранник дважды и ловит обратное — занимает несколько минут, не
-полагаться на кэш `go test`). Каждая новая политика обязана иметь проверку,
-красную без неё. Линт настоящего времени — `go run ./cmd/realtimelint .` —
-шаблон `./...` он не понимает.
+gate:
+  commands:
+    - "go test ./..."
+    - "go test -race <affected packages>"
+    - "go run ./cmd/negcheck"
+    - "go run ./cmd/realtimelint ."
+  notes:
+    negcheck:
+      "runs every guard twice (with/without its policy) via `go test -count=1`,
+      ~20+ min wall clock on this machine across 35 policies — this is expected,
+      not a hang; don't rely on go test's cache"
+    realtimelint: "does not accept ./... as an argument — pass literally `.`"
+  rule: "every new policy must ship with a test that is red without it"
+```
