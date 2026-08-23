@@ -41,9 +41,7 @@ func TestBypassSinkCarriesDatagramAndReply(t *testing.T) {
 	listener := pc.LocalAddr().(*net.UDPAddr).AddrPort()
 
 	received := make(chan []byte, 1)
-	echoDone := make(chan struct{})
 	go func() {
-		defer close(echoDone)
 		buf := make([]byte, 1500)
 		for {
 			n, from, err := pc.ReadFrom(buf)

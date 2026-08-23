@@ -1,6 +1,7 @@
 package netstack
 
 import (
+	"errors"
 	"net/netip"
 	"sync/atomic"
 	"testing"
@@ -207,6 +208,29 @@ func TestT17MDNSGoesToLocalNetwork(t *testing.T) {
 	}
 	if h.dialer.Conn(client) != nil {
 		t.Fatal("mDNS ушёл в туннель")
+	}
+}
+
+// Отказ приёмника bypass (нет физического интерфейса, политика выключена и
+// т.п.) — это дроп, наблюдаемый через Stats.Blocked, а не тишина: до этого
+// теста ошибка Send терялась на месте (netstack.go, handle/case Bypass).
+//
+// Синхронизация без часов — тот же приём, что у TestIPv6IsBlocked: насос
+// один, второй пакет (unhealthy → reject_mode отвечает RST/ICMP синхронно)
+// подтверждает, что первый уже обработан.
+func TestBypassSendErrorCountsAsBlocked(t *testing.T) {
+	h := newHarness(t, false)
+	h.byp.SetErr(errors.New("нет физического интерфейса"))
+
+	h.dev.Inject(packettest.UDP(client, mdns, []byte("_services")))
+	h.dev.Inject(packettest.UDP(client, udpPeerA, []byte("после")))
+	h.dev.WaitEmitted(t, 1)
+
+	if st := h.st.Stats(); st.Blocked != 1 {
+		t.Fatalf("заблокировано %d пакетов, ожидался один отказ bypass: %+v", st.Blocked, st)
+	}
+	if pkts := h.byp.Packets(); len(pkts) != 0 {
+		t.Fatalf("пакет ушёл в локальную сеть, хотя Send отказал: %d пакетов", len(pkts))
 	}
 }
 

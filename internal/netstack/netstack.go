@@ -257,8 +257,14 @@ func (s *Stack) handle(pkt []byte) {
 		}
 		s.tcp.inject(pkt) // DNS поверх TCP: поток надо сначала терминировать
 	case Bypass:
-		if s.cfg.Bypass != nil {
-			_ = s.cfg.Bypass.Send(pkt)
+		// Отказ Send (ErrDisabled, ErrUnsupported, ошибка сокета — включая
+		// outbound.ErrNoInterface, «нет физического интерфейса, честнее
+		// отказать, чем зациклить») — это дроп, а не тишина: doc-комментарий
+		// Stats.Blocked («дропнуто по §6.9/§6.10») уже покрывает этот случай.
+		if s.cfg.Bypass == nil {
+			s.count(&s.blocked)
+		} else if err := s.cfg.Bypass.Send(pkt); err != nil {
+			s.count(&s.blocked)
 		}
 	case Block:
 		s.count(&s.blocked)

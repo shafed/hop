@@ -3,6 +3,7 @@ package bypass
 import (
 	"net"
 	"net/netip"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -191,10 +192,13 @@ func TestBypassAcceptsReplyFromAnotherAddress(t *testing.T) {
 func TestBypassRefusesTCP(t *testing.T) {
 	listener := newListener(t)
 
-	var replied bool
+	// atomic: Reply зовётся из горутины receive, тело теста читает из своей —
+	// без этого запись гонялась бы с чтением незамеченной ровно тогда, когда
+	// это стало бы важно (TCP получил бы Reply).
+	var replied atomic.Bool
 	n, err := New(Config{
 		Control: countingControl(new(int32)),
-		Reply:   func([]byte) { replied = true },
+		Reply:   func([]byte) { replied.Store(true) },
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -212,7 +216,7 @@ func TestBypassRefusesTCP(t *testing.T) {
 	if _, _, rerr := listener.ReadFromUDP(buf); rerr == nil {
 		t.Fatal("TCP-пакет всё же ушёл наружу")
 	}
-	if replied {
+	if replied.Load() {
 		t.Fatal("Reply позван для отказавшего TCP")
 	}
 }
@@ -248,6 +252,7 @@ func TestBypassIdleClosesSocket(t *testing.T) {
 
 func TestBypassCloseStopsGoroutines(t *testing.T) {
 	listener := newListener(t)
+	before := runtime.NumGoroutine()
 
 	var mu sync.Mutex
 	var replies int
@@ -273,5 +278,18 @@ func TestBypassCloseStopsGoroutines(t *testing.T) {
 
 	if err := n.Send(packettest.UDP(client, listenerAddr, []byte("after close"))); err != errClosed {
 		t.Fatalf("Send после Close = %v, ожидался errClosed", err)
+	}
+
+	// Close уже дожидается n.wg внутри, так что receive к этому моменту
+	// вернулась — опрос с ограниченным временем нужен только на случай гонки
+	// рантайма между Done() и фактическим снятием горутины со стека, не как
+	// замена ожиданию. Без этой проверки утечка горутины не падает здесь, а
+	// проявляется зависанием какого-то другого, ни к чему не обязанного теста.
+	deadline := time.Now().Add(readTimeout) //hop:realtime
+	for runtime.NumGoroutine() > before {
+		if time.Now().After(deadline) { //hop:realtime
+			t.Fatalf("горутины не остановились после Close: сейчас %d, было %d", runtime.NumGoroutine(), before)
+		}
+		time.Sleep(5 * time.Millisecond) //hop:realtime
 	}
 }

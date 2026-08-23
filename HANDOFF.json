@@ -7,7 +7,7 @@
   "closed_this_pass": {
     "what": "BypassSink as a real UDP NAT path for verdict Bypass (SPEC §6.10, §6.8)",
     "closes_registry_rows": ["SPEC.md §8.4 table: new row T31"],
-    "decision_log": "implementation-notes.md, section 'Этап 8 — BypassSink: настоящий NAT-путь для bypass (§6.10, §6.8)'",
+    "decision_log": "implementation-notes.md, section 'Этап 9 — BypassSink: настоящий NAT-путь для bypass (§6.10, §6.8)'",
     "changed_files": [
       {
         "path": "internal/packet/parse.go",
@@ -19,7 +19,7 @@
       },
       {
         "path": "internal/netstack/netstack.go",
-        "what": "Stack.Deliver(pkt []byte) — the reply path back into the TUN device, through the same s.write single-writer that natTable/tcpStack already use. netstack.go:259 handle() calls s.cfg.Bypass.Send(pkt) for verdict Bypass and discards the error (same silent-drop shape as before when Bypass is nil or disabled)."
+        "what": "Stack.Deliver(pkt []byte) — the reply path back into the TUN device, through the same s.write single-writer that natTable/tcpStack already use. netstack.go:259 handle() calls s.cfg.Bypass.Send(pkt) for verdict Bypass; fix wave after this pass's initial merge (final review, finding 1) made a Send failure — nil sink, ErrDisabled, ErrUnsupported, or a socket error including outbound.ErrNoInterface — count as Stats.Blocked instead of being discarded silently."
       },
       {
         "path": "internal/agent/wire.go",
@@ -66,7 +66,7 @@
     "name": "bypass/block lists from configuration (SPEC §6.10)",
     "why_first": "First item of the queue that was already deferred behind BypassSink; now that BypassSink delivers packets for real, a fixed hardcoded list is the next thing standing between the spec's routing description and what the config can actually express.",
     "current_state": [
-      "internal/netstack/verdict.go:119, isBypass(f flow) bool — hardcoded logic: RFC1918/loopback/link-local ranges plus §5.6's always-allowed exceptions (DHCP, NTP), plus mDNS (224.0.0.251:5353 only — IPv4) and SSDP for service discovery (§6.10). None of this is configurable at runtime; the address set isn't read from any config struct. Note: SPEC.md §6.10 also lists an IPv6 mDNS address ([ff02::fb]:5353) among the exceptions, but isBypass has no IPv6 branch — IPv6 packets never reach classify()/isBypass() at all, they're blocked earlier at the parse !ok branch in netstack.go:246 (§6.9). That gap is spec-vs-code, not something this task should silently fold in; see implementation-notes.md, Deviations, for the record of it.",
+      "internal/netstack/verdict.go:119, isBypass(f flow) bool — hardcoded logic: RFC1918/loopback/link-local ranges plus §5.6's always-allowed exceptions (DHCP, NTP), plus mDNS (224.0.0.251:5353 only — IPv4) and SSDP for service discovery (§6.10). None of this is configurable at runtime; the address set isn't read from any config struct. Note: SPEC.md §6.10 also lists an IPv6 mDNS address ([ff02::fb]:5353) among the exceptions, but isBypass has no IPv6 branch — IPv6 packets never reach classify()/isBypass() at all, they're blocked earlier at the parse !ok branch in netstack.go:245 (§6.9). That gap is spec-vs-code, not something this task should silently fold in; see implementation-notes.md, Deviations, for the record of it.",
       "internal/netstack/verdict.go:76, classify(f flow, healthy bool) Verdict — calls isBypass(f) directly; verdict order (bypass vs DNS hijack) is already a policy (VerdictOrder), but the bypass membership test itself is not.",
       "BypassSink (this pass) delivers whatever verdict Bypass hands it — it has no opinion on which flows get that verdict. Wiring the actual list is entirely verdict.go's concern."
     ],
@@ -85,6 +85,22 @@
     }
   },
   "queue_after_bypass_config_lists": [
+    {
+      "task": "RST for TCP-to-LAN instead of a silent drop",
+      "detail": "verdict Bypass for TCP (RFC1918/loopback/link-local, internal/netstack/verdict.go:119) is still dropped silently by netstack.handle — the deliberate 'only UDP' scope decision for this pass (constraints.md, implementation-notes.md Deviations). Final review (finding 1) named internal/reject's existing RST path as the better answer, not this pass's job: reject.Reply(pkt) already exists for the Reject verdict and could plausibly be reused for a refused bypass TCP packet instead of a bare drop.",
+      "note": "not the same drop as an unreachable bypass sink (that one now counts in Stats.Blocked as of the final fix wave, netstack.go case Bypass) — this is about the verdict-level TCP-to-LAN case, which never even reaches bypass.NAT.Send."
+    },
+    {
+      "task": "Invalidate bypass sockets on interface change",
+      "detail": "bypass.NAT binds each socket to Selector.Interface() at creation (internal/bypass/bypass.go:143) and never re-binds it; nothing ties the NAT's socket cache to outbound.Selector's interface-change signal. Worse, socket.seen is refreshed on every Send (bypass.go:139), not only on a successful round trip, so periodic service-discovery retries (mDNS/SSDP) keep a dead-bound socket alive past the Idle sweep indefinitely. See implementation-notes.md Deviations (Этап 9) for the full writeup and §6.8's 'следствие первое'.",
+      "shapes": ["NAT.Reset() called by outbound.Selector's rtnetlink watcher on interface change (close all sockets; next Send re-dials)", "a hard TTL on socket age independent of seen, so a socket dies by age even under continuous traffic"],
+      "why_deferred": "properly wiring either shape touches outbound.Selector's rtnetlink watcher, which is outside BypassSink's scope (Global Constraint 9, constraints.md)."
+    },
+    {
+      "task": "Surface bypass.NAT.Stats() through netstack.Stack.Stats()",
+      "detail": "bypass.NAT.Stats() (internal/bypass/bypass.go:227) is unreachable in production today — nothing outside internal/bypass/bypass_test.go calls it, and Stack.Stats() (internal/netstack/netstack.go) does not fold it in the way it folds in natTable's stats. In production the idle sweep of bypass sockets therefore only runs on Send, and persists until Down after traffic stops — parity with natTable, not a regression, but Stats() staying unreachable means bypass socket/goroutine counts are invisible to whatever eventually surfaces Stack.Stats (CLI status, metrics).",
+      "note": "final review (finding 9) fixed only the Stats() doc comment to say this plainly; the architecture (wiring it into Stack.Stats) is this queue item, not done in that pass."
+    },
     {
       "task": "IPv6 blocking under ipv6_block",
       "red_without_it": "T28, internal/l3/tunnel_test.go"

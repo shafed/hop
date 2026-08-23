@@ -285,6 +285,7 @@ type Bypass struct {
 	mu   sync.Mutex
 	cond *sync.Cond
 	pkts [][]byte
+	err  error // не nil → Send отказывает вместо приёма (тест наблюдаемости отказа)
 }
 
 // NewBypass создаёт приёмник.
@@ -294,9 +295,21 @@ func NewBypass() *Bypass {
 	return b
 }
 
+// SetErr велит Send отказывать с err вместо приёма пакета — имитация
+// bypass.NAT без физического интерфейса (outbound.ErrNoInterface) или с
+// выключенной политикой.
+func (b *Bypass) SetErr(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.err = err
+}
+
 func (b *Bypass) Send(pkt []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.err != nil {
+		return b.err
+	}
 	b.pkts = append(b.pkts, append([]byte(nil), pkt...))
 	b.cond.Broadcast()
 	return nil
