@@ -82,6 +82,7 @@ type Agent struct {
 	// res — то, что видит netstack, а по dns связка кормит подписку и ждёт
 	// подтверждения сброса.
 	dns       *resolver.Resolver
+	boot      *resolver.Bootstrap
 	dnsEvents chan health.SwitchEvent
 	dnsAcked  chan struct{}
 
@@ -195,8 +196,58 @@ func (a *Agent) buildResolver() error {
 	if err != nil {
 		return fmt.Errorf("agent: резолвер не собрался: %w", err)
 	}
-	a.dns, a.res = r, r
+	b, err := resolver.NewBootstrap(resolver.BootstrapConfig{
+		Upstreams:  ups,
+		DialDirect: a.cfg.DialDirect,
+		Clock:      a.clk,
+	})
+	if err != nil {
+		return fmt.Errorf("agent: bootstrap не собрался: %w", err)
+	}
+
+	a.dns, a.res, a.boot = r, r, b
 	return nil
+}
+
+// resolveNode подставляет узлу адрес вместо имени (§5.7а).
+//
+// Резолвить обязана связка, а не Xray: Xray резолвит адрес сам, отдельным
+// сокетом, который через наш перехваченный :53 уходит в туннель — то есть в
+// резолвер, которому для работы нужен живой узел, которого нет, пока имя не
+// разрешилось. Это и есть петля §5.7(а), и разрывается она здесь.
+//
+// Отказ bootstrap не выбрасывает узел из набора: имя остаётся как было, и
+// дозвон до него провалится штатным путём, уйдя в живость (§6.3). Выбрасывать
+// значило бы, что один недоступный апстрим сокращает подписку молча.
+func (a *Agent) resolveNode(n engine.Node) engine.Node {
+	if a.boot == nil {
+		return n
+	}
+	if _, err := netip.ParseAddr(n.Server); err == nil {
+		// Узел задан адресом — bootstrap не спрашивается вовсе (D58).
+		return n
+	}
+
+	addrs, err := a.boot.Resolve(n.Server)
+	if err != nil || len(addrs) == 0 {
+		a.log.Warn("имя узла не резолвится, останется именем",
+			"узел", n.ID, "имя", n.Server, "err", err)
+		return n
+	}
+
+	// Рукопожатие обязано пережить подстановку. engine.tlsSettings берёт
+	// serverName из sni, иначе из host, иначе оставляет Xray взять адрес — и
+	// вот последнее после подстановки упёрлось бы в чужой сертификат. Имя,
+	// которое мы только что разрешили, и есть правильный serverName.
+	if n.Security != "" && n.Security != "none" &&
+		n.Param("sni") == "" && n.Param("host") == "" {
+		if n.Params == nil {
+			n.Params = map[string]string{}
+		}
+		n.Params["sni"] = n.Server
+	}
+	n.Server = addrs[0].String()
+	return n
 }
 
 // trafficPhaseNow — фаза трафика для резолвера. Считается той же чистой
@@ -364,7 +415,7 @@ func (a *Agent) reloadNodes() error {
 	en := make([]engine.Node, 0, len(nodes))
 	hn := make([]health.Node, 0, len(nodes))
 	for _, n := range nodes {
-		en = append(en, n.ToEngine())
+		en = append(en, a.resolveNode(n.ToEngine()))
 		hn = append(hn, n.ToHealth())
 	}
 
