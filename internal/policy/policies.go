@@ -57,6 +57,7 @@ var (
 		Doc:  "hijack-dns прежде bypass (§3.4, T16)",
 		Guards: []Guard{
 			{Pkg: "./internal/netstack", Test: "^TestT16DNSToLocalRouterIsHijacked$"},
+			{Pkg: "./internal/l2", Test: "^TestT16DNSToLocalRouterIsHijackedRealResolver$"},
 		},
 	}
 
@@ -364,6 +365,7 @@ var (
 		Doc:  "повтор по TCP на флаг TC, а не усечённый ответ (§5.7, D33)",
 		Guards: []Guard{
 			{Pkg: "./internal/resolver", Test: "^TestD33TruncatedAnswerRetriesOverTCP$"},
+			{Pkg: "./internal/l2", Test: "^TestD33TruncatedAnswerRetriesOverTCPRealNode$"},
 		},
 	}
 
@@ -382,6 +384,7 @@ var (
 		Guards: []Guard{
 			{Pkg: "./internal/resolver", Test: "^TestD19SwitchBumpsGeneration$"},
 			{Pkg: "./internal/resolver", Test: "^TestD20BypassEdgesFlushTwice$"},
+			{Pkg: "./internal/l2", Test: "^TestT14SwitchResolvesToNewIP$"},
 		},
 	}
 
