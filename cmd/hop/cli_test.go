@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/shafed/hop/internal/negcheck"
 	"github.com/shafed/hop/internal/policy"
 	"github.com/shafed/hop/internal/store"
 )
@@ -45,15 +46,54 @@ func testCLI(t *testing.T) (*cli, *bytes.Buffer, *bytes.Buffer) {
 	return c, &out, &errs
 }
 
-// specVerbs — глаголы §5.9 плюс два, которых в перечислении спеки не было.
+// specVerbs — глаголы §5.9, прочитанные ИЗ SPEC.md, а не переписанные сюда.
 //
-// `agent` спека называет отдельным абзацем («Бинарь один»), а не в списке;
-// `probe` дописан в §5.9 этим проходом — код у него старше спеки, и правило
-// проекта решает такое расхождение в пользу замера.
-var specVerbs = []string{
-	"up", "down", "status", "nodes", "events", "bypass",
-	"routing", "sub", "node", "auto", "autoconnect",
-	"agent", "probe",
+// Список литералом здесь уже стоял, и он был вторым экземпляром правды: §5.9
+// и тест разъезжаются молча, а именно от молчаливого расхождения документа и
+// кода этот репозиторий защищается (см. `cmd/doclint`). Читается строка формы
+// «`hop a | b | c`» из раздела §5.9; отсутствие раздела или строки — падение,
+// а не пустой список, иначе переписанная спека делала бы проверку зелёной,
+// ничего не проверяя.
+//
+// `agent` спека называет отдельным абзацем («Бинарь один»), а не в
+// перечислении, поэтому он добавляется к прочитанному явно и с этим доводом.
+func specVerbs(t *testing.T) []string {
+	t.Helper()
+
+	root, err := negcheck.ModuleRoot(".")
+	if err != nil {
+		t.Fatalf("корень модуля не найден: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "SPEC.md"))
+	if err != nil {
+		t.Fatalf("SPEC.md не прочитан: %v", err)
+	}
+
+	var section bool
+	for _, line := range strings.Split(string(raw), "\n") {
+		switch {
+		case strings.HasPrefix(line, "### 5.9"):
+			section = true
+			continue
+		case section && strings.HasPrefix(line, "### "):
+			t.Fatal("в §5.9 нет строки перечисления глаголов вида `hop a | b | c`")
+		case !section || !strings.HasPrefix(line, "`hop ") || !strings.Contains(line, "|"):
+			continue
+		}
+		list := strings.TrimPrefix(line[:strings.LastIndex(line, "`")], "`hop ")
+		verbs := []string{"agent"}
+		for _, v := range strings.Split(list, "|") {
+			if v = strings.TrimSpace(v); v != "" {
+				verbs = append(verbs, v)
+			}
+		}
+		if len(verbs) < 5 {
+			t.Fatalf("из §5.9 разобрано %d глаголов (%v) — строка перечисления разобрана неверно", len(verbs), verbs)
+		}
+		return verbs
+	}
+	t.Fatal("раздел §5.9 в SPEC.md не найден")
+	return nil
 }
 
 // TestW55EveryVerbOfTheSpecIsInTheGrammar — грамматика §5.9 названа целиком и
@@ -68,13 +108,14 @@ func TestW55EveryVerbOfTheSpecIsInTheGrammar(t *testing.T) {
 	for _, c := range commands {
 		have[c.verb] = true
 	}
-	for _, v := range specVerbs {
+	spec := specVerbs(t)
+	for _, v := range spec {
 		if !have[v] {
 			t.Errorf("глагола %q нет в грамматике, а §5.9 называет его поимённо", v)
 		}
 	}
 	for _, c := range commands {
-		if !slices.Contains(specVerbs, c.verb) {
+		if !slices.Contains(spec, c.verb) {
 			t.Errorf("глагол %q есть в грамматике и не назван в §5.9: поверхность выросла мимо документа", c.verb)
 		}
 	}
