@@ -26,6 +26,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 
+	"github.com/shafed/hop/internal/bypass"
 	"github.com/shafed/hop/internal/clock"
 	"github.com/shafed/hop/internal/packet"
 	"github.com/shafed/hop/internal/policy"
@@ -96,6 +97,24 @@ type BypassSink interface {
 	Send(pkt []byte) error
 }
 
+// BypassStatSource — необязательная вторая половина приёмника: счётчики для
+// снимка стека. Объявил метод — Stats() их подмешивает, не объявил — в снимке
+// нули.
+//
+// Тот же приём, что у StreamResolver выше и у FlushableResolver в связке, и по
+// той же причине: способность есть не у всякой реализации. Приёмник обязан
+// уметь ровно одно — выпустить пакет; считать сокеты умеет только тот, у кого
+// сокеты есть. Расширение самого BypassSink сделало бы счётчики обязательными
+// для всех, включая fakenet.Bypass — подставное исходящее, которое намеренно
+// не зависит ни от testing, ни от продуктовых пакетов, — и заставило бы
+// каждого нового приёмника (macOS, Windows) возвращать нули по обязанности.
+// Взамен принята цена: несовпавшая проверка типа промахивается молча, нулями.
+// Её платит TestStackStatsSeesRealBypassNAT, где за стеком стоит настоящий
+// bypass.NAT.
+type BypassStatSource interface {
+	Stats() bypass.Stats
+}
+
 // Config — всё, от чего зависит стек.
 type Config struct {
 	Device   packet.PacketDevice
@@ -163,9 +182,10 @@ type Stack struct {
 	nat   *natTable
 	tcp   *tcpStack
 
-	mu       sync.Mutex
-	blocked  int64
-	rejected int64
+	mu                sync.Mutex
+	blocked           int64
+	rejected          int64
+	bypassTCPRejected int64
 
 	closeOnce sync.Once
 	done      chan struct{}
@@ -253,13 +273,18 @@ func (s *Stack) InterruptTCP() int {
 	return s.tcp.closeAll()
 }
 
-// Stats — снимок счётчиков.
+// Stats — снимок счётчиков. Читает и ничего не меняет: ни одна из трёх таблиц
+// не убирается по факту снятия снимка (bypass.NAT.Stats, natTable.stats).
 func (s *Stack) Stats() Stats {
 	s.mu.Lock()
-	st := Stats{Blocked: s.blocked, Rejected: s.rejected}
+	st := Stats{Blocked: s.blocked, Rejected: s.rejected, BypassTCPRejected: s.bypassTCPRejected}
 	s.mu.Unlock()
 	st.Flows = s.flows.len()
 	st.NATEntries, st.NATSockets, st.NATOrphaned = s.nat.stats()
+	if src, ok := s.cfg.Bypass.(BypassStatSource); ok {
+		b := src.Stats()
+		st.BypassSockets, st.BypassOrphaned, st.BypassRebound = b.Sockets, b.Orphaned, b.Rebound
+	}
 	return st
 }
 
@@ -344,6 +369,7 @@ func (s *Stack) refuseBypassTCP(pkt []byte) {
 	if policy.BypassTCPReject.On() {
 		if r := reject.RST(pkt); r != nil {
 			s.count(&s.rejected)
+			s.count(&s.bypassTCPRejected)
 			s.write(r)
 			return
 		}
