@@ -65,7 +65,9 @@
       },
       {
         "file": "internal/agent/rebind_test.go",
-        "tests": ["TestBypassSocketRebindsOnInterfaceChange"],
+        "tests": [
+          "TestBypassSocketRebindsOnInterfaceChange"
+        ],
         "note": "W47, the second registered guard: the Config.Physical → bypass.Config.Interface seam. Needed because Config.Interface is optional — a forgotten passthrough would leave the mechanism dead in production with the unit test green. Drives a real agent on a fake device with a listener on loopback and flips the interface name under live traffic."
       }
     ],
@@ -112,6 +114,29 @@
       "name": "probably none",
       "note": "Observability that nothing branches on is not a policy — there is no behavior to disable and no test that could go red for the right reason. If the task does grow a behavioral half (e.g. the sweep starts running off a ticker rather than off Send), THAT half gets the flag, and the guard is written before the implementation, as the last four passes did."
     }
+  },
+  "parallel_task": {
+    "nature": "PARALLEL — does not block the main pass order and is not part of plan_order. Runs on its own branch alongside the queue; whoever picks up next_task should ignore this block.",
+    "name": "doclint: prose claims about state must be machine-checkable",
+    "why": "Two rot incidents were found in one day, both of the same kind: prose asserting a state that nothing verifies. (1) 'Global Constraint 9, constraints.md' was cited by two consecutive passes to justify deferring the bypass-socket task; the file has never existed in any branch, and when the argument was finally checked on its merits the task turned out to cost one optional field and one wiring line. (2) PLAN.md claimed 'T21–T29 проходят в netns'; four of them (T25, T26, T27, T28) do not exist as Go tests at all. Neither error was catchable by any existing check. What did NOT rot: negcheck, realtimelint, and the T-number index — every rule with an executable check behind it survived.",
+    "goal": "A third linter in the family of cmd/negcheck and cmd/realtimelint, pointed at the documents instead of the code, wired into .github/workflows/ci.yml, red on each of the two incidents above.",
+    "checks_it_must_perform": [
+      "Every T*/W* number named in SPEC.md §8 tables, PLAN.md or docs/verification-agent.md either exists as a Go test (grep for the number in a test name or its doc comment, the way T31/T32/T33/W36/W47 are written today) or appears in ONE explicit not-yet-written list that the linter itself reads.",
+      "Every policy name mentioned in PLAN.md or docs/verification-agent.md is registered in internal/policy/policies.go. (ipv6_block is named in PLAN.md today and is NOT registered — that is a true positive, not a bug in the linter; it belongs in the not-yet list.)",
+      "Every file path mentioned in HANDOFF.json, PLAN.md, SPEC.md and implementation-notes.md exists. This is the constraints.md check, and it is the same rule already written by hand in this file's citation_hygiene block — the point of this task is that the rule stops depending on a human remembering it."
+    ],
+    "known_true_positives_that_must_be_red_before_being_fixed": [
+      "PLAN.md: ipv6_block named as a live policy — not registered in internal/policy.",
+      "PLAN.md: T25, T26, T27, T28 named — no such Go tests.",
+      "HANDOFF.json: 'branch' and 'branch_note' describe four worktree branches waiting to be merged. All four were merged into main and deleted; main is now f6a2728. This block is stale in exactly the way the linter is meant to catch, and is itself a good test case for the path/state check."
+    ],
+    "starting_point": {
+      "patch": "/tmp/hop-doc-fixes.patch — uncommitted corrections already made to PLAN.md in the main working tree (5 factual fixes: the false T21–T29 claim in two places, the macOS/Windows workflows described as running when they are skeletons, the T25/T28 references in 'что должно сломаться', and the 'что осталось' list). Apply it as your first commit so there is one copy of this change, not two.",
+      "note": "After the patch is applied on your branch, the copy in the main working tree is redundant and will be discarded — do not expect it to be there, and do not try to edit /home/shafed/github/hop directly."
+    },
+    "second_smaller_rule": "HANDOFF.json should carry pointers and traps, not retellings. Its most useful content across four passes was file:line references and named traps ('seen is refreshed on every Send'). Its worst was a paraphrase of PLAN.md's scope for the routing_lists task that contradicted PLAN.md and had to be overridden. A retelling is a second copy of the truth and it drifts. Write this down wherever conventions between passes live.",
+    "flag_to_add": "Probably none — a linter is not a product policy, and cmd/realtimelint carries no flag either. If you disagree, say so explicitly in implementation-notes.md: the registry rule is about new policies, not about refusing to add one.",
+    "gate": "Same gate as any pass. The linter itself needs a test that is red without it, in whatever form cmd/realtimelint's own coverage takes — check how realtimelint is tested before inventing a shape."
   },
   "gate": {
     "commands": [

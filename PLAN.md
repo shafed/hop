@@ -511,7 +511,11 @@ outbound (§6.7), привязка исходящих сокетов (§6.8) и 
 
 ## Этап 8. Реальный TUN и платформенный хвост (L3) — Linux-ядро закрыто
 
-**Что уже сделано.** Linux поднимает настоящий TUN; T21–T29 проходят в netns.
+**Что уже сделано.** Linux поднимает настоящий TUN; в netns проходят T21, T22,
+T23-fast, T23-slow, T23b, T24, T29 и T31 — то есть не весь набор §8.4. T25
+(петля), T26 (перехват :53), T27 (fail-close на уровне TUN) и T28 (IPv6) на L3
+не написаны: поведение T25–T27 покрыто ниже уровнем, T28 не закрыт вовсе (см.
+«Что осталось»).
 Вместо UID-правила каждый новый TCP- и UDP-сокет агента привязывается к
 физическому интерфейсу. `internal/outbound.Selector` следит за default route в
 main table через rtnetlink, `net.Dialer.Control` ставит `SO_BINDTODEVICE`, а
@@ -548,15 +552,18 @@ health-пробы и HTTP-подписки. `AgentUID` удалён; cleanup с�
 `Send` и закрывает разошедшиеся — `bypass_rebind`, «следствие первое» §6.8.
 Наблюдателя rtnetlink это не тронуло: сигнал берётся опросом уже публикуемого
 `Interface()`, связка лишь пробрасывает `Config.Physical`, который у неё и так
-был. Нужно закрыть IPv6, довести списки §6.10 до диска и CLI, а затем
-реализовать и прогнать платформенные ветки macOS и Windows, включая Wintun и
-проверенную поставку `wintun.dll`.
+был. Нужно закрыть IPv6 — политику `ipv6_block` и T28, — дописать
+недостающие L3-тесты T25, T26 и T27, довести списки §6.10 до диска и CLI, а
+затем реализовать и прогнать платформенные ветки macOS и Windows, включая Wintun
+и проверенную поставку `wintun.dll`.
 
 Пользовательские split-префиксы, когда они появятся, идут в правила
 маршрутизации, а не в вердикт `bypass`: bypass выдаёт пакет через сокет агента и
 потому является NAT, а не прозрачным форвардингом.
 
-**Чем машина проверяет.** Linux — полный T21–T29 в netns на каждый PR, W36 и
+**Чем машина проверяет.** Linux — на каждый PR в netns T21, T22, T23-fast,
+T23-slow, T23b, T24, T29 и T31: шаг `l3-linux` в `.github/workflows/ci.yml`
+гоняет весь бинарь `internal/l3`, а недостающих T25–T28 в нём нет. Плюс W36 и
 kernel-тест binding, `internal/netstack/interrupt_test.go` на каждый прогон L2.
 L3-тест bypass построен: `internal/l3/bypass_test.go`,
 `TestBypassMDNSReachesPhysicalInterfaceAndReturnsViaNAT` (T31, §8.4) —
@@ -570,11 +577,16 @@ mDNS-запрос из туннеля виден на физическом ин�
 (`internal/bypass`) и W47 `TestBypassSocketRebindsOnInterfaceChange`
 (`internal/agent`, шов `Config.Physical` → `bypass.Config.Interface`); рядом с
 ними `TestBypassIdleSweepNeverCollectsSocketUnderTraffic` закрепляет, почему
-уборка простоя на эту роль не годится. macOS и Windows прогоняются по
-расписанию, с T22 и T23-slow первыми.
+уборка простоя на эту роль не годится. macOS и Windows по расписанию пока только
+собираются: `l3-macos.yml` и `l3-windows.yml` — скелеты, делающие `go build` и
+`go vet` и печатающие, что привилегированный слой ещё не написан. Порядок «T22 и
+T23-slow первыми» — план на то, когда эти ветки появятся.
 
-**Что должно сломаться при выключении.** Отсутствие binding → W36/T25;
-`ipv6_block=off` → T28; `routing_lists=off` → T32 и два теста вердикта из
+**Что должно сломаться при выключении.** Отсутствие binding → W36; T25, который
+должен закрывать ту же петлю на L3, ещё не написан. `ipv6_block=off` → T28 —
+обещание на будущее, а не действующая проверка: ни политики, ни теста пока нет,
+IPv6 сегодня умирает в ветке `!ok` разбора (`netstack.go`), а не намеренной
+блокировкой. `routing_lists=off` → T32 и два теста вердикта из
 `routing_test.go` краснеют, а T17 и T31 остаются зелёными: умолчания совпадают
 с прежним жёстким набором. `bypass_sink=off` →
 `TestBypassSendsDatagramFromBoundSocket` и `TestBypassReplyReturnsToClient`
