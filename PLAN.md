@@ -542,10 +542,15 @@ health-пробы и HTTP-подписки. `AgentUID` удалён; cleanup с�
 довод в `implementation-notes.md`. Списки bypass/block §6.10 из кода ушли: `netstack.Routing` —
 два списка правил «префикс + протокол + порт», `netstack.Config.Routing` и
 `agent.Config.Routing` (пусто — умолчания §6.10), исключения §5.6 из
-конфигурации не вынимаются, обнаружение служб — вынимается. Нужно закрыть IPv6,
-провести смену сети до selector и health, довести списки §6.10 до диска и CLI, а
-затем реализовать и прогнать платформенные ветки macOS и Windows, включая Wintun
-и проверенную поставку `wintun.dll`.
+конфигурации не вынимаются, обнаружение служб — вынимается. Смена интерфейса
+доведена и до сокетов bypass: NAT помнит, к какому интерфейсу `Control`
+привязал сокет, сверяет его с нынешним ответом `Selector.Interface` на каждом
+`Send` и закрывает разошедшиеся — `bypass_rebind`, «следствие первое» §6.8.
+Наблюдателя rtnetlink это не тронуло: сигнал берётся опросом уже публикуемого
+`Interface()`, связка лишь пробрасывает `Config.Physical`, который у неё и так
+был. Нужно закрыть IPv6, довести списки §6.10 до диска и CLI, а затем
+реализовать и прогнать платформенные ветки macOS и Windows, включая Wintun и
+проверенную поставку `wintun.dll`.
 
 Пользовательские split-префиксы, когда они появятся, идут в правила
 маршрутизации, а не в вердикт `bypass`: bypass выдаёт пакет через сокет агента и
@@ -560,8 +565,13 @@ mDNS-запрос из туннеля виден на физическом ин�
 тестов вердикта в `internal/netstack/routing_test.go`. Отказ вместо дропа на
 пути bypass — T33 (§8.3) плюс два теста шва между `reject.Excluded` и вердиктом
 `Bypass`: `TestBypassTCPNeedsRSTBecauseReplyStaysSilent` (`internal/netstack`) и
-`TestRSTAnswersWhereReplyStaysSilent` (`internal/reject`). macOS и Windows прогоняются по расписанию, с T22 и T23-slow
-первыми.
+`TestRSTAnswersWhereReplyStaysSilent` (`internal/reject`). Перепривязку
+сокетов bypass проверяют `TestBypassInterfaceChangeRebindsSocket`
+(`internal/bypass`) и W47 `TestBypassSocketRebindsOnInterfaceChange`
+(`internal/agent`, шов `Config.Physical` → `bypass.Config.Interface`); рядом с
+ними `TestBypassIdleSweepNeverCollectsSocketUnderTraffic` закрепляет, почему
+уборка простоя на эту роль не годится. macOS и Windows прогоняются по
+расписанию, с T22 и T23-slow первыми.
 
 **Что должно сломаться при выключении.** Отсутствие binding → W36/T25;
 `ipv6_block=off` → T28; `routing_lists=off` → T32 и два теста вердикта из
@@ -572,7 +582,13 @@ mDNS-запрос из туннеля виден на физическом ин�
 проверяет только вердикт, не доставку. `bypass_tcp_reject=off` → T33: RST не
 строится, и тест ждёт полный `WaitTimeout` — то самое молчание, которое §5.6
 запрещает; `TestBypassSendErrorCountsAsBlocked` при этом зелен при любом её
-состоянии, потому что UDP-путь она не трогает. Без реестра релеев
+состоянии, потому что UDP-путь она не трогает. `bypass_rebind=off` →
+`TestBypassInterfaceChangeRebindsSocket` (`internal/bypass`) и W47
+(`internal/agent`) краснеют: сокет после смены интерфейса остаётся прежним, и
+это видно по неизменившемуся исходному порту у слушателя. Флаг не слит с
+`bypass_sink`: тот гасит путь целиком, и под ним обе проверки покраснели бы по
+чужой причине — «наружу вообще ничего не ушло», а не «сокет не сменился».
+Без реестра релеев
 `TestInterruptTCPClosesLiveConnection` и его соседи в `internal/netstack` не
 собираются вовсе — они падают на этапе компиляции, если `Stack.InterruptTCP`
 убрать, а не только на ассерте.

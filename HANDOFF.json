@@ -1,121 +1,116 @@
 {
   "status": "machine-readable — only for the next AI session, not for human reading. Human-readable history/decisions live in PLAN.md and implementation-notes.md.",
-  "branch": "worktree-agent-a36f0462725213e27",
-  "branch_note": "Git worktree branch. Built on worktree-agent-a4c6a74e9de201e39 (fb71f0e, the routing_lists pass), which was built on worktree-bypass-sink-nat (f175e42, the BypassSink pass), which was built on 8d7d163 = main = origin/main at the time. This worktree started at 8d7d163 and was brought onto the right base by merging worktree-agent-a4c6a74e9de201e39 (clean fast-forward) before any file was touched; verified with `git merge-base --is-ancestor fb71f0e HEAD`. Not merged into main, not pushed — merging is the human's call. Three branches now wait for that call: worktree-bypass-sink-nat, worktree-agent-a4c6a74e9de201e39 and this one, and each contains the previous.",
+  "branch": "worktree-agent-ac1b14ff56c2f8001",
+  "branch_note": "Git worktree branch. Built on worktree-agent-a36f0462725213e27 (7b0aa82, the bypass_tcp_reject pass), which was built on worktree-agent-a4c6a74e9de201e39 (fb71f0e, routing_lists), which was built on worktree-bypass-sink-nat (f175e42, BypassSink), which was built on 8d7d163 = main = origin/main at the time. This worktree started at 8d7d163 and was brought onto the right base by merging worktree-agent-a36f0462725213e27 (clean fast-forward) before any file was touched; verified with `git merge-base --is-ancestor 7b0aa82 HEAD`. Not merged into main, not pushed — merging is the human's call. Four branches now wait for that call: worktree-bypass-sink-nat, worktree-agent-a4c6a74e9de201e39, worktree-agent-a36f0462725213e27 and this one, and each contains the previous.",
+  "citation_hygiene": {
+    "rule": "Every path named in this file must exist. Check with `ls <path>` and `git log --all -- <path>` before leaving it in.",
+    "why_this_block_exists": "The previous two passes carried a citation to 'Global Constraint 9, constraints.md'. That file does not exist — not in the working tree, not in the history of any branch — and the citation was what justified deferring the bypass-socket-invalidation task into the queue. It has been removed from this file entirely; the writeup is in implementation-notes.md, section 'Этап 9 — перепривязка сокетов bypass'. Every path currently named in this file was verified to exist at the time it was written.",
+    "the_rule_that_citation_was_standing_in_for": "Stated in the passes' own words, as a convention between passes rather than a quotation: a pass closes its own queue item and does not widen into neighbouring modules; where the correct shape does require changing another package, that is recorded in Deviations with an argument — it is not grounds to defer the task silently. This is what the passes actually did: the BypassSink pass changed internal/packettest, the bypass_tcp_reject pass changed internal/reject, both with the reason written down."
+  },
   "plan_order": "8 (remainder) -> 9",
   "closed_this_pass": {
-    "what": "RST for TCP-to-LAN instead of a silent drop (SPEC §5.6 'закрытие — отказ, а не молчание'; the previous HANDOFF's next_task, priority 1)",
+    "what": "Invalidate bypass sockets on interface change (the previous HANDOFF's next_task, priority 1; SPEC §6.8 'следствие первое')",
     "closes_registry_rows": [
-      "SPEC.md §8.3 table: new row T33"
+      "docs/verification-agent.md §5.8: new row W47",
+      "docs/verification-agent.md §6: new flag row bypass_rebind"
     ],
-    "decision_log": "implementation-notes.md, section 'Этап 9 — RST для TCP в локальную сеть (bypass_tcp_reject)', including the two required decisions and three Deviations",
-    "the_trap_that_made_this_non_trivial": {
-      "what": "reject.Reply(pkt) CANNOT be reused here. Reply's first act is `if !ok || Excluded(pkt) { return nil }`, and reject.Excluded returns true for every local destination (reject.isLocal: loopback, RFC1918, link-local, multicast, broadcast). So Reply returns nil for exactly the packets this task is about.",
-      "fix": "New exported reject.RST(pkt) — the same tcpRST builder Reply uses, with no Excluded question: TCP in, RST out, nil for anything else (not TCP, garbage, an RST itself — no loops). No policy inside; who deserves an answer is the caller's call. Still one RST builder in the product.",
-      "why_the_two_lists_differ": "Excluded answers 'what the §5.6 responder has no right to answer' — such a packet is not refused, it is simply none of our business. Verdict Bypass answers 'what to let out to the local network'. Where the bypass path refuses a flow, the second question is already settled and the first list would gag the answer.",
-      "pinned_by": "TestBypassTCPNeedsRSTBecauseReplyStaysSilent (internal/netstack) and TestRSTAnswersWhereReplyStaysSilent (internal/reject) — both assert BOTH halves (Reply is silent, RST answers), so a 'simplification' back to Reply reddens the explanation, not only T33."
-    },
-    "decision_udp_stays_a_drop": {
-      "answer": "No. UDP refused by the bypass sink (ErrUnsupported / ErrDisabled / socket error) keeps its silent, counted Stats.Blocked drop. TestBypassSendErrorCountsAsBlocked keeps `Stats.Blocked == 1` unchanged — nothing about the UDP path moved.",
+    "decision_log": "implementation-notes.md, section 'Этап 9 — перепривязка сокетов bypass при смене интерфейса (bypass_rebind)', including the shape argument, the scope re-examination, the flag decision and three Deviations. The old writeup of the hole (Deviations of the BypassSink section) now says 'Закрыто' and points there.",
+    "decision_shape": {
+      "answer": "The signal — but taken by POLL, not by push. Not the TTL, and not NAT.Reset() driven from the watcher. One mechanism ships; no TTL floor was added.",
+      "mechanism": "bypass.NAT records the interface name Control bound each socket to (socket.iface) and, on every Send, compares it with what Config.Interface returns now (outbound.Selector.Interface in production). Mismatch closes every socket whose binding differs; the next Send re-dials with the current binding. internal/bypass/bypass.go: Config.Interface, socket.iface, currentInterface(), rebindLocked().",
       "arguments_strongest_first": [
-        "RFC 1122 §3.2.2 forbids generating an ICMP error in response to a datagram addressed to a broadcast or multicast address — and mDNS (224.0.0.251), SSDP (239.255.255.250) and DHCP (255.255.255.255) are precisely what the bypass path exists for. The same instinct is already encoded in reject.isLocal, which puts multicast and broadcast among the exceptions.",
-        "ICMPv4PortUnreachable would be a lie about a third party: it says 'nobody is listening on that port there', while what actually failed is our own socket. A refusal that misstates the cause is worse than silence — it sends diagnosis the wrong way. The TCP RST, by contrast, tells the truth about our own path.",
-        "There is nothing to rescue from a timeout. §5.6 justifies 'refusal, not silence' by applications hanging until their timeout. TCP-to-LAN is literally that (connect hangs tens of seconds). Service discovery is the opposite: connectionless, periodic, retried by design, nobody waiting.",
-        "The UDP refusal is transient, the TCP one is permanent. ErrNoInterface / WriteTo failures pass in a second; answering ICMP turns a momentary unreadiness into a hard error at the client (net.UDPConn surfaces ICMP on a connected socket as a connection error). The bypass path's refusal of TCP never changes — it follows from the shape of the path, not the state of the network.",
-        "ErrDisabled specifically: the bypass_sink policy exists so that switching it off reproduces pre-policy behavior, i.e. the silent drop. Answering ICMP under it would break that contract and negcheck's meaning for it."
+        "It is the same signal, not a timer. Selector.Interface() is not an independent poll of the OS — it is the published output of the very rtnetlink watcher a push would have come from: watch() receives RouteUpdate/LinkUpdate, calls refresh(), set() stores the name under s.mu. Reading that field reads the result of the event.",
+        "Poll beats push on precision: Reset() fires on ANY watcher event (and an active network produces many that are not interface changes), closing every socket each time. Comparing names fires exactly when the interface is genuinely different.",
+        "The TTL treats the symptom (a wedged socket), not the cause, and pays blind: too short tears down healthy exchanges, too long leaves the leak window open, and no value is derivable from anything. It is not needed as a floor either — the signal cannot 'fail to arrive', because nothing waits for it: it is read on every Send, i.e. exactly when a stale binding could first do harm.",
+        "It cost one optional field in bypass.Config and one passthrough in agent/wire.go. internal/outbound is unchanged."
       ]
     },
+    "decision_scope_argument_did_not_hold": {
+      "claim_that_was_deferred_on": "'Doing it properly means touching the rtnetlink watcher outbound.Selector, which widens the pass beyond BypassSink.'",
+      "verdict": "False in its premise, checked rather than taken on trust. Everything a push would have delivered is already published: Selector.Interface() is exported, kept under RWMutex, updated by the watcher, and ALREADY handed to the agent as Config.Physical (cmd/hop/main.go passes physical.Interface). The correct shape is cheaper than the shape whose expense justified the deferral.",
+      "citation": "The deferral cited 'Global Constraint 9, constraints.md'. See citation_hygiene above: that file does not exist anywhere in this repo or its history. The reference is gone from this document; the finding is recorded in implementation-notes.md so the next reader does not take it on faith the way two passes did."
+    },
     "decision_own_flag": {
-      "answer": "Own flag, bypass_tcp_reject. reject_mode was NOT reused.",
+      "answer": "Own flag, bypass_rebind. bypass_sink — the plausible reuse candidate named by the previous HANDOFF — was NOT reused.",
       "arguments": [
-        "reject_mode's doc says fail-close ('fail-close через RST/ICMP, а не дроп (§5.6, T12, T13)'), and T33 runs on a stand with a LIVE node. The tunnel is open; the refusal means 'this path will not carry this flow', not 'there is no way out'. Merging them would either falsify that doc comment or widen it to 'all refusals go silent', after which T12/T13's 'падает без чего' column in §8.3 stops being accurate.",
-        "The precedent next door is exactly this shape: bypass_sink is also a bypass-path flag whose off-state is the silent drop, and it did not become part of reject_mode either. The dividing line the codebase already drew: reject_mode is about the phase (fail-close), bypass flags are about the path.",
-        "negcheck loses resolution on merge — reject_mode's guard set would become a union of two independent claims, and 'red without reject_mode' would stop naming one cause."
+        "Mechanical, not aesthetic: bypass_sink=off makes Send return ErrDisabled on its first line, before any socket exists. The guard would go red under it for the wrong cause — 'nothing left the machine at all', not 'the socket did not change' — and would not distinguish a broken rebind from a switched-off path.",
+        "negcheck loses resolution on reuse: 'red without bypass_sink' would stop naming one cause.",
+        "Same argument the previous pass used to keep bypass_tcp_reject out of reject_mode. The line the codebase draws: one flag, one claim."
       ],
-      "counter_argument_weighed_and_rejected": "Two flags allow an incoherent combination (reject_mode=drop with bypass_tcp_reject on: hop silent in fail-close, talkative on LAN). It does not weigh: policies are not a user setting but a falsifiability stand, and they are disabled one at a time precisely so each reddens its own check.",
-      "registered": "internal/policy/policies.go, next to BypassSink; guard TestT33TCPToLocalNetworkGetsRST, verified red under HOP_DISABLE=bypass_tcp_reject (no RST is built at all and the test waits out the full WaitTimeout). Guard test was written and seen red BEFORE the implementation, in a separate commit (aa12c42), the order both previous passes followed."
+      "registered": "internal/policy/policies.go, next to BypassSink and BypassTCPReject. Two guards, both written and SEEN RED before the implementation, in a separate commit (0dbf087) — the order the last three passes followed. Red on the assertion, not on compilation: the Config.Interface field and the agent passthrough went into that same commit precisely so the claim failed rather than the build."
     },
     "changed_files": [
       {
-        "path": "internal/reject/reject.go",
-        "what": "New exported RST(pkt []byte) []byte — TCP RST with no Excluded check, nil for non-TCP/garbage/an RST. Reply is untouched and still gates on Excluded; both share tcpRST."
+        "path": "internal/bypass/bypass.go",
+        "what": "New InterfaceFunc type and optional Config.Interface. socket gains iface (written once at creation — the binding is immutable, §6.8). currentInterface() reads the callback BEFORE taking n.mu (foreign callback, own lock) and reports 'unknown' for nil callback, error, or empty name. rebindLocked(iface) runs in socketFor under policy.BypassRebind and closes every socket whose non-empty iface differs, counting n.rebound. Stats gains Rebound."
       },
       {
-        "path": "internal/netstack/netstack.go",
-        "what": "handle()'s case Bypass answers TCP with s.refuseBypassTCP(pkt) and returns, BEFORE ever calling Bypass.Send. New method refuseBypassTCP: under policy.BypassTCPReject it calls reject.RST, counts Stats.Rejected and writes through the single-writer s.write; nil answer or the policy off falls through to Stats.Blocked (silence must stay observable). The BypassSink interface doc now states the UDP-only contract explicitly, so an implementation need not learn to refuse by protocol."
+        "path": "internal/agent/wire.go",
+        "what": "Up() passes Interface: bypass.InterfaceFunc(a.cfg.Physical) into bypass.New — a passthrough of a value the agent already held, not a new event source. A nil Config.Physical converts to a nil InterfaceFunc and the NAT behaves exactly as before."
       },
       {
         "path": "internal/policy/policies.go",
-        "what": "New policy BypassTCPReject (bypass_tcp_reject), registered in All() next to BypassSink. Doc carries the short form of why it is not reject_mode."
-      },
-      {
-        "path": "internal/packettest/fake.go",
-        "what": "ExpectRST and ExpectICMPUnreach now WAIT (up to WaitTimeout) via a shared expect() helper on the same Written() channel and the same clock.System{}.After that WaitEmitted uses. They used to look only at what was already written, which made them unusable as intended: Emitted() drains, so 'WaitEmitted then ExpectRST' handed back an empty queue, and 'ExpectRST straight away' raced the pump. Behavior for already-written packets is unchanged; the only previous caller (fake_test.go) writes synchronously and needed no edit."
+        "what": "New policy BypassRebind (bypass_rebind), registered in All(). Doc carries the short form of why it is not bypass_sink."
       }
     ],
     "new_tests": [
       {
-        "file": "internal/netstack/bypasstcp_test.go",
+        "file": "internal/bypass/rebind_test.go",
         "tests": [
-          "TestT33TCPToLocalNetworkGetsRST",
-          "TestBypassTCPNeedsRSTBecauseReplyStaysSilent"
+          "TestBypassInterfaceChangeRebindsSocket",
+          "TestBypassKeepsSocketWhenInterfaceUnknown",
+          "TestBypassIdleSweepNeverCollectsSocketUnderTraffic"
         ],
-        "note": "T33 is the registered guard for bypass_tcp_reject. It runs on a HEALTHY stand on purpose — that is what makes it not-fail-close and therefore not reject_mode's business. Positive half: RST on the device, addressed lanHost -> client. Negative half: h.byp.Packets() empty (nothing reached the bypass sink) and h.dialer.TCPDialed() empty (nothing was dialed into the tunnel), plus Stats.Rejected == 1 && Blocked == 0. It synchronizes on ExpectRST's own wait, never on fakenet.Bypass.WaitPackets, which waits forever and would hang instead of reddening. The seam test is the mirror of TestRejectVerdictNeverEndsInSilence: for five LAN destinations it asserts classify == Bypass, reject.Reply == nil, reject.RST != nil."
-        },
+        "note": "TestBypassInterfaceChangeRebindsSocket is a registered guard. The seen-is-refreshed-on-Send trap is closed twice over: the fake clock NEVER advances (sweepLocked cannot run at all while now.Sub(swept) < idle/2, so the idle sweep has nobody to collect — and the test asserts clk.Now() unchanged at the end), and the client keeps sending across the change, asserting the port does NOT move while the interface is stable and DOES move once it changes. Observable is the source port the listener sees, via listener.SetReadDeadline — fakenet.Bypass.WaitPackets is used nowhere, it waits forever. TestBypassIdleSweepNeverCollectsSocketUnderTraffic is documentation, not a guard: green under either state of the flag, it shows the sweep running on every Send for 7.5×Idle and never collecting the socket."
+      },
       {
-        "file": "internal/reject/reject_test.go",
-        "tests": [
-          "TestRSTAnswersWhereReplyStaysSilent",
-          "TestRSTOnlyForTCPAndNotForItself"
-        ],
-        "note": "The same seam asserted from the reject side, plus RST's own contract: nil for its own output (no loop), for UDP, for garbage and for nil."
+        "file": "internal/agent/rebind_test.go",
+        "tests": ["TestBypassSocketRebindsOnInterfaceChange"],
+        "note": "W47, the second registered guard: the Config.Physical → bypass.Config.Interface seam. Needed because Config.Interface is optional — a forgotten passthrough would leave the mechanism dead in production with the unit test green. Drives a real agent on a fake device with a listener on loopback and flips the interface name under live traffic."
       }
     ],
     "stayed_green": [
-      "TestT17MDNSGoesToLocalNetwork (internal/netstack) — untouched: mDNS is UDP and the UDP branch did not move.",
-      "TestT32ConfiguredBypassLeavesTunnel (internal/netstack) — untouched, same reason.",
-      "TestBypassSendErrorCountsAsBlocked (internal/netstack) — Stats.Blocked == 1 expectation deliberately NOT changed; the UDP refusal path is unchanged by design (see decision_udp_stays_a_drop).",
-      "TestT12FailCloseAnswersRST / TestT13FailCloseAnswersICMP — the Reject branch and reject_mode are untouched.",
-      "TestBypassMDNSReachesPhysicalInterfaceAndReturnsViaNAT (T31, internal/l3) — re-run under `unshare -Urn`; the whole internal/l3 suite PASS."
+      "the whole internal/bypass suite — the existing tests pass no Config.Interface, so socket.iface is empty and never counts as stale: exactly the pre-policy behavior",
+      "T31 (TestBypassMDNSReachesPhysicalInterfaceAndReturnsViaNAT, internal/l3) — re-run under `unshare -Urn`",
+      "T17, T32, T33 (internal/netstack)",
+      "TestBypassSendErrorCountsAsBlocked (internal/netstack) — untouched, the UDP refusal path did not move"
     ],
     "deviations": [
-      "packettest.ExpectRST / ExpectICMPUnreach changed from 'look at what is already there' to 'wait up to WaitTimeout'. Touching a neighbouring package inside this task — yes; the alternative was worse: a third test re-parsing TCP flags by hand instead of using the ready helper. Same clock and same channel as WaitEmitted, so realtimelint stays quiet.",
-      "The refusal is built per packet, not once per flow. The verdict is remembered (flowTable, §3.4) but the answer is not cached: a SYN retransmit arriving before the RST reaches the client produces a second RST. The Reject branch (T12) behaves the same way, and it is more correct than remembering 'already answered' — a client that missed the first answer must get the second.",
-      "A configuration bypass rule naming a TCP flow now gets an RST rather than reaching the local network. Not a regression in configurability but its honest boundary: the bypass path is a UDP NAT (§6.8) and configuration cannot gift it TCP. Before this pass such a rule dropped the packet silently — the same lie, only quieter."
+      "The signal is polled, not pushed — a departure from the shape the previous HANDOFF named first (NAT.Reset() from the watcher). Rejected in favour of something cheaper and more precise; argument in implementation-notes.md. Conservative in CLAUDE.md's sense: no new event source, no new goroutine, no change to the platform package.",
+      "The comparison runs on Send, so other clients' stale sockets are closed at the first Send by any client. While the NAT is entirely silent, stale sockets live on — harmless outbound (nothing goes out through them), with one residue: a receive goroutine could still accept a reply on the old interface in that window. That is exactly why the first Send closes ALL sockets with a foreign binding, not only the one it came for.",
+      "Stats grew a third field (Rebound) in a struct nothing in production reads yet (Stack.Stats does not fold it in — that is the next queue item). Added because the guard asserts the mechanism fired directly, not only via the port change."
     ],
     "spec_edits": [
-      "SPEC.md §8.3: new row T33.",
-      "SPEC.md §6.10: new paragraph 'Путь несёт только UDP, и TCP по нему получает отказ, а не дроп' — states the UDP-only contract, the RST for TCP, and the RFC 1122 reason UDP stays a drop."
+      "SPEC.md §6.8: new paragraph 'Следствие первое распространяется и на долгоживущие сокеты bypass' — the NAT remembers its binding, compares it on every send, closes what diverged; the idle sweep cannot play this role because service discovery retries continuously; a missing default route is not an interface change.",
+      "No §8.3 row: the claim is unit-level, exactly like both bypass_sink guards. No numbered T test was added."
+    ],
+    "not_done_on_purpose": [
+      "No L3 stand with a second veth (the shape HANDOFF suggested). It would exercise the kernel's SO_BINDTODEVICE rather than the decision to re-open the socket, and the kernel side of that path is already covered by T31.",
+      "No TTL. See decision_shape — shipping both without naming the load-bearing one is what the task forbade, and the TTL is not needed as a floor."
     ]
   },
   "next_task": {
     "priority": 1,
-    "name": "Invalidate bypass sockets on interface change",
-    "why_first": "It is the last known hole in the bypass path that is a hole rather than a deferred feature, and the previous pass wrote it up as such: 'дыра, а не решение'. §6.8's 'следствие первое' says outright that a socket's binding is immutable and a network change means the old sockets must be re-dialed. Nothing does that today, and the observable symptom is a growing Stats.Blocked with no explanation — or, worse, traffic leaving through the interface the user just left.",
+    "name": "Surface bypass.NAT.Stats() through netstack.Stack.Stats()",
+    "why_first": "It is the last piece of the bypass path that is invisible rather than absent, and this pass just made it worse in one specific way: bypass.Stats now carries three counters (Sockets, Orphaned, Rebound) and production reads none of them. Rebound in particular is the only way to tell 'the interface keeps flapping' from 'the network is fine', and it currently exists only for a test to read.",
     "current_state": [
-      "bypass.NAT binds every socket to whatever Selector.Interface() returned at its creation (internal/bypass/bypass.go, socketFor -> the Control func passed in Config) and never re-binds it. The NAT's lifetime is tied to a.stack (agent Up/Down), and switching Wi-Fi -> Ethernet tears down neither.",
-      "Worse: sock.seen is refreshed on every Send (internal/bypass/bypass.go, the socketFor path), not only on a successful round trip. A client that retries mDNS/SSDP every few seconds — and service discovery does exactly that — keeps a socket that is dead by binding alive forever: the Idle sweep (default 60 s) never sees it as idle. Not 'it will go away after 60 s of quiet' but 'it will never go away while the client keeps asking'.",
-      "Nothing ties the NAT's socket cache to outbound.Selector's interface-change signal. agent.NetworkChanged exists and is poked directly by tests; whether the event reaches it from the OS is checked by no level at all (docs/verification-agent.md says this about T6 and it holds for the wiring too).",
-      "Full writeup: implementation-notes.md, 'Этап 9 — BypassSink', Deviations, the paragraph 'Смена интерфейса не инвалидирует уже открытые bypass-сокеты — дыра, а не решение'."
+      "bypass.NAT.Stats() is unreachable in production: nothing outside internal/bypass/*_test.go calls it. Verified by grep at the time of writing.",
+      "netstack.Stack.Stats() (internal/netstack/netstack.go) folds in natTable's stats but not the bypass NAT's, even though the Stack holds the sink (Config.Bypass). The sink is typed as the netstack.BypassSink interface, which has Send only — so folding it in means either widening that interface or type-asserting for an optional Stats() method. That choice is the task.",
+      "Consequence today: the idle sweep of bypass sockets only ever runs on Send (Stats() is the other place it runs from, and nobody calls it), so after traffic stops the sockets persist until Down. Parity with natTable, not a regression — but it is the second reason to wire Stats up.",
+      "A neighbour the bypass_tcp_reject pass left: Stats.Rejected now counts bypass-TCP refusals alongside fail-close ones, and nothing in the snapshot distinguishes them."
     ],
-    "goal": "A bypass socket bound to an interface that is no longer the outbound interface stops being used: either it is closed on the interface-change signal and the next Send re-dials, or it dies of age regardless of traffic. Decide which — and argue it — rather than implementing both.",
-    "shapes": [
-      "NAT.Reset() called by outbound.Selector's rtnetlink watcher on interface change: close all sockets, next Send re-dials. Precise, but wiring it properly touches the watcher, which is why the BypassSink pass called it out of scope (the previous HANDOFF cited 'Global Constraint 9, constraints.md' — note that constraints.md does not exist anywhere in this repo or worktree, so that citation cannot be checked; treat the scope argument on its merits).",
-      "A hard TTL on socket age, independent of seen, so a socket dies by age even under continuous traffic. Cheaper and entirely inside internal/bypass, but it is a timer, not a signal: it papers over the symptom (a wedged socket) instead of reacting to the cause (the interface changed).",
-      "The two are not exclusive — the TTL is a floor under the signal — but shipping both without saying which one is the mechanism would leave the next reader unable to tell which is load-bearing."
-    ],
+    "goal": "Whatever eventually surfaces Stack.Stats (CLI status, metrics) can see bypass socket count, orphaned replies and rebinds. Decide and argue how the sink exposes them: widen netstack.BypassSink, or keep Send-only and type-assert an optional interface.",
     "reuse": [
-      "internal/agent already has NetworkChanged and already fans out events; the bypass NAT's lifetime already lives next to a.stack in Up/Down/watchService (internal/agent/wire.go).",
-      "bypass.NAT already has close() and a sweep on its own clock.Clock, so both shapes have somewhere to live.",
-      "internal/l3/bypass_test.go (T31) is the existing stand that drives a real physical interface in a netns; a second veth is the natural way to make an interface change real rather than mocked."
+      "internal/netstack/netstack.go — Stack.Stats() and the natTable folding it already does is the pattern to copy.",
+      "internal/bypass/bypass.go — Stats() already exists, already sweeps, already documented as unreachable in production (the doc comment says so in as many words; that comment must be corrected by this task, not left behind)."
     ],
     "test_gap": {
-      "stays_green": "T31 (TestBypassMDNSReachesPhysicalInterfaceAndReturnsViaNAT, internal/l3), T17, T32, T33, TestBypassSendErrorCountsAsBlocked, and the internal/bypass suite.",
-      "missing_and_needed": "A test where the interface changes under a live bypass socket and the next Send does NOT go out the old binding. On fakes this is a Control func that records which interface it was asked for; at L3 it is a second veth. Note the seen-is-refreshed-on-Send trap: the test must keep sending during the change, or it will pass for the wrong reason (the idle sweep collecting the socket)."
+      "stays_green": "the whole internal/bypass suite, T17, T31, T32, T33, TestBypassSendErrorCountsAsBlocked, and both bypass_rebind guards (TestBypassInterfaceChangeRebindsSocket, TestBypassSocketRebindsOnInterfaceChange).",
+      "missing_and_needed": "A test that drives a datagram through the Stack's bypass path and then reads a non-zero bypass socket count out of Stack.Stats() — i.e. asserting the fold, not the counter. internal/netstack already has the fake sink (internal/fakenet) and internal/agent/bypass_test.go already drives a real bypass.NAT end to end; either is a plausible home."
     },
     "flag_to_add": {
-      "name": "not yet chosen",
-      "note": "If it gets its own flag, register it in internal/policy/policies.go and write the guard test before the implementation — the order the last three passes followed. If it reuses an existing one (bypass_sink is the plausible candidate), say so explicitly in implementation-notes.md: the registry rule is about new flags, not about refusing to add one."
+      "name": "probably none",
+      "note": "Observability that nothing branches on is not a policy — there is no behavior to disable and no test that could go red for the right reason. If the task does grow a behavioral half (e.g. the sweep starts running off a ticker rather than off Send), THAT half gets the flag, and the guard is written before the implementation, as the last four passes did."
     }
   },
   "gate": {
@@ -126,7 +121,7 @@
       "go run ./cmd/realtimelint ."
     ],
     "notes": {
-      "negcheck": "runs every guard twice (with/without its policy) via `go test -count=1`; 38 policies as of this pass, ~20-35 min wall clock on this machine — this is expected, not a hang; don't rely on go test's cache. Per-task gate only needs the new policy's own guard under HOP_DISABLE=<name>; the controller runs the full one at the end of the pass.",
+      "negcheck": "runs every guard twice (with/without its policy) via `go test -count=1`; 39 policies as of this pass, ~20-35 min wall clock on this machine — this is expected, not a hang; don't rely on go test's cache. Per-task gate only needs the new policy's own guard under HOP_DISABLE=<name>; the controller runs the full one at the end of the pass.",
       "realtimelint": "does not accept ./... as an argument — pass literally `.`",
       "l3_how_to_run": "Build once, run under an unprivileged user namespace: `go test -c -o /tmp/l3.test ./internal/l3` then `HOP_L3=1 unshare -Urn /tmp/l3.test` (add `-test.v -test.run '<pattern>'` to scope it). This works without root — unshare -Urn grants CAP_NET_ADMIN inside the fresh netns. Building the test binary once and reusing it across repeated unshare invocations is much faster than `go test` per run when iterating.",
       "gate_correction": "go run ./cmd/realtimelint . is red on main and stayed exactly as red: 3 hits in internal/dnstest/realserver_test.go (lines 32, 72, 104) from commit 7916b55, no new ones — verified by comparing the full output, not the exit code. go vet ./... is likewise red at internal/engine/dialer.go:168 (copylocks in xray-core's SocketConfig), predating all these passes. `gofmt -l ./internal` reports internal/l2/dns_test.go, also pre-existing and untouched. The honest gate is 'no *new* findings' against these three.",
@@ -134,19 +129,15 @@
     },
     "rule": "every new policy must ship with a test that is red without it"
   },
-  "queue_after_bypass_tcp_reject": [
-    {
-      "task": "Surface bypass.NAT.Stats() through netstack.Stack.Stats()",
-      "detail": "bypass.NAT.Stats() is unreachable in production today — nothing outside internal/bypass/bypass_test.go calls it, and Stack.Stats() (internal/netstack/netstack.go) does not fold it in the way it folds in natTable's stats. In production the idle sweep of bypass sockets therefore only runs on Send, and persists until Down after traffic stops — parity with natTable, not a regression, but Stats() staying unreachable means bypass socket/goroutine counts are invisible to whatever eventually surfaces Stack.Stats (CLI status, metrics).",
-      "note": "the BypassSink pass's final review (finding 9) fixed only the Stats() doc comment to say this plainly; wiring it into Stack.Stats is this queue item. Note it has grown a neighbour: this pass's Stats.Rejected now counts bypass-TCP refusals alongside fail-close ones, and nothing distinguishes them in the snapshot."
-    },
+  "queue_after_bypass_rebind": [
     {
       "task": "IPv6 blocking under ipv6_block",
       "red_without_it": "T28, internal/l3/tunnel_test.go"
     },
     {
       "task": "macOS dataplane",
-      "detail": "utun via AF_SYSTEM, SIOCAIFADDR, PF_ROUTE"
+      "detail": "utun via AF_SYSTEM, SIOCAIFADDR, PF_ROUTE",
+      "note": "bypass_rebind is Linux-shaped only in its source: the NAT compares interface NAMES, and Selector.Interface on macOS/Windows must publish the same thing for the mechanism to keep working there. internal/outbound/selector_other.go is the stub to look at."
     },
     {
       "task": "Windows dataplane",
