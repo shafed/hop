@@ -1,0 +1,7 @@
+{
+  "branch": "worktree-here",
+  "note": "Патч /tmp/hop-doc-fixes.patch уже применён; тесты в internal/thing/thing_test.go.",
+  "changed_files": [
+    { "path": "internal/thing/thing_test.go", "what": "тест фикстуры" }
+  ]
+}

@@ -12,12 +12,12 @@ import (
 	"time"
 )
 
-// TestBypassMDNSReachesPhysicalInterfaceAndReturnsViaNAT — L3-версия того, что
-// internal/agent/bypass_test.go доказывает на фейковом устройстве и loopback:
-// весь путь agent → netstack (вердикт Bypass) → bypass.NAT → физический
-// сокет → обратно, но здесь физический интерфейс настоящий (veth), а не
-// фейковая заглушка. Симметрично тому, чем interrupt_test.go стал для W8/W14
-// (harness_test.go).
+// TestBypassMDNSReachesPhysicalInterfaceAndReturnsViaNAT — T31 из §8.4:
+// L3-версия того, что internal/agent/bypass_test.go доказывает на фейковом
+// устройстве и loopback: весь путь agent → netstack (вердикт Bypass) →
+// bypass.NAT → физический сокет → обратно, но здесь физический интерфейс
+// настоящий (veth), а не фейковая заглушка. Симметрично тому, чем
+// interrupt_test.go стал для W8/W14 (harness_test.go).
 //
 // В продукте mDNS до туннеля не доходит вовсе: 224.0.0.0/4 стоит правилом
 // выше туннельного (internal/platform.LocalPrefixes, prioExclusions в

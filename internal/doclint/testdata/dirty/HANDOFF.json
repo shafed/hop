@@ -1,0 +1,7 @@
+{
+  "branch": "worktree-gone",
+  "note": "Ветка отведена от worktree-here; файл internal/thing/nope.go описывает шов.",
+  "changed_files": [
+    { "path": "internal/thing/thing_test.go", "what": "тест фикстуры" }
+  ]
+}
