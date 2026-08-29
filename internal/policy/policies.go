@@ -288,6 +288,24 @@ var (
 		},
 	}
 
+	// BypassTCPReject — TCP в локальную сеть, который приёмник bypass не
+	// несёт, получает RST, а не молчаливый дроп (§5.6, §6.10). Выключение
+	// возвращает дроп: приложение висит до своего connect timeout, ровно то
+	// поведение, из-за которого §5.6 написан. Краснит T33.
+	//
+	// Флаг свой, а не reject_mode: тот гасит **fail-close**, и в его doc так и
+	// написано; здесь узлы живы, вердикт — bypass, и отказ означает «этим
+	// путём такой поток не пройдёт», а не «выхода нет». Сосед по смыслу —
+	// bypass_sink, тоже про путь bypass, тоже с молчаливым дропом в
+	// выключенном состоянии; довод целиком — в implementation-notes.md.
+	BypassTCPReject = &Policy{
+		Name: "bypass_tcp_reject",
+		Doc:  "TCP с вердиктом bypass получает RST, а не дроп (§5.6, §6.10, T33)",
+		Guards: []Guard{
+			{Pkg: "./internal/netstack", Test: "^TestT33TCPToLocalNetworkGetsRST$"},
+		},
+	}
+
 	// RoutingLists — списки §6.10 приходят из конфигурации, а не зашиты в
 	// verdict.go. Выключение возвращает жёсткий набор: конфиг игнорируется
 	// целиком, и стек ведёт себя ровно как до этой политики. Краснеют оба
@@ -504,6 +522,7 @@ func All() []*Policy {
 		VerdictOrder,
 		RejectMode,
 		BypassSink,
+		BypassTCPReject,
 		NATKey,
 		RoutingLists,
 		KOfN,
