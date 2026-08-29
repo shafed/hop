@@ -414,6 +414,17 @@ W36 проверяет обе стороны fail-close: Xray получает `
 добавляет к нему один проброс, `Config.Routing` → `netstack.Config.Routing`, —
 ровно как у `Config.DNSUpstreams`, у которого своей W-строки тоже нет.
 
+`bypass_tcp_reject` (TCP с вердиктом bypass получает RST, а не дроп) — по той же
+причине и без W-строки: решение принимается в `netstack.handle`, связка о нём не
+знает вовсе и ничего не пробрасывает. Краснеющая проверка — T33
+(`TestT33TCPToLocalNetworkGetsRST`, `internal/netstack`), шов между
+`reject.Excluded` и вердиктом `Bypass` держат
+`TestBypassTCPNeedsRSTBecauseReplyStaysSilent` (`internal/netstack`) и
+`TestRSTAnswersWhereReplyStaysSilent` (`internal/reject`). Флаг не слит с
+`reject_mode` намеренно: тот про fail-close, а T33 гоняется при живом узле —
+довод целиком в `implementation-notes.md`, «Этап 9 — RST для TCP в локальную
+сеть».
+
 ---
 
 ## 6.1 Состояние регистра

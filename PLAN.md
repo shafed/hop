@@ -535,10 +535,11 @@ health-пробы и HTTP-подписки. `AgentUID` удалён; cleanup с�
 
 **Что осталось.** `BypassSink` стал реальным NAT-путём через тот же
 `outbound.Selector` (`internal/bypass`, провод в `internal/agent/wire.go` и
-`internal/netstack/netstack.go`) — только UDP, TCP в локальную сеть остаётся
-дропом (см. `implementation-notes.md`, «Deviations»); это следующий незакрытый
-пункт: отвечать на него RST тем же `internal/reject`, что обслуживает вердикт
-`Reject`. Списки bypass/block §6.10 из кода ушли: `netstack.Routing` —
+`internal/netstack/netstack.go`) — только UDP; TCP в локальную сеть больше не
+дроп, а RST: `reject.RST` (тот же построитель, что у `Reply`, но без вопроса
+`Excluded`, который молчит на всю локальную сеть) под флагом
+`bypass_tcp_reject`, T33 в §8.3. UDP, отвергнутый приёмником, ICMP не получает —
+довод в `implementation-notes.md`. Списки bypass/block §6.10 из кода ушли: `netstack.Routing` —
 два списка правил «префикс + протокол + порт», `netstack.Config.Routing` и
 `agent.Config.Routing` (пусто — умолчания §6.10), исключения §5.6 из
 конфигурации не вынимаются, обнаружение служб — вынимается. Нужно закрыть IPv6,
@@ -556,7 +557,10 @@ L3-тест bypass построен: `internal/l3/bypass_test.go`,
 `TestBypassMDNSReachesPhysicalInterfaceAndReturnsViaNAT` (T31, §8.4) —
 mDNS-запрос из туннеля виден на физическом интерфейсе, ответ возвращается
 клиенту через NAT. Списки §6.10 из конфигурации проверяет T32 (§8.3) плюс пять
-тестов вердикта в `internal/netstack/routing_test.go`. macOS и Windows прогоняются по расписанию, с T22 и T23-slow
+тестов вердикта в `internal/netstack/routing_test.go`. Отказ вместо дропа на
+пути bypass — T33 (§8.3) плюс два теста шва между `reject.Excluded` и вердиктом
+`Bypass`: `TestBypassTCPNeedsRSTBecauseReplyStaysSilent` (`internal/netstack`) и
+`TestRSTAnswersWhereReplyStaysSilent` (`internal/reject`). macOS и Windows прогоняются по расписанию, с T22 и T23-slow
 первыми.
 
 **Что должно сломаться при выключении.** Отсутствие binding → W36/T25;
@@ -565,7 +569,10 @@ mDNS-запрос из туннеля виден на физическом ин�
 с прежним жёстким набором. `bypass_sink=off` →
 `TestBypassSendsDatagramFromBoundSocket` и `TestBypassReplyReturnsToClient`
 (`internal/bypass`) и T31 (L3) краснеют, а T17 остаётся зелёным, потому что он
-проверяет только вердикт, не доставку. Без реестра релеев
+проверяет только вердикт, не доставку. `bypass_tcp_reject=off` → T33: RST не
+строится, и тест ждёт полный `WaitTimeout` — то самое молчание, которое §5.6
+запрещает; `TestBypassSendErrorCountsAsBlocked` при этом зелен при любом её
+состоянии, потому что UDP-путь она не трогает. Без реестра релеев
 `TestInterruptTCPClosesLiveConnection` и его соседи в `internal/netstack` не
 собираются вовсе — они падают на этапе компиляции, если `Stack.InterruptTCP`
 убрать, а не только на ассерте.
