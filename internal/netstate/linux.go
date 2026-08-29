@@ -28,6 +28,12 @@ var sections = []struct {
 	{"addrs", []string{"-o", "addr", "show"}},
 	{"routes", []string{"-o", "route", "show", "table", "all"}},
 	{"rules", []string{"-o", "rule", "show"}},
+	// Правила IPv6 живут в отдельной базе, и `ip rule show` их не показывает.
+	// Без этого раздела правило блокировки IPv6 (§6.9), пережившее down,
+	// оставило бы §8.4 зелёным: замер — снапшот вокруг `ip -6 rule add`
+	// не менялся вовсе. Маршруты IPv6 добирать не пришлось: `route show
+	// table all` печатает оба семейства сразу.
+	{"rules6", []string{"-o", "-6", "rule", "show"}},
 }
 
 func (linuxSource) Capture() (Snapshot, error) {

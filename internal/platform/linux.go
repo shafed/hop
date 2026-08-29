@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/shafed/hop/internal/netstate"
+	"github.com/shafed/hop/internal/policy"
 	"github.com/shafed/hop/internal/reject"
 	"github.com/shafed/hop/internal/tunnel"
 	"golang.org/x/sys/unix"
@@ -136,6 +137,23 @@ type step struct {
 // netstate.Journal.Rollback), поэтому первый шаг снимается последним.
 func upSteps(p tunnel.Params) []step {
 	var steps []step
+
+	// §6.9: IPv6 закрывается первым и снимается последним — при любом исходе
+	// нет момента, когда туннель уже (или ещё) существует, а IPv6 открыт.
+	//
+	// Правило, а не маршрут в таблице туннеля, потому что утечка идёт не через
+	// туннель: замер показал, что при поднятом туннеле `ip -6 route get` ведёт
+	// на физический интерфейс через main, а таблица туннеля в IPv6 пуста и в
+	// поиске не участвует вовсе. Тип unreachable, а не blackhole: §5.6 требует
+	// отказа, а не молчания, и приложение получает ENETUNREACH мгновенно.
+	// Подробности замера — implementation-notes.md.
+	if policy.IPv6Block.On() {
+		steps = append(steps, step{
+			"ipv6 block",
+			ip6("rule", "add", "unreachable", "priority", fmt.Sprint(prioTunnel)),
+			ip6("rule", "del", "unreachable", "priority", fmt.Sprint(prioTunnel)),
+		})
+	}
 
 	steps = append(steps,
 		step{"mtu", ip("link", "set", "dev", p.Name, "mtu", fmt.Sprint(p.MTU)), nil},
@@ -271,12 +289,20 @@ func (l *Linux) Down() error {
 // Опознаются правила по приоритетам, которые раскладывает только hopd.
 func Reclaim() (int, error) {
 	dropped := 0
-	for _, prio := range []int{prioExclusions, legacyPrioLoopGuard, prioTunnel} {
-		for i := 0; i < 64; i++ {
-			if err := run(ip("rule", "del", "priority", fmt.Sprint(prio)))(); err != nil {
-				break // правил с этим приоритетом больше нет
+	// Оба семейства: правила IPv6 живут в собственной базе, `ip rule del` их
+	// не видит, а пережить смерть сервиса они могут ровно так же (§6.9, T29).
+	// Уборка идёт при любом состоянии ipv6_block: убирать за предыдущим
+	// воплощением — не политика, а обязанность старта (§6.2), и прошлая
+	// сборка могла разложить правило при включённой политике.
+	for _, family := range [][]string{ip("rule", "del"), ip6("rule", "del")} {
+		for _, prio := range []int{prioExclusions, legacyPrioLoopGuard, prioTunnel} {
+			for i := 0; i < 64; i++ {
+				args := append(append([]string(nil), family...), "priority", fmt.Sprint(prio))
+				if err := run(args)(); err != nil {
+					break // правил с этим приоритетом больше нет
+				}
+				dropped++
 			}
-			dropped++
 		}
 	}
 	return dropped, nil
