@@ -25,8 +25,8 @@ var lanHost = netip.MustParseAddrPort("192.168.1.10:445")
 // Именно поэтому охраняет он свой флаг, bypass_tcp_reject, а не reject_mode.
 //
 // Охраняющий тест bypass_tcp_reject: с выключенной политикой RST не строится
-// вовсе, и WaitEmitted ждёт полный таймаут — то самое поведение, ради которого
-// написан §5.6.
+// вовсе, и ExpectRST ждёт полный WaitTimeout — то самое молчание, ради запрета
+// которого написан §5.6.
 func TestT33TCPToLocalNetworkGetsRST(t *testing.T) {
 	h := newHarness(t, true)
 
