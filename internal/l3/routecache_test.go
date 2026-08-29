@@ -34,6 +34,15 @@ const (
 	peerPort   = 9099
 	probeTable = 8422
 	probePrio  = 1000
+
+	// IPv6-половина того же стенда — для T28. Адреса ULA (fd00::/8), не
+	// link-local: link-local ядро раздаёт само, и по нему нельзя отличить
+	// «маршрутизируемый IPv6 закрыт» от «IPv6 нет вовсе». Обе стороны
+	// адресуются nodad, иначе DAD держит адрес tentative и первые ~секунду
+	// им нельзя пользоваться.
+	peer6CIDR  = "fd00:9:9::2/64"
+	peer6Addr  = "fd00:9:9::2"
+	local6CIDR = "fd00:9:9::1/64"
 )
 
 func TestRouteReplaceOnEstablishedConnection(t *testing.T) {
@@ -183,6 +192,7 @@ func peerMain() {
 	for _, args := range [][]string{
 		{"ip", "link", "set", "lo", "up"},
 		{"ip", "addr", "add", peerCIDR, "dev", "veth1"},
+		{"ip", "-6", "addr", "add", peer6CIDR, "dev", "veth1", "nodad"},
 		{"ip", "link", "set", "veth1", "up"},
 	} {
 		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
@@ -195,13 +205,27 @@ func peerMain() {
 	// протокол на другом порту, TCP-эхо не трогает.
 	startMDNSResponder()
 
+	// Второй слушатель, тот же эхо-протокол по IPv6 — для T28. Отдельный
+	// сокет, а не dual-stack на "[::]": T28 утверждает, что до пира не дошло
+	// именно по IPv6, и слушатель, принимающий заодно IPv4, это утверждение
+	// размывал бы.
+	ln6, err := net.Listen("tcp6", fmt.Sprintf("[%s]:%d", peer6Addr, peerPort))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "пир: listen6:", err)
+		os.Exit(1)
+	}
+	go acceptEcho(ln6)
+
 	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", peerAddr, peerPort))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "пир: listen:", err)
 		os.Exit(1)
 	}
 	fmt.Println("ready")
+	acceptEcho(ln)
+}
 
+func acceptEcho(ln net.Listener) {
 	for {
 		c, err := ln.Accept()
 		if err != nil {

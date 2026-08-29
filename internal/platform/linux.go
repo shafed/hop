@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/shafed/hop/internal/netstate"
+	"github.com/shafed/hop/internal/policy"
 	"github.com/shafed/hop/internal/reject"
 	"github.com/shafed/hop/internal/tunnel"
 	"golang.org/x/sys/unix"
@@ -116,6 +117,80 @@ func (d *tunDevice) WritePackets(bufs [][]byte) error {
 	return nil
 }
 
+// step — одно изменение сети вместе со своим откатом.
+//
+// Список шагов строится отдельно от их исполнения (upSteps) по той же
+// причине, по которой §6.2 вынес респондер в чистую функцию: решение «что
+// раскладывать» проверяется без прав, а раскладывание — нет. Иначе
+// единственным способом убедиться, что шаг вообще есть в списке, остаётся
+// привилегированный прогон в netns.
+type step struct {
+	name     string
+	add, del []string
+}
+
+// upSteps — что Up раскладывает и как каждый шаг откатывается. Чистая
+// функция от параметров туннеля: ничего не выполняет и ни от чего не зависит,
+// кроме флагов политик.
+//
+// Порядок значим дважды: журнал откатывает шаги в обратном порядке (LIFO,
+// netstate.Journal.Rollback), поэтому первый шаг снимается последним.
+func upSteps(p tunnel.Params) []step {
+	var steps []step
+
+	// §6.9: IPv6 закрывается первым и снимается последним — при любом исходе
+	// нет момента, когда туннель уже (или ещё) существует, а IPv6 открыт.
+	//
+	// Правило, а не маршрут в таблице туннеля, потому что утечка идёт не через
+	// туннель: замер показал, что при поднятом туннеле `ip -6 route get` ведёт
+	// на физический интерфейс через main, а таблица туннеля в IPv6 пуста и в
+	// поиске не участвует вовсе. Тип unreachable, а не blackhole: §5.6 требует
+	// отказа, а не молчания, и приложение получает ENETUNREACH мгновенно.
+	// Подробности замера — implementation-notes.md.
+	if policy.IPv6Block.On() {
+		steps = append(steps, step{
+			"ipv6 block",
+			ip6("rule", "add", "unreachable", "priority", fmt.Sprint(prioTunnel)),
+			ip6("rule", "del", "unreachable", "priority", fmt.Sprint(prioTunnel)),
+		})
+	}
+
+	steps = append(steps,
+		step{"mtu", ip("link", "set", "dev", p.Name, "mtu", fmt.Sprint(p.MTU)), nil},
+		step{"addr", ip("addr", "add", p.Addr, "dev", p.Name), ip("addr", "del", p.Addr, "dev", p.Name)},
+		step{"up", ip("link", "set", "dev", p.Name, "up"), ip("link", "set", "dev", p.Name, "down")},
+		// Откат удаляет маршрут по месту (таблица + префикс), а не по форме:
+		// форма зависит от того, чем маршрут оказался к моменту уборки, а место
+		// — нет.
+		step{"route",
+			ip("route", "add", "default", "dev", p.Name, "table", fmt.Sprint(p.Table)),
+			ip("route", "del", "default", "table", fmt.Sprint(p.Table))},
+	)
+	for _, pfx := range LocalPrefixes {
+		steps = append(steps, step{
+			"exclude " + pfx,
+			ip("rule", "add", "to", pfx, "lookup", "main", "priority", fmt.Sprint(prioExclusions)),
+			ip("rule", "del", "to", pfx, "lookup", "main", "priority", fmt.Sprint(prioExclusions)),
+		})
+	}
+	for _, r := range ExcludedUDPPorts {
+		port := fmt.Sprint(r[0])
+		if r[1] != r[0] {
+			port = fmt.Sprintf("%d-%d", r[0], r[1])
+		}
+		steps = append(steps, step{
+			"exclude udp/" + port,
+			ip("rule", "add", "ipproto", "udp", "dport", port, "lookup", "main", "priority", fmt.Sprint(prioExclusions)),
+			ip("rule", "del", "ipproto", "udp", "dport", port, "lookup", "main", "priority", fmt.Sprint(prioExclusions)),
+		})
+	}
+	return append(steps, step{
+		"tunnel rule",
+		ip("rule", "add", "lookup", fmt.Sprint(p.Table), "priority", fmt.Sprint(prioTunnel)),
+		ip("rule", "del", "lookup", fmt.Sprint(p.Table), "priority", fmt.Sprint(prioTunnel)),
+	})
+}
+
 // Up создаёт интерфейс, вешает адрес и раскладывает маршруты и правила.
 //
 // Каждый шаг идёт через журнал вместе со своим откатом: восстановление
@@ -132,50 +207,7 @@ func (l *Linux) Up(p tunnel.Params) (tunnel.Device, error) {
 	// Down, и порядок ровно тот, что нужен — сначала снимаются адреса,
 	// маршруты и правила, и только потом с последним дескриптором уходит сам
 	// интерфейс. Закрыть его здесь значило бы закрыть дважды.
-	steps := []struct {
-		name     string
-		add, del []string
-	}{
-		{"mtu", ip("link", "set", "dev", p.Name, "mtu", fmt.Sprint(p.MTU)), nil},
-		{"addr", ip("addr", "add", p.Addr, "dev", p.Name), ip("addr", "del", p.Addr, "dev", p.Name)},
-		{"up", ip("link", "set", "dev", p.Name, "up"), ip("link", "set", "dev", p.Name, "down")},
-		// Откат удаляет маршрут по месту (таблица + префикс), а не по форме:
-		// форма зависит от того, чем маршрут оказался к моменту уборки, а место
-		// — нет.
-		{"route", l.tunnelRoute("add"), ip("route", "del", "default", "table", fmt.Sprint(p.Table))},
-	}
-	for _, pfx := range LocalPrefixes {
-		steps = append(steps, struct {
-			name     string
-			add, del []string
-		}{
-			"exclude " + pfx,
-			ip("rule", "add", "to", pfx, "lookup", "main", "priority", fmt.Sprint(prioExclusions)),
-			ip("rule", "del", "to", pfx, "lookup", "main", "priority", fmt.Sprint(prioExclusions)),
-		})
-	}
-	for _, r := range ExcludedUDPPorts {
-		port := fmt.Sprint(r[0])
-		if r[1] != r[0] {
-			port = fmt.Sprintf("%d-%d", r[0], r[1])
-		}
-		steps = append(steps, struct {
-			name     string
-			add, del []string
-		}{
-			"exclude udp/" + port,
-			ip("rule", "add", "ipproto", "udp", "dport", port, "lookup", "main", "priority", fmt.Sprint(prioExclusions)),
-			ip("rule", "del", "ipproto", "udp", "dport", port, "lookup", "main", "priority", fmt.Sprint(prioExclusions)),
-		})
-	}
-	steps = append(steps, struct {
-		name     string
-		add, del []string
-	}{
-		"tunnel rule",
-		ip("rule", "add", "lookup", fmt.Sprint(p.Table), "priority", fmt.Sprint(prioTunnel)),
-		ip("rule", "del", "lookup", fmt.Sprint(p.Table), "priority", fmt.Sprint(prioTunnel)),
-	})
+	steps := upSteps(p)
 
 	for _, s := range steps {
 		s := s
@@ -246,10 +278,6 @@ func (l *Linux) Down() error {
 	return l.j.Rollback()
 }
 
-func (l *Linux) tunnelRoute(verb string) []string {
-	return ip("route", verb, "default", "dev", l.params.Name, "table", fmt.Sprint(l.params.Table))
-}
-
 // Reclaim снимает правила, оставшиеся от предыдущего воплощения сервиса.
 //
 // T29 показал, что смерть сервиса переживают его правила: интерфейс уходит с
@@ -261,18 +289,31 @@ func (l *Linux) tunnelRoute(verb string) []string {
 // Опознаются правила по приоритетам, которые раскладывает только hopd.
 func Reclaim() (int, error) {
 	dropped := 0
-	for _, prio := range []int{prioExclusions, legacyPrioLoopGuard, prioTunnel} {
-		for i := 0; i < 64; i++ {
-			if err := run(ip("rule", "del", "priority", fmt.Sprint(prio)))(); err != nil {
-				break // правил с этим приоритетом больше нет
+	// Оба семейства: правила IPv6 живут в собственной базе, `ip rule del` их
+	// не видит, а пережить смерть сервиса они могут ровно так же (§6.9, T29).
+	// Уборка идёт при любом состоянии ipv6_block: убирать за предыдущим
+	// воплощением — не политика, а обязанность старта (§6.2), и прошлая
+	// сборка могла разложить правило при включённой политике.
+	for _, family := range [][]string{ip("rule", "del"), ip6("rule", "del")} {
+		for _, prio := range []int{prioExclusions, legacyPrioLoopGuard, prioTunnel} {
+			for i := 0; i < 64; i++ {
+				args := append(append([]string(nil), family...), "priority", fmt.Sprint(prio))
+				if err := run(args)(); err != nil {
+					break // правил с этим приоритетом больше нет
+				}
+				dropped++
 			}
-			dropped++
 		}
 	}
 	return dropped, nil
 }
 
 func ip(args ...string) []string { return append([]string{"ip"}, args...) }
+
+// ip6 — тот же ip, но по семейству IPv6. Отдельная обёртка, а не аргумент:
+// «-6» стоит первым и его забывчивость молча превращает правило IPv6 в
+// правило IPv4 с тем же приоритетом.
+func ip6(args ...string) []string { return append([]string{"ip", "-6"}, args...) }
 
 func run(args []string) func() error {
 	if args == nil {
