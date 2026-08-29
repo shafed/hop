@@ -20,12 +20,26 @@ import (
 // В продукте это outbound.Selector.Control.
 type ControlFunc func(network, address string, c syscall.RawConn) error
 
+// InterfaceFunc — имя текущего физического интерфейса по умолчанию (§6.8).
+// В продукте это outbound.Selector.Interface: тот же rtnetlink-наблюдатель,
+// чей ответ Control кладёт свежему сокету в SO_BINDTODEVICE. Форма совпадает с
+// engine.InterfaceFunc — связка передаёт сюда ровно то же значение
+// (agent.Config.Physical).
+type InterfaceFunc func() (string, error)
+
 // Config — всё, от чего зависит NAT.
 type Config struct {
 	Control ControlFunc      // обязателен
 	Reply   func(pkt []byte) // обратный путь: собранный IPv4/UDP-пакет в туннель
 	Clock   clock.Clock      // nil → clock.System{}
 	Idle    time.Duration    // 0 → 60 с, как netstack.defaultUDPIdle
+	// Interface — чем NAT узнаёт, что интерфейс сменился («следствие первое»
+	// §6.8). Не обязателен: nil означает «сравнивать не с чем», и сокеты
+	// живут как до этой политики — до Idle или до Close. Обязательным не
+	// сделан намеренно, потому что Config.Bypass у связки старше и тесты
+	// подставляют NAT без всякого физического интерфейса; проводку в
+	// продукте держит отдельная проверка шва (W47).
+	Interface InterfaceFunc
 }
 
 // defaultIdle — то же значение, что netstack.defaultUDPIdle: простой UDP §5.3
@@ -54,6 +68,10 @@ type socket struct {
 	conn net.PacketConn
 	src  netip.AddrPort
 	seen time.Time
+	// iface — имя интерфейса, к которому Control привязал этот сокет.
+	// Привязка неизменна (§6.8), поэтому поле пишется один раз при создании
+	// и дальше только сравнивается с нынешним интерфейсом.
+	iface string
 }
 
 // NAT — full-cone UDP NAT для вердикта bypass (§6.10). Та же форма, что
@@ -69,6 +87,7 @@ type NAT struct {
 	mu       sync.Mutex
 	socks    map[netip.AddrPort]*socket
 	orphaned int64
+	rebound  int64
 	closed   bool
 	swept    time.Time
 
@@ -126,6 +145,11 @@ func (n *NAT) Send(pkt []byte) error {
 // — отказ всего Send, а не непривязанный сокет: непривязанный сокет здесь и
 // есть петля, ради предотвращения которой §6.8 написан.
 func (n *NAT) socketFor(src netip.AddrPort) (*socket, error) {
+	// Опрос интерфейса — до захвата n.mu: колбэк чужой (в продукте это
+	// outbound.Selector под своим RWMutex), и звать его под своим замком
+	// незачем.
+	iface, known := n.currentInterface()
+
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.closed {
@@ -144,7 +168,10 @@ func (n *NAT) socketFor(src netip.AddrPort) (*socket, error) {
 	if err != nil {
 		return nil, err
 	}
-	sock := &socket{conn: conn, src: src, seen: now}
+	if !known {
+		iface = ""
+	}
+	sock := &socket{conn: conn, src: src, seen: now, iface: iface}
 	n.socks[src] = sock
 	n.wg.Add(1)
 	go func() {
@@ -152,6 +179,22 @@ func (n *NAT) socketFor(src netip.AddrPort) (*socket, error) {
 		n.receive(sock)
 	}()
 	return sock, nil
+}
+
+// currentInterface — нынешний исходящий интерфейс и признак того, что ответ
+// вообще получен. Ложь означает «сравнивать не с чем»: колбэка нет либо
+// default route сейчас нет вовсе. Второе — законное переходное состояние
+// ноутбука (§6.8, outbound.New), и рвать по нему живой сокет значило бы
+// превращать мгновенную неготовность в жёсткий отказ.
+func (n *NAT) currentInterface() (string, bool) {
+	if n.cfg.Interface == nil {
+		return "", false
+	}
+	name, err := n.cfg.Interface()
+	if err != nil || name == "" {
+		return "", false
+	}
+	return name, true
 }
 
 // receive — обратный путь. full-cone (§5.3): ответ принимается с любого
@@ -215,6 +258,10 @@ func (n *NAT) Close() {
 type Stats struct {
 	Sockets  int
 	Orphaned int64
+	// Rebound — сколько сокетов закрыто из-за того, что их интерфейс перестал
+	// быть исходящим (§6.8, политика bypass_rebind). Растущее значение при
+	// стоящей сети означало бы, что Interface отвечает неустойчиво.
+	Rebound int64
 }
 
 // Stats попутно подчищает простаивающие сокеты — то же совмещение, что у
@@ -228,7 +275,7 @@ func (n *NAT) Stats() Stats {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.sweepLocked(n.clk.Now())
-	return Stats{Sockets: len(n.socks), Orphaned: n.orphaned}
+	return Stats{Sockets: len(n.socks), Orphaned: n.orphaned, Rebound: n.rebound}
 }
 
 // addrPort — адрес отвечающего в виде, пригодном для обратного пакета.

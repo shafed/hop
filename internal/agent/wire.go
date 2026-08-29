@@ -317,6 +317,12 @@ func (a *Agent) Up() error {
 			Control: a.cfg.BypassControl,
 			Reply:   a.deliverBypass,
 			Clock:   a.clk,
+			// Тот же селектор, что уже питает Control и сокеты Xray: NAT
+			// сравнивает привязку сокета с нынешним интерфейсом и
+			// переоткрывает сокет, когда тот сменился (§6.8, «следствие
+			// первое»). Проброс, а не новый источник события: наблюдатель
+			// rtnetlink уже есть, и Interface — его же публикуемый ответ.
+			Interface: bypass.InterfaceFunc(a.cfg.Physical),
 		})
 		if err != nil {
 			_ = a.cfg.Trans.Release()
