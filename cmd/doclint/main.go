@@ -40,7 +40,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, f)
 	}
 	if len(found) > 0 {
-		fmt.Fprintf(os.Stderr, "doclint: %d утверждений без исполнимой проверки\n", len(found))
+		fmt.Fprintf(os.Stderr, "doclint: утверждений без исполнимой проверки: %d\n", len(found))
 		os.Exit(1)
 	}
 	fmt.Println("doclint: чисто")

@@ -127,11 +127,18 @@ func Check(cfg Config) ([]Finding, error) {
 	r.numbers(spec, true)
 	r.paths(spec)
 
-	notes, err := readMarkdown(cfg.Root, fileNotes)
-	if err != nil {
-		return nil, err
+	// Список исключений — тоже документ: причина, ссылающаяся на
+	// несуществующий файл, — ровно та гниль, против которой всё это.
+	for _, name := range []string{fileNotes, AllowList} {
+		doc, err := readMarkdown(cfg.Root, name)
+		if os.IsNotExist(err) && name == AllowList {
+			continue // списка исключений может не быть вовсе
+		}
+		if err != nil {
+			return nil, err
+		}
+		r.paths(doc)
 	}
-	r.paths(notes)
 
 	if err := r.handoff(); err != nil {
 		return nil, err
