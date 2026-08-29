@@ -2,6 +2,7 @@ package netstack
 
 import (
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -69,11 +70,57 @@ func TestW59IdleEntryIsCollectedWithoutTraffic(t *testing.T) {
 		"всё ещё в снимке: уборка по-прежнему едет только на чужом событии")
 }
 
+// sweepers — сколько сейчас живёт горутин фоновой уборки natTable.
+//
+// По стеку, а не по runtime.NumGoroutine(): счётчик горутин отвечает на другой
+// вопрос. Замер (контроллер, слияние прохода W59): проверка, сравнивавшая
+// NumGoroutine до и после New, оставалась зелёной даже с ЗАКОММЕНТИРОВАННЫМ
+// startIdleSweeper — в счётчик попадает всё, что в этот момент заводит или
+// доживает рантайм, и «горутин стало больше» не значит «завелась именно та».
+// Имя функции в дампе стека — единственное, что здесь различает уборщика.
+func sweepers() int {
+	// Буфер растёт, пока дамп не влезет целиком: runtime.Stack молча
+	// обрезает по длине, а обрезанный дамп даёт заниженное число — то есть
+	// зелёную проверку там, где горутина есть. Замер: на 64 КиБ и пяти
+	// прогонах подряд счёт срывался с 1 на 0 и на 3.
+	buf := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return strings.Count(string(buf[:n]), "netstack.(*natTable).sweepLoop")
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+}
+
+// waitSweepers ждёт, пока число живых уборщиков не станет want.
+//
+// Ожидание, а не снимок, и с обеих сторон. Замер (контроллер, слияние прохода
+// W59): только что заведённая горутина в дампе появляется НЕ мгновенно —
+// снимок сразу после New видел ноль примерно на одном прогоне из двадцати; а
+// после Close горутина, чей `defer Done()` уже выполнен, ещё доживает
+// несколько инструкций и мгновение видна. Утверждения это не ослабляет:
+// незаведённая уборка не заведётся и за две секунды, пережившая владельца — не
+// исчезнет.
+func waitSweepers(t *testing.T, want int, why string) {
+	t.Helper()
+	deadline := time.Now().Add(packettest.WaitTimeout) //hop:realtime
+	for {
+		n := sweepers()
+		if n == want {
+			return
+		}
+		if time.Now().After(deadline) { //hop:realtime
+			t.Fatalf("уборщиков %d, ожидалось %d: %s", n, want, why)
+		}
+		time.Sleep(time.Millisecond) //hop:realtime
+	}
+}
+
 // TestW59SweepDoesNotOutliveClose — цена механизма, измеренная явно. Фоновая
 // уборка — это горутина и тикер, то есть ровно та пара, которой свойственно
 // пережить владельца. Стек заводится и закрывается, не отправив ни одной
-// датаграммы: горутин чтения NAT нет вовсе, поэтому всё, что видно счётчику
-// горутин, — это уборщик natTable.
+// датаграммы.
 //
 // Проверка не охраняет политику: при выключенной она пропускается — уборщика
 // нет, течь нечему. Охраняет TestW59IdleEntryIsCollectedWithoutTraffic.
@@ -82,33 +129,25 @@ func TestW59SweepDoesNotOutliveClose(t *testing.T) {
 		t.Skip("nat_idle_sweep выключен: фоновой уборки нет, течь нечему")
 	}
 
-	before := runtime.NumGoroutine()
+	// Счёт относительный: соседние проверки этого же пакета держат свои стеки
+	// живыми до своего Cleanup, и их уборщики видны в общем дампе.
+	base := sweepers()
 
 	dev := packettest.NewFake(1500)
 	st, err := New(Config{
 		Device:  dev,
 		Clock:   clock.NewFake(time.Unix(1, 0)),
-		UDPIdle: time.Millisecond, // тикер на настоящих часах должен успеть тикнуть
+		UDPIdle: time.Second,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	// Стек тут заведён с фейковыми часами, но с реальным периодом тикера в
-	// продукте (Millisecond) это не нужно — важно лишь, что New завёл
-	// горутину. Она молчит, пока часы стоят; следит тест только за тем, что
-	// New не потерялась и Close её остановил.
+	// Часы стоят: уборщик заведён, но не тикает ни разу — здесь проверяется
+	// его существование, а не работа (работу проверяет соседний тест).
+	waitSweepers(t, base+1, "после New фоновая уборка не заведена")
 
 	done := make(chan error, 1)
 	go func() { done <- st.Run() }()
-
-	deadline := time.Now().Add(packettest.WaitTimeout) //hop:realtime
-	for runtime.NumGoroutine() <= before {
-		if time.Now().After(deadline) { //hop:realtime
-			t.Fatalf("после New горутин %d, было %d: фоновая уборка не заведена",
-				runtime.NumGoroutine(), before)
-		}
-		time.Sleep(time.Millisecond) //hop:realtime
-	}
 
 	dev.Close()
 	if err := <-done; err != nil {
@@ -116,12 +155,5 @@ func TestW59SweepDoesNotOutliveClose(t *testing.T) {
 	}
 	st.Close()
 
-	deadline = time.Now().Add(packettest.WaitTimeout) //hop:realtime
-	for runtime.NumGoroutine() > before {
-		if time.Now().After(deadline) { //hop:realtime
-			t.Fatalf("горутины не остановились после Close: сейчас %d, было %d — "+
-				"уборщик пережил владельца", runtime.NumGoroutine(), before)
-		}
-		time.Sleep(5 * time.Millisecond) //hop:realtime
-	}
+	waitSweepers(t, base, "уборщик пережил владельца")
 }
