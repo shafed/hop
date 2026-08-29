@@ -2,7 +2,7 @@
   "status": "machine-readable — only for the next AI session, not for human reading. Human-readable history/decisions live in PLAN.md and implementation-notes.md.",
   "convention": "This file carries POINTERS AND TRAPS, not retellings. A задача is cited by its section in PLAN.md or SPEC.md, never paraphrased here: a paraphrase is a second copy of the truth and it drifts (it already did once, for routing_lists). What belongs here instead: file and symbol pointers, measured facts, rejected shapes with their arguments, and the traps that cost the last passes time. Written down in full in implementation-notes.md, section 'doclint — утверждение документа о состоянии обязано опираться на исполнимое'.",
   "branch": "main",
-  "branch_note": "Two more passes ran in parallel worktrees off 4387428 and are merged into local main: pass/nat-idle-sweep (fast-forward) and pass/cli-subcommands (merge 345ac2f). Both carry a controller correction on top — 1cbe55e and ef9027d — each described in its closed_this_pass entry. Nothing was pushed; the six pass branches still exist locally, their worktrees were removed.",
+  "branch_note": "The passes off 4387428 are merged into local main. Both latest passes carry a controller correction on top — 1cbe55e and ef9027d — each described in its closed_this_pass entry. The acceptance pass removed the remaining auxiliary worktree and all seven local branches after proving each was an ancestor of main. Nothing was pushed.",
   "citation_hygiene": {
     "rule": "Every path, T/W number, policy name and git ref named in this file must exist. This is no longer a convention a human has to remember — `go run ./cmd/doclint .` checks it, and CI runs it as `go run ./cmd/doclint -git=false .`.",
     "why_this_block_still_exists": "It records what the check is FOR. Two consecutive passes cited 'Global Constraint 9, constraints.md' — a file that never existed in any branch — and the citation was what justified deferring a task that, when finally checked on its merits, cost one optional field and one wiring line. The rule that citation stood in for: a pass closes its own queue item and does not widen into neighbouring modules; where the correct shape does require changing another package, that is recorded in Deviations with an argument — it is not grounds to defer the task silently.",
@@ -33,6 +33,12 @@
       "honest_gaps": "`hop status` shows only the service phase: traffic phase and active node belong to the agent, and the store holds an exclusive flock for its whole life (measured live: a held .lock makes `hop nodes` wait 5s and refuse with code 1), so a status command that opens the store would refuse exactly when it is most needed. An always-empty field would read as 'no traffic', which is a lie — the command says in words what it does not know."
     }
   ],
+  "acceptance_review": {
+    "decision_log": "implementation-notes.md, section 'Приёмка после слияния проходов `nat_idle_sweep` и CLI'",
+    "measured": "The merged range 4387428..d3956a9 passed go test ./..., race on cmd/hop + internal/netstack + internal/engine, doclint, the full 46-policy negcheck, all three new negative controls, and 60 runs of TestW59SweepDoesNotOutliveClose. Live probe --json returned 3 with jq-parseable stdout and the fail-close diagnostic only on stderr.",
+    "review_finding": "cmd/hop no-argument handlers ignore fs.Args(), while flag.FlagSet stops at the first positional argument. Live reproduction: `hop nodes unexpected --json` exits 0 and emits the human view; `--json` is left unparsed. Fix centrally with argument cardinality and a negative CLI test.",
+    "cleanup": "The auxiliary worktree and all seven merged local branches were removed with safe deletion after an ancestor check; only main remains locally."
+  },
   "parallel_passes_trap": {
     "what_happened_before": "Two of three passes independently took the next free registry number and both landed W48. Nothing catches this inside a single pass: each read the registry, saw W47 as the last row, and was right at the time it looked.",
     "what_was_done_this_time": "The controller handed out the numbers BEFORE the passes started (W51 to the idle sweep, W52-W53 to the lists, W54 kept for its own pass) and required each number to stand in the test NAME. No collision occurred. Repeat this: it is the cheap half.",
