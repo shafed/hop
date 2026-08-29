@@ -2,7 +2,7 @@
   "status": "machine-readable — only for the next AI session, not for human reading. Human-readable history/decisions live in PLAN.md and implementation-notes.md.",
   "convention": "This file carries POINTERS AND TRAPS, not retellings. A задача is cited by its section in PLAN.md or SPEC.md, never paraphrased here: a paraphrase is a second copy of the truth and it drifts (it already did once, for routing_lists). What belongs here instead: file and symbol pointers, measured facts, rejected shapes with their arguments, and the traps that cost the last passes time. Written down in full in implementation-notes.md, section 'doclint — утверждение документа о состоянии обязано опираться на исполнимое'.",
   "branch": "main",
-  "branch_note": "Three parallel passes were run side by side in worktrees, each based on ed6ee69 (documents pass, itself based on f6a2728 = main at the time), and then merged into one integration branch: 449ba62 (bypass counters in the snapshot), 09af0d2 (doclint), ca7a096 (IPv6 blocking). The integration merges are 0f63c5a and 8c99730, plus 0e1a198 which resolves the registry collision described in parallel_passes_trap. Nothing was pushed; merging into local main is the human's call, and the pass worktrees are deleted once it happens.",
+  "branch_note": "The ipv6_kill_established pass is four implementation/documentation commits ending at 808712f, based directly on 9cca057 = main at the start of the pass, followed by this handoff update. It was independently rechecked and fast-forwarded into local main. Nothing was pushed.",
   "citation_hygiene": {
     "rule": "Every path, T/W number, policy name and git ref named in this file must exist. This is no longer a convention a human has to remember — `go run ./cmd/doclint .` checks it, and CI runs it as `go run ./cmd/doclint -git=false .`.",
     "why_this_block_still_exists": "It records what the check is FOR. Two consecutive passes cited 'Global Constraint 9, constraints.md' — a file that never existed in any branch — and the citation was what justified deferring a task that, when finally checked on its merits, cost one optional field and one wiring line. The rule that citation stood in for: a pass closes its own queue item and does not widen into neighbouring modules; where the correct shape does require changing another package, that is recorded in Deviations with an argument — it is not grounds to defer the task silently.",
@@ -37,6 +37,22 @@
       "registry": "docs/verification-agent.md §5.8 row W48 (TestW48UpBlocksIPv6, privilege-free: the list of Up steps is a pure function, upSteps) and §6 flag row ipv6_block. T28 lives in internal/l3 and is NOT named in the policy registry, by the standing rule: negcheck runs `go test`, and L3 skips without HOP_L3, so it would be green under any state of the flag — exactly the fixture_bad shape."
     },
     {
+      "what": "Refuse, don't silence, IPv6 TCP connections that predate `up` (ipv6_kill_established, W50)",
+      "head": "808712f",
+      "decision_log": "implementation-notes.md, section 'Этап 8 — отказ соединениям IPv6 старше туннеля (`ipv6_kill_established`, W50)'",
+      "shape": "Immediately after the ipv6_block rule, Linux dumps TCP6 sockets with inet_diag and destroys eligible pre-existing sockets via a hand-serialized SOCK_DESTROY request. It repeats while a round destroys anything, at most four rounds, to narrow the connect()/diag race. `ss --kill` was rejected by measurement: it returns 0 on EPERM and its default TCP state filter misses SYN_SENT.",
+      "boundary": "Only non-local, non-listening, genuine IPv6 sockets are targets; own addresses, ::1 and IPv4-mapped sockets are left alone. The step exists only when BOTH ipv6_block and ipv6_kill_established are on. It has no rollback because socket destruction is deliberately irreversible and sockets are outside the netstate snapshot.",
+      "degradation": "A kernel without INET_DIAG_DESTROY does not bring Up down: the blocking rule is already installed, so confidentiality is preserved; hopd logs a Warn with the reason and the count left alive. This loses prompt refusal, not the block.",
+      "registry": "docs/verification-agent.md §5.8 row W50 (TestW50UpSweepsSilencedIPv6) and §6 flag row ipv6_kill_established. TestW50IPv6EstablishedIsAbortedNotSilenced is the real-kernel half and deliberately stays outside the registry because it skips without HOP_L3.",
+      "post_pass_verification": [
+        "Full `go test ./...` passed outside the network-restricted sandbox; the sandbox-only run failed solely because internal/engine could not listen on 127.0.0.1:0.",
+        "The affected-package race run passed; doclint is clean; W50 is green normally, red with HOP_DISABLE=ipv6_kill_established, and green (skipped by policy boundary) with HOP_DISABLE=ipv6_block.",
+        "The real W50 L3 test passed in unshare -Urn: hopd destroyed two sockets; ESTABLISHED and SYN_SENT both returned ECONNABORTED in microseconds.",
+        "Full negcheck was run after the report, outside the network-restricted sandbox: all 41 policies are guarded by a red test. The first sandboxed attempt produced only eight oracle defects from forbidden loopback listen calls and is not a product result.",
+        "The report's IPv4 follow-up was measured correctly on 203.0.113.2, outside LocalPrefixes. In 5/5 isolated-netns runs the post-up route was hopt0/table 8421 and the pre-up direct TCP connection received an immediate RST; it never continued directly. No IPv4 SOCK_DESTROY policy is justified by this scenario. The temporary measurement test was removed and the worktree was clean afterward."
+      ]
+    },
+    {
       "what": "doclint — a document's claim about state must rest on something executable (the parallel task; not part of plan_order)",
       "head": "09af0d2",
       "decision_log": "implementation-notes.md, section 'doclint — утверждение документа о состоянии обязано опираться на исполнимое', including where the recognition boundary was drawn and why",
@@ -53,20 +69,12 @@
   },
   "next_task": {
     "priority": 1,
-    "name": "Refuse, don't silence, IPv6 connections that predate `up`",
-    "why_first": "The one §5.6 hole the IPv6 pass measured and deliberately left open. After the rule lands, an ALREADY ESTABLISHED IPv6 socket leaks nothing but hangs to its own TCP timeout, and send() still reports success. On a dual-stack desktop that is every open browser connection at the moment of `up`. §5.6 says refuse, never go silent — and this is silence.",
-    "measured_starting_point": "`ss --kill -6 -t dst [<addr>]` under `unshare -Urn` returns 0 and turns the connection into ECONNABORTED. CAP_NET_ADMIN is enough, no root. ss ships in the same iproute2 as ip, so no new dependency. It needs CONFIG_INET_DIAG_DESTROY, which is not universal — that is degradation, not breakage, and the pass must decide what happens without it.",
-    "shape_question": "One sweep right after the rule is installed suffices, because after the rule no NEW IPv6 connection can be established. Whether to shell out to ss or to speak SOCK_DESTROY over netlink directly is the design call; the platform layer today only shells out to ip.",
-    "flag": "its own, e.g. ipv6_kill_established. NOT ipv6_block: with ipv6_block=off no rule exists, so no socket would ever be stale and the guard would go red for the wrong cause. Same argument that kept bypass_rebind out of bypass_sink.",
-    "test_gap": "An L3 test that opens an IPv6 connection BEFORE `up` and asserts it is refused, not hung, after. The stand is already built: internal/l3/harness_test.go grew a veth peer with a TCP echo server on fd00:9:9::2 and waitAddrsSettled for this pass."
+    "name": "Довести Stack.Stats() до пользователя",
+    "why_first": "The counters already reach netstack.Stack.Stats() but stop there: the agent forwards only DNSStats, and neither ipc nor cmd/hop exposes the stack counters. Rebound and the new IPv6 sweep outcome are currently observable only in tests or hopd logs.",
+    "shape_question": "Decide whether counters join agent.Snapshot (docs/verification-agent.md §2 says a snapshot in pieces is not a snapshot) or travel through a separate call like Agent.DNSStats() in internal/agent/wire.go and cmd/hop/watch.go. Include the IPv6 sweep count and unsupported-kernel degradation only if their ownership and lifetime fit the same snapshot; do not silently turn a log event into a cumulative counter without specifying reset semantics.",
+    "flag": "probably none — observability does not branch product behavior"
   },
   "queue": [
-    {
-      "task": "Довести Stack.Stats() до пользователя",
-      "why": "The counters now reach the stack snapshot and stop there: the agent does not forward it (wire.go exposes only DNSStats), and neither ipc nor cmd/hop knows about it. Rebound, the counter the whole rebind pass was for, is still readable nowhere but a test.",
-      "shape_hint": "The pattern to copy is next door: Agent.DNSStats() in internal/agent/wire.go and its consumer in cmd/hop/watch.go. The pass's real question is whether the counters join agent.Snapshot (docs/verification-agent.md §2, 'снимок по частям не годится') or travel by a separate call the way DNSStats does.",
-      "flag": "probably none — the same observability"
-    },
     {
       "task": "Уборка простоя сокетов bypass без трафика",
       "why": "The price the stats pass named out loud: with traffic stopped, bypass sockets live until Close. natTable has the same fate for the same reason — neither table has a background ticker.",
@@ -104,11 +112,6 @@
       "size": "small"
     }
   ],
-  "repo_hygiene_finding": {
-    "what": "Two compiled binaries, hop and hopd, are tracked in git (~48 MB each). They predate all of these passes — the last commit touching them is ba4459c.",
-    "why_it_matters_here": "They are also a source of false matches for any tool that greps the tree: doclint skips them only because it reads named documents, and a registry grep for a number hits the binaries' string tables.",
-    "not_done": "Removing them rewrites nothing but the index, yet it is a repository decision, not a pass decision. Left for the human."
-  },
   "gate": {
     "commands": [
       "go test ./...",
@@ -119,7 +122,7 @@
     ],
     "notes": {
       "doclint": "New this pass. Fast. Runs in CI as `go run ./cmd/doclint -git=false .` — a checkout has neither the pass branches nor the full history, so the git half is off there and on locally.",
-      "negcheck": "runs every guard twice (with/without its policy) via `go test -count=1`; 40 policies as of this pass, ~20-35 min wall clock on this machine — this is expected, not a hang; don't rely on go test's cache. Per-task gate only needs the new policy's own guard under HOP_DISABLE=<name>; the controller runs the full one at the end.",
+      "negcheck": "runs every guard twice (with/without its policy) via `go test -count=1`; 41 policies as of this pass, ~20-35 min wall clock on this machine — this is expected, not a hang; don't rely on go test's cache. It needs permission to listen on loopback: a network-restricted sandbox creates false oracle defects. Per-task gate only needs the new policy's own guard under HOP_DISABLE=<name>; the controller runs the full one at the end.",
       "realtimelint": "does not accept ./... as an argument — pass literally `.`",
       "l3_how_to_run": "Build once, run under an unprivileged user namespace: `go test -c -o /tmp/l3.test ./internal/l3` then `HOP_L3=1 unshare -Urn /tmp/l3.test` (add `-test.v -test.run '<pattern>'` to scope it). This works without root — unshare -Urn grants CAP_NET_ADMIN inside the fresh netns. Reusing the built binary across repeated unshare invocations is much faster than `go test` per run.",
       "known_red_that_is_not_yours": "go vet ./... is red at internal/engine/dialer.go (copylocks in xray-core's SocketConfig). `go run ./cmd/realtimelint .` is red with 3 hits in internal/dnstest/realserver_test.go. `gofmt -l ./internal` reports internal/l2/dns_test.go. All three predate these passes; the honest gate is 'no NEW findings', compared on the full output rather than the exit code.",
