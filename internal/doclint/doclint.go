@@ -351,6 +351,12 @@ func collectTestNumbers(root string) (map[string]bool, error) {
 // прочесть их как объявление значило бы краснеть на каждом честном доводе.
 var bulletHeadRe = regexp.MustCompile(`^-\s+\*\*([^*]+)\*\*`)
 
+// openRe — пометка, открывающая участок. Признаётся только целой строкой:
+// иначе абзац, объясняющий саму пометку, открывал бы участок посреди прозы, а
+// объяснять её в том же разделе приходится обязательно — участок иначе
+// выглядит пустым местом.
+var openRe = regexp.MustCompile(`^<!--\s*` + regexp.QuoteMeta(MarkerUnwritten) + `\s*-->$`)
+
 // unwritten сверяет прозаический список ненаписанного с машинным.
 //
 // Списков ненаписанного в проекте два: абзац в регистре и AllowList. Первый
@@ -370,7 +376,7 @@ var bulletHeadRe = regexp.MustCompile(`^-\s+\*\*([^*]+)\*\*`)
 func (r *pass) unwritten(doc *mdDoc) {
 	var in, started bool
 	for _, l := range doc.lines {
-		if strings.Contains(l.text, MarkerUnwritten) {
+		if openRe.MatchString(strings.TrimSpace(l.text)) {
 			in, started = true, false
 			continue
 		}
