@@ -13,11 +13,13 @@ import (
 	"github.com/shafed/hop/internal/subscription"
 )
 
-// Ввод узлов (Р40). Три одноразовых режима: сделали дело и вышли.
+// Ввод узлов (§1/С2, §1/С8). Одноразовые режимы: сделали дело и вышли.
 //
-// Это временный интерфейс. Подкоманды `hop sub add`, `hop node add`,
-// `hop nodes` — этап 9; они надеваются поверх этих же вызовов, потому что вся
-// работа здесь делается пакетами subscription и store, а не флагами.
+// Флаги Р40 сняты этапом 9: подкоманды `hop sub add`, `hop node add`,
+// `hop node rm` и `hop nodes` надеты поверх этих же вызовов без переписывания —
+// вся работа здесь делается пакетами subscription и store, а не разбором
+// аргументов. Печать узлов уехала в output.go: у `hop nodes` есть `--json`, и
+// формируется он в одном месте на весь бинарь (§5.9).
 
 // addSubscription скачивает подписку и сливает её в группу (§5.8, §6.16).
 //
@@ -30,7 +32,7 @@ func addSubscription(ctx context.Context, st *store.Store, url string, out io.Wr
 		Downloader: subscription.NewDownloader(doer, clock.System{}),
 	}
 
-	// Группа именуется по ссылке, а не случайно: повторный `-sub` с той же
+	// Группа именуется по ссылке, а не случайно: повторный `hop sub add` с той же
 	// ссылкой обязан обновить ту же группу, а не завести вторую. Слияние §6.16
 	// иначе не увидело бы прежних узлов и потеряло бы всю их историю проб.
 	groupID := groupIDFor(url)
@@ -60,7 +62,7 @@ func addNode(st *store.Store, link string, out io.Writer) error {
 		return fmt.Errorf("в ссылке не нашлось ни одного узла")
 	}
 	if len(p.Nodes) > 1 {
-		return fmt.Errorf("в аргументе %d узлов, а -node берёт один; для пачки есть -sub", len(p.Nodes))
+		return fmt.Errorf("в аргументе %d узлов, а `hop node add` берёт один; для пачки есть `hop sub add`", len(p.Nodes))
 	}
 
 	m := subscription.Add(store.ManualGroupID, st.Nodes(store.ManualGroupID), p.Nodes[0], subscription.NewID)
@@ -77,7 +79,7 @@ func addNode(st *store.Store, link string, out io.Writer) error {
 
 // removeNode убирает узел или всю группу.
 //
-// Один флаг на два случая намеренно: пользователь видит в `-nodes` и то и
+// Один глагол на два случая намеренно: пользователь видит в `hop nodes` и то и
 // другое одним списком и не обязан знать, что у них разная природа. Пустой
 // состав группы стор принимает — это тот же Apply, что и слияние, только
 // состав пуст, — и живость удалённых узлов уходит вместе с ними (§1/С8).
@@ -104,29 +106,6 @@ func removeNode(st *store.Store, id string, out io.Writer) error {
 	}
 	fmt.Fprintf(out, "узел %s удалён из группы %s\n", id, node.GroupID)
 	return nil
-}
-
-// listNodes печатает, что лежит в сторе.
-//
-// Ключи не печатаются ни в каком виде (§6.14): в выводе только id, имя, адрес
-// и порт — того, чем узел опознаётся глазом, для этого хватает.
-func listNodes(st *store.Store, out io.Writer) {
-	groups := st.Groups()
-	if len(groups) == 0 {
-		fmt.Fprintln(out, "стор пуст: добавьте подписку через -sub или узел через -node")
-		return
-	}
-	for _, g := range groups {
-		nodes := st.Nodes(g.ID)
-		fmt.Fprintf(out, "группа %s (%d узлов)\n", g.ID, len(nodes))
-		for _, n := range nodes {
-			mark := " "
-			if !n.Supported {
-				mark = "×"
-			}
-			fmt.Fprintf(out, "  %s %-12s %s  %s:%d\n", mark, n.ID, n.Name, n.Server, n.Port)
-		}
-	}
 }
 
 // groupIDFor — устойчивый id группы по ссылке подписки.

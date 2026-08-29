@@ -3,16 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
-	"time" //hop:realtime
 
 	"github.com/shafed/hop/internal/engine"
 	"github.com/shafed/hop/internal/health"
 	"github.com/shafed/hop/internal/store"
 )
 
-// probeNodes проверяет каждый узел из стора и печатает результат.
+// probeNodes проверяет каждый узел из стора и собирает вывод команды.
 //
 // Зачем отдельный режим, когда пробы и так идут внутри агента: агент требует
 // поднятого туннеля, то есть root и работающего hopd, и его отказ не отвечает
@@ -22,7 +20,10 @@ import (
 //
 // Путь пробы тот же, что в продукте (§6.7): дозвон через outbound проверяемого
 // узла, те же три URL, та же сводка §5.4. Отличается только владелец движка.
-func probeNodes(ctx context.Context, st *store.Store, out io.Writer, physical engine.InterfaceFunc) error {
+//
+// Печатает не она, а emit (§5.9): здесь собирается значение, а как его подать —
+// человеку таблицей или машине в JSON — решает одна точка на весь бинарь.
+func probeNodes(ctx context.Context, st *store.Store, physical engine.InterfaceFunc) (probeOut, error) {
 	var nodes []store.Node
 	for _, g := range st.Groups() {
 		for _, n := range st.Nodes(g.ID) {
@@ -31,8 +32,10 @@ func probeNodes(ctx context.Context, st *store.Store, out io.Writer, physical en
 			}
 		}
 	}
+	// Пустой стор — ошибка конфигурации (код 1), а не fail-close (код 3):
+	// «живых узлов нет» и «узлов нет вовсе» требуют от человека разного.
 	if len(nodes) == 0 {
-		return fmt.Errorf("в сторе нет ни одного поддержанного узла")
+		return probeOut{}, fmt.Errorf("в сторе нет ни одного поддержанного узла")
 	}
 
 	en := make([]engine.Node, 0, len(nodes))
@@ -43,7 +46,7 @@ func probeNodes(ctx context.Context, st *store.Store, out io.Writer, physical en
 	// вызывающему вместе с ошибкой.
 	e, err := engine.NewWithConfig(engine.Config{Nodes: en, Physical: physical})
 	if err != nil {
-		return fmt.Errorf("движок не собрался: %w", err)
+		return probeOut{}, fmt.Errorf("движок не собрался: %w", err)
 	}
 	defer e.Close()
 
@@ -51,21 +54,21 @@ func probeNodes(ctx context.Context, st *store.Store, out io.Writer, physical en
 		return e.DialTCP(engine.WithProbe(ctx), nodeID, addr)
 	})
 
+	v := probeOut{Nodes: make([]probeNodeOut, 0, len(nodes))}
 	for _, n := range nodes {
 		c, cancel := context.WithTimeout(ctx, health.DefaultProbeTimeout)
 		res := p.Probe(c, n.ID)
 		cancel()
 
-		name := n.Name
-		if name == "" {
-			name = n.ID[:min(8, len(n.ID))]
-		}
+		out := probeNodeOut{ID: n.ID, Name: n.Name, Server: n.Server, Port: n.Port}
 		if res.Err != nil {
-			fmt.Fprintf(out, "✗ %-20s %s:%d — %v\n", name, n.Server, n.Port, res.Err)
-			continue
+			out.Error = res.Err.Error()
+		} else {
+			out.Alive = true
+			out.RTTMs = res.RTT.Milliseconds()
+			v.Alive++
 		}
-		fmt.Fprintf(out, "✓ %-20s %s:%d — %s\n", name, n.Server, n.Port,
-			res.RTT.Round(time.Millisecond)) //hop:realtime
+		v.Nodes = append(v.Nodes, out)
 	}
-	return nil
+	return v, nil
 }

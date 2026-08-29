@@ -102,6 +102,7 @@ func NewWithConfig(c Config) (*Engine, error) {
 		return nil, fmt.Errorf("engine: для узлов нужен физический интерфейс (§6.8)")
 	}
 	installDialer()
+	takeXrayLogOffStdout()
 
 	cfg, err := BuildConfig(nodes)
 	if err != nil {
