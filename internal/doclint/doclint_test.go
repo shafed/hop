@@ -34,6 +34,10 @@ func run(t *testing.T, dir string) []string {
 // TestDirtyFixtureIsRed — на поддельном репозитории с одной гнилью каждого
 // вида линтер обязан назвать ровно их и ничего сверх. Это мета-проверка того
 // же жанра, что TestMetaCheck у negcheck: без неё линтер сам непроверен.
+//
+// Пятый вид — «проза»: участок doclint:unwritten объявляет W71 ненаписанным,
+// а тест с этим номером в дереве есть. Проверка обратного направления: первые
+// четыре требуют исполнимого за утверждением «сделано», эта — за «не сделано».
 func TestDirtyFixtureIsRed(t *testing.T) {
 	want := []string{
 		"HANDOFF.json|путь|internal/thing/nope.go",
@@ -43,6 +47,7 @@ func TestDirtyFixtureIsRed(t *testing.T) {
 		"PLAN.md|тест|T77",
 		"SPEC.md|тест|T76",
 		"docs/not-yet-written.md|лишняя строка|T70",
+		"docs/verification-agent.md|проза|W71",
 		"docs/verification-agent.md|тест|W79",
 		"implementation-notes.md|путь|internal/thing/absent.go",
 	}
@@ -60,7 +65,8 @@ func TestDirtyFixtureIsRed(t *testing.T) {
 // TestCleanFixtureIsGreen — второе направление, без которого первое ничего не
 // стоит: на документе, где те же обороты употреблены честно (CIDR, чужой
 // референс, pkg.Symbol, абсолютный путь, шаблон, snake_case не про политику,
-// диапазон номеров, помеченная doclint:ignore мёртвая ссылка), линтер обязан
+// диапазон номеров, помеченная doclint:ignore мёртвая ссылка, номер в теле
+// причины и пункт за границей участка doclint:unwritten), линтер обязан
 // молчать.
 func TestCleanFixtureIsGreen(t *testing.T) {
 	if got := run(t, "clean"); len(got) != 0 {
