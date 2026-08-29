@@ -371,3 +371,45 @@ func TestW58EveryReadingCommandTakesJSON(t *testing.T) {
 		}
 	}
 }
+
+// TestW58MachineOutputIsAloneOnStdout — в машинном канале стоит только вывод
+// команды.
+//
+// Замер, а не предположение: `hop probe --json` печатал в stdout строку
+// «[Warning] … WebSocket transport … is deprecated» перед JSON. Пишет её Xray
+// своим глобальным логом, и `loglevel: none` в конфиге инстанса её не гасит —
+// предупреждение о конфигурации появляется раньше, чем инстанс. Схему при этом
+// проверяли зелёные тесты: они смотрели на значение, а не на поток.
+//
+// Поэтому здесь подменяется настоящий os.Stdout, а не буфер команды: мусорит
+// чужая библиотека мимо наших писателей, и увидеть её можно только там.
+func TestW58MachineOutputIsAloneOnStdout(t *testing.T) {
+	storeWithDeadNode(t)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stdout
+	os.Stdout = w
+
+	c := newCLI(w, io.Discard)
+	c.newOutbound = func(string) (outboundPath, error) { return fakeOutbound{}, nil }
+	code := c.dispatch([]string{"probe", "--json"})
+
+	os.Stdout = saved
+	w.Close()
+	out, readErr := io.ReadAll(r)
+	r.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+
+	if code != 3 {
+		t.Fatalf("проба мёртвого узла дала %d, ожидалась 3", code)
+	}
+	var v any
+	if err := json.Unmarshal(out, &v); err != nil {
+		t.Fatalf("stdout не разбирается как JSON (%v), а --json — контракт с автоматикой:\n%s", err, out)
+	}
+}
