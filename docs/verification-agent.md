@@ -390,6 +390,8 @@ W22 существует потому, что пересборка на кажд
 | W49 | счётчики приёмника bypass видны в `Stack.Stats()`, и видны на настоящем `bypass.NAT`                   | —               |
 | W50 | `up` разрушает соединения IPv6, установленные до него: отказ, а не молчание (§5.6)                     | `ipv6_kill_established` |
 | W51 | сокет bypass, простоявший дольше `Idle` при молчащем клиенте, закрывается сам, без `Send` и без `Close` | `bypass_idle_sweep` |
+| W52 | списки §6.10 из `settings.json` доезжают до `agent.Config.Routing`                                     | `settings_file` |
+| W53 | апстримы §5.7 из того же файла доезжают до `agent.Config.DNSUpstreams`                                 | `settings_file` |
 | W54 | счётчики стека доходят до пользователя: `Agent.StackStats` и строка «стек» в `watch`                   | —               |
 
 W47 — проброс, а не поведение: `Config.Physical` доходит до
@@ -486,6 +488,7 @@ W36 проверяет обе стороны fail-close: Xray получает `
 | `ipv6_block`      | `up` не закрывает IPv6, и он течёт мимо  | W48, T28      |
 | `ipv6_kill_established` | соединения IPv6 старше туннеля молчат вместо отказа | W50 |
 | `bypass_idle_sweep` | простоявший сокет bypass ждёт следующего пакета или `Close` | W51 |
+| `settings_file` | `settings.json` не читается, настройки пусты всегда | W52, W53, S40, S41 |
 
 `switch_reason`, `reject_mode`, `traffic_kills`, `error_classify` уже в реестре
 и здесь только переиспользуются — связка обязана краснить их сквозным путём, а
