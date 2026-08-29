@@ -73,9 +73,6 @@ func TestW55EveryVerbOfTheSpecIsInTheGrammar(t *testing.T) {
 		}
 	}
 	for _, c := range commands {
-		if c.verb == "help" {
-			continue
-		}
 		if !slices.Contains(specVerbs, c.verb) {
 			t.Errorf("глагол %q есть в грамматике и не назван в §5.9: поверхность выросла мимо документа", c.verb)
 		}
@@ -253,12 +250,8 @@ func goldenViews() []struct {
 		},
 		{
 			name: "status",
-			v: statusOut{
-				Tunnel: tunnelOut{Phase: "up", Device: "fd", OrphanLeft: "0s"},
-				Store:  store.StatusView{Groups: []store.GroupView{}, Nodes: 0},
-			},
-			want: `{"tunnel":{"phase":"up","device":"fd","orphan_left":"0s"},` +
-				`"store":{"groups":[],"nodes":0}}`,
+			v:    statusOut{Tunnel: tunnelOut{Phase: "up", Device: "fd", OrphanLeft: "0s"}},
+			want: `{"tunnel":{"phase":"up","device":"fd","orphan_left":"0s"}}`,
 		},
 		{
 			name: "probe",
