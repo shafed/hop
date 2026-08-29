@@ -4,6 +4,7 @@ package platform
 
 import (
 	"errors"
+	"log/slog"
 	"runtime"
 
 	"github.com/shafed/hop/internal/tunnel"
@@ -21,7 +22,7 @@ import (
 // проверено.
 type Unsupported struct{}
 
-func New() *Unsupported { return &Unsupported{} }
+func New(*slog.Logger) *Unsupported { return &Unsupported{} }
 
 var errUnsupported = errors.New("platform: привилегированный слой для " + runtime.GOOS + " появится вместе с этапом 8")
 

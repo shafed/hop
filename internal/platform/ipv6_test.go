@@ -29,7 +29,7 @@ func testParams() tunnel.Params {
 // `go test`, а L3 без HOP_L3 и netns пропускается, то есть был бы зелен при
 // любом состоянии флага.
 func TestW48UpBlocksIPv6(t *testing.T) {
-	steps := upSteps(testParams())
+	steps := upSteps(testParams(), discardLog())
 
 	var found *step
 	for i := range steps {
@@ -67,7 +67,7 @@ func TestW48UpBlocksIPv6(t *testing.T) {
 // ни при подъёме, ни при откате, ни при срыве на середине Up, — когда
 // интерфейс уже (или ещё) существует, а IPv6 открыт.
 func TestW48IPv6BlockIsFirstStepAndSoLastUndone(t *testing.T) {
-	steps := upSteps(testParams())
+	steps := upSteps(testParams(), discardLog())
 	if len(steps) == 0 {
 		t.Fatal("Up не раскладывает ничего")
 	}
@@ -81,7 +81,7 @@ func TestW48IPv6BlockIsFirstStepAndSoLastUndone(t *testing.T) {
 // зелен при любом состоянии флага и охраной не служит — он держит границу
 // политики, чтобы «закрыть IPv6» однажды не превратилось в «закрыть всё».
 func TestIPv6BlockLeavesIPv4StepsAlone(t *testing.T) {
-	steps := upSteps(testParams())
+	steps := upSteps(testParams(), discardLog())
 	want := []string{"mtu", "addr", "up", "route", "tunnel rule"}
 	for _, name := range want {
 		if !hasStep(steps, name) {
@@ -134,7 +134,11 @@ func hasStep(steps []step, name string) bool {
 func dump(steps []step) string {
 	var b strings.Builder
 	for _, s := range steps {
-		fmt.Fprintf(&b, "  %-24s %s\n", s.name, strings.Join(s.add, " "))
+		what := strings.Join(s.add, " ")
+		if s.add == nil {
+			what = "<не команда ip>"
+		}
+		fmt.Fprintf(&b, "  %-24s %s\n", s.name, what)
 	}
 	return b.String()
 }

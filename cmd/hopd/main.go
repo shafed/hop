@@ -75,7 +75,7 @@ func run(log *slog.Logger, sock, readyFile string, gid int, cfg tunnel.Config) e
 		return fmt.Errorf("снапшот сети: %w", err)
 	}
 
-	m := tunnel.New(clk, platform.New(), cfg)
+	m := tunnel.New(clk, platform.New(log), cfg)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

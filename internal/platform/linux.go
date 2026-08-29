@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os/exec"
 	"strings"
 	"sync/atomic"
@@ -34,10 +35,21 @@ type Linux struct {
 	params    tunnel.Params
 	dev       *tunDevice
 	responder chan struct{} // закрывается, когда читатель-респондер вышел
+	log       *slog.Logger
 }
 
 // New создаёт платформенный слой.
-func New() *Linux { return &Linux{} }
+//
+// Журнал сервиса передаётся сюда, потому что один шаг Up умеет деградировать
+// (§6.9, зачистка сокетов IPv6): он не роняет подъём, но обязан сказать, что
+// сделал не всё. Молча деградировать — то же самое молчание, против которого
+// написан §5.6, только обращённое к человеку, а не к приложению.
+func New(log *slog.Logger) *Linux {
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+	return &Linux{log: log}
+}
 
 // tunDevice — дескриптор TUN, тот самый, что уезжает агенту через SCM_RIGHTS.
 // Сервис держит свою копию открытой, поэтому перезапуск агента не убивает
@@ -127,6 +139,18 @@ func (d *tunDevice) WritePackets(bufs [][]byte) error {
 type step struct {
 	name     string
 	add, del []string
+	// do — шаг, который командой iproute2 не выражается. Непуст ровно один
+	// из do и add. Откат у такого шага может отсутствовать, и это отдельное
+	// утверждение, а не забывчивость: разрушенный сокет обратно не собрать.
+	do func() error
+}
+
+// apply — что журнал исполнит на этом шаге.
+func (s step) apply() func() error {
+	if s.do != nil {
+		return s.do
+	}
+	return run(s.add)
 }
 
 // upSteps — что Up раскладывает и как каждый шаг откатывается. Чистая
@@ -135,7 +159,7 @@ type step struct {
 //
 // Порядок значим дважды: журнал откатывает шаги в обратном порядке (LIFO,
 // netstate.Journal.Rollback), поэтому первый шаг снимается последним.
-func upSteps(p tunnel.Params) []step {
+func upSteps(p tunnel.Params, log *slog.Logger) []step {
 	var steps []step
 
 	// §6.9: IPv6 закрывается первым и снимается последним — при любом исходе
@@ -149,28 +173,32 @@ func upSteps(p tunnel.Params) []step {
 	// Подробности замера — implementation-notes.md.
 	if policy.IPv6Block.On() {
 		steps = append(steps, step{
-			"ipv6 block",
-			ip6("rule", "add", "unreachable", "priority", fmt.Sprint(prioTunnel)),
-			ip6("rule", "del", "unreachable", "priority", fmt.Sprint(prioTunnel)),
+			name: "ipv6 block",
+			add:  ip6("rule", "add", "unreachable", "priority", fmt.Sprint(prioTunnel)),
+			del:  ip6("rule", "del", "unreachable", "priority", fmt.Sprint(prioTunnel)),
 		})
 	}
 
 	steps = append(steps,
-		step{"mtu", ip("link", "set", "dev", p.Name, "mtu", fmt.Sprint(p.MTU)), nil},
-		step{"addr", ip("addr", "add", p.Addr, "dev", p.Name), ip("addr", "del", p.Addr, "dev", p.Name)},
-		step{"up", ip("link", "set", "dev", p.Name, "up"), ip("link", "set", "dev", p.Name, "down")},
+		step{name: "mtu", add: ip("link", "set", "dev", p.Name, "mtu", fmt.Sprint(p.MTU))},
+		step{name: "addr",
+			add: ip("addr", "add", p.Addr, "dev", p.Name),
+			del: ip("addr", "del", p.Addr, "dev", p.Name)},
+		step{name: "up",
+			add: ip("link", "set", "dev", p.Name, "up"),
+			del: ip("link", "set", "dev", p.Name, "down")},
 		// Откат удаляет маршрут по месту (таблица + префикс), а не по форме:
 		// форма зависит от того, чем маршрут оказался к моменту уборки, а место
 		// — нет.
-		step{"route",
-			ip("route", "add", "default", "dev", p.Name, "table", fmt.Sprint(p.Table)),
-			ip("route", "del", "default", "table", fmt.Sprint(p.Table))},
+		step{name: "route",
+			add: ip("route", "add", "default", "dev", p.Name, "table", fmt.Sprint(p.Table)),
+			del: ip("route", "del", "default", "table", fmt.Sprint(p.Table))},
 	)
 	for _, pfx := range LocalPrefixes {
 		steps = append(steps, step{
-			"exclude " + pfx,
-			ip("rule", "add", "to", pfx, "lookup", "main", "priority", fmt.Sprint(prioExclusions)),
-			ip("rule", "del", "to", pfx, "lookup", "main", "priority", fmt.Sprint(prioExclusions)),
+			name: "exclude " + pfx,
+			add:  ip("rule", "add", "to", pfx, "lookup", "main", "priority", fmt.Sprint(prioExclusions)),
+			del:  ip("rule", "del", "to", pfx, "lookup", "main", "priority", fmt.Sprint(prioExclusions)),
 		})
 	}
 	for _, r := range ExcludedUDPPorts {
@@ -179,15 +207,15 @@ func upSteps(p tunnel.Params) []step {
 			port = fmt.Sprintf("%d-%d", r[0], r[1])
 		}
 		steps = append(steps, step{
-			"exclude udp/" + port,
-			ip("rule", "add", "ipproto", "udp", "dport", port, "lookup", "main", "priority", fmt.Sprint(prioExclusions)),
-			ip("rule", "del", "ipproto", "udp", "dport", port, "lookup", "main", "priority", fmt.Sprint(prioExclusions)),
+			name: "exclude udp/" + port,
+			add:  ip("rule", "add", "ipproto", "udp", "dport", port, "lookup", "main", "priority", fmt.Sprint(prioExclusions)),
+			del:  ip("rule", "del", "ipproto", "udp", "dport", port, "lookup", "main", "priority", fmt.Sprint(prioExclusions)),
 		})
 	}
 	return append(steps, step{
-		"tunnel rule",
-		ip("rule", "add", "lookup", fmt.Sprint(p.Table), "priority", fmt.Sprint(prioTunnel)),
-		ip("rule", "del", "lookup", fmt.Sprint(p.Table), "priority", fmt.Sprint(prioTunnel)),
+		name: "tunnel rule",
+		add:  ip("rule", "add", "lookup", fmt.Sprint(p.Table), "priority", fmt.Sprint(prioTunnel)),
+		del:  ip("rule", "del", "lookup", fmt.Sprint(p.Table), "priority", fmt.Sprint(prioTunnel)),
 	})
 }
 
@@ -207,11 +235,11 @@ func (l *Linux) Up(p tunnel.Params) (tunnel.Device, error) {
 	// Down, и порядок ровно тот, что нужен — сначала снимаются адреса,
 	// маршруты и правила, и только потом с последним дескриптором уходит сам
 	// интерфейс. Закрыть его здесь значило бы закрыть дважды.
-	steps := upSteps(p)
+	steps := upSteps(p, l.log)
 
 	for _, s := range steps {
 		s := s
-		if err := l.j.Do(s.name, run(s.add), run(s.del)); err != nil {
+		if err := l.j.Do(s.name, s.apply(), run(s.del)); err != nil {
 			_ = l.j.Rollback()
 			_ = dev.Close()
 			l.dev = nil
