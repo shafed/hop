@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"log/slog"
+	"reflect"
 	"strings"
 	"time" //hop:realtime
 
 	"github.com/shafed/hop/internal/agent"
 	"github.com/shafed/hop/internal/health"
+	"github.com/shafed/hop/internal/netstack"
 )
 
 // watch — единственное окно наружу до этапа 9.
@@ -76,8 +78,57 @@ func watch(ctx context.Context, a *agent.Agent, log *slog.Logger, every time.Dur
 					"усечено клиенту", ds.TruncToClient, "отказов", ds.ServFail,
 					"поколение кэша", ds.Generation)
 			}
+
+			// Счётчики датаплейна — только на DEBUG и только целиком. Края,
+			// как у фазы и DNS, здесь нет намеренно: это накопительные числа,
+			// и «край» у них пришлось бы назначить порогом, а порога никто не
+			// мерил. Отсутствие стека — не нули: до Up и после Down строки
+			// нет вовсе (Agent.StackStats).
+			if ss, ok := a.StackStats(); ok {
+				log.Debug("стек", stackLine(ss)...)
+			}
 		}
 	}
+}
+
+// stackCounters — как каждое поле netstack.Stats называется в логе.
+//
+// Таблица, а не строка формата: счётчики стека уже один раз доехали до
+// Stack.Stats() и там встали, потому что показать их было некому, и заметить
+// это можно было только чтением кода. Сверить таблицу с типом умеет проверка
+// (W54), строку формата — никто.
+//
+// Порядок здесь — читательский, а не порядок полей: сперва «сколько живёт»,
+// потом «сколько потеряно», потом «кому отказано».
+var stackCounters = []struct{ field, label string }{
+	{"Flows", "вердиктов"},
+	{"NATEntries", "записей NAT"},
+	{"NATSockets", "сокетов NAT"},
+	{"BypassSockets", "сокетов мимо туннеля"},
+	{"NATOrphaned", "ответов без записи NAT"},
+	{"BypassOrphaned", "ответов мимо туннеля без адресата"},
+	{"BypassRebound", "сокетов переоткрыто по смене интерфейса"},
+	{"Blocked", "дропнуто"},
+	{"Rejected", "отказано"},
+	{"BypassTCPRejected", "из них TCP мимо туннеля"},
+}
+
+// stackLine — счётчики парами ключ-значение для slog.
+//
+// По имени поля через reflect, а не полем структуры: так подпись и счётчик
+// связаны в одном месте, и таблица не может разъехаться с типом молча —
+// несуществующее имя краснит W54, а не печатает пустоту.
+func stackLine(st netstack.Stats) []any {
+	v := reflect.ValueOf(st)
+	kv := make([]any, 0, 2*len(stackCounters))
+	for _, c := range stackCounters {
+		f := v.FieldByName(c.field)
+		if !f.IsValid() {
+			continue
+		}
+		kv = append(kv, c.label, f.Interface())
+	}
+	return kv
 }
 
 func logSwitch(log *slog.Logger, ev health.SwitchEvent) {
