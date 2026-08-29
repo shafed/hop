@@ -221,6 +221,14 @@ func TestBypassRefusesTCP(t *testing.T) {
 	}
 }
 
+// Простой дольше Idle закрывает сокет, и делает это Send, а не Stats.
+//
+// Проверяется через второго клиента: он заводит свой сокет и тем самым
+// прокручивает уборку, после чего сокет остаётся ровно один — его. Раньше тест
+// смотрел на Stats после сдвига часов и проходил за счёт уборки внутри самого
+// геттера; теперь Stats — чистое чтение (см. её doc), и опереться на неё
+// значило бы проверять то, чего в продукте нет: снимок счётчиков трафика не
+// двигает.
 func TestBypassIdleClosesSocket(t *testing.T) {
 	listener := newListener(t)
 	clk := clock.NewFake(time.Unix(0, 0))
@@ -245,8 +253,12 @@ func TestBypassIdleClosesSocket(t *testing.T) {
 	}
 
 	clk.Advance(3 * time.Second)
-	if got := n.Stats().Sockets; got != 0 {
-		t.Fatalf("Sockets = %d после простоя дольше Idle, ожидался 0", got)
+	other := netip.AddrPortFrom(client.Addr(), client.Port()+1)
+	if err := n.Send(packettest.UDP(other, listenerAddr, []byte("hi"))); err != nil {
+		t.Fatalf("Send второго клиента: %v", err)
+	}
+	if got := n.Stats().Sockets; got != 1 {
+		t.Fatalf("Sockets = %d после простоя дольше Idle, ожидался 1 — сокет первого клиента не убран", got)
 	}
 }
 
