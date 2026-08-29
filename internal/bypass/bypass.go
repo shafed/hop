@@ -171,9 +171,13 @@ func (n *NAT) socketFor(src netip.AddrPort) (*socket, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !known {
-		iface = ""
-	}
+	// iface здесь — то, что Interface вернул на входе в socketFor, а Control
+	// внутри ListenPacket спросил его ещё раз. Разойтись они могут только
+	// если интерфейс сменился ровно между этими двумя чтениями; тогда
+	// следующий Send закроет свежий сокет как устаревший. Лишний передозвон
+	// раз в жизни такого совпадения дешевле, чем блокировка на время
+	// ListenPacket. При known == false здесь пусто — так currentInterface и
+	// отвечает.
 	sock := &socket{conn: conn, src: src, seen: now, iface: iface}
 	n.socks[src] = sock
 	n.wg.Add(1)
