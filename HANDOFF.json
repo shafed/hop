@@ -1,178 +1,130 @@
 {
   "status": "machine-readable — only for the next AI session, not for human reading. Human-readable history/decisions live in PLAN.md and implementation-notes.md.",
+  "convention": "This file carries POINTERS AND TRAPS, not retellings. A задача is cited by its section in PLAN.md or SPEC.md, never paraphrased here: a paraphrase is a second copy of the truth and it drifts (it already did once, for routing_lists). What belongs here instead: file and symbol pointers, measured facts, rejected shapes with their arguments, and the traps that cost the last passes time. Written down in full in implementation-notes.md, section 'doclint — утверждение документа о состоянии обязано опираться на исполнимое'.",
   "branch": "main",
-  "branch_note": "The bypass_rebind pass and the three it was built on (BypassSink, routing_lists, bypass_tcp_reject) have all been merged into main and their worktree branches deleted. main is f6a2728 and already contains everything closed_this_pass describes; nothing is waiting for a merge call any more. The earlier text here named four live branches and stayed unread for a day after they were gone \u2014 the same rot as the dead citation described in citation_hygiene below, which is why cmd/doclint now resolves every branch name and commit hash this file mentions.",
+  "branch_note": "Three parallel passes were run side by side in worktrees, each based on ed6ee69 (documents pass, itself based on f6a2728 = main at the time), and then merged into one integration branch: 449ba62 (bypass counters in the snapshot), 09af0d2 (doclint), ca7a096 (IPv6 blocking). The integration merges are 0f63c5a and 8c99730, plus 0e1a198 which resolves the registry collision described in parallel_passes_trap. Nothing was pushed; merging into local main is the human's call, and the pass worktrees are deleted once it happens.",
   "citation_hygiene": {
-    "rule": "Every path named in this file must exist. Check with `ls <path>` and `git log --all -- <path>` before leaving it in.",
-    "why_this_block_exists": "The previous two passes carried a citation to 'Global Constraint 9, constraints.md'. That file does not exist — not in the working tree, not in the history of any branch — and the citation was what justified deferring the bypass-socket-invalidation task into the queue. It has been removed from this file entirely; the writeup is in implementation-notes.md, section 'Этап 9 — перепривязка сокетов bypass'. Every path currently named in this file was verified to exist at the time it was written.",
-    "the_rule_that_citation_was_standing_in_for": "Stated in the passes' own words, as a convention between passes rather than a quotation: a pass closes its own queue item and does not widen into neighbouring modules; where the correct shape does require changing another package, that is recorded in Deviations with an argument — it is not grounds to defer the task silently. This is what the passes actually did: the BypassSink pass changed internal/packettest, the bypass_tcp_reject pass changed internal/reject, both with the reason written down."
+    "rule": "Every path, T/W number, policy name and git ref named in this file must exist. This is no longer a convention a human has to remember — `go run ./cmd/doclint .` checks it, and CI runs it as `go run ./cmd/doclint -git=false .`.",
+    "why_this_block_still_exists": "It records what the check is FOR. Two consecutive passes cited 'Global Constraint 9, constraints.md' — a file that never existed in any branch — and the citation was what justified deferring a task that, when finally checked on its merits, cost one optional field and one wiring line. The rule that citation stood in for: a pass closes its own queue item and does not widen into neighbouring modules; where the correct shape does require changing another package, that is recorded in Deviations with an argument — it is not grounds to defer the task silently.",
+    "exceptions_list": "docs/not-yet-written.md — the single list doclint reads. It goes red in BOTH directions: a line that has become unnecessary is a finding too, so the list cannot rot into a dumping ground."
   },
-  "plan_order": "8 (remainder) -> 9",
-  "closed_this_pass": {
-    "what": "Invalidate bypass sockets on interface change (the previous HANDOFF's next_task, priority 1; SPEC §6.8 'следствие первое')",
-    "closes_registry_rows": [
-      "docs/verification-agent.md §5.8: new row W47",
-      "docs/verification-agent.md §6: new flag row bypass_rebind"
-    ],
-    "decision_log": "implementation-notes.md, section 'Этап 9 — перепривязка сокетов bypass при смене интерфейса (bypass_rebind)', including the shape argument, the scope re-examination, the flag decision and three Deviations. The old writeup of the hole (Deviations of the BypassSink section) now says 'Закрыто' and points there.",
-    "decision_shape": {
-      "answer": "The signal — but taken by POLL, not by push. Not the TTL, and not NAT.Reset() driven from the watcher. One mechanism ships; no TTL floor was added.",
-      "mechanism": "bypass.NAT records the interface name Control bound each socket to (socket.iface) and, on every Send, compares it with what Config.Interface returns now (outbound.Selector.Interface in production). Mismatch closes every socket whose binding differs; the next Send re-dials with the current binding. internal/bypass/bypass.go: Config.Interface, socket.iface, currentInterface(), rebindLocked().",
-      "arguments_strongest_first": [
-        "It is the same signal, not a timer. Selector.Interface() is not an independent poll of the OS — it is the published output of the very rtnetlink watcher a push would have come from: watch() receives RouteUpdate/LinkUpdate, calls refresh(), set() stores the name under s.mu. Reading that field reads the result of the event.",
-        "Poll beats push on precision: Reset() fires on ANY watcher event (and an active network produces many that are not interface changes), closing every socket each time. Comparing names fires exactly when the interface is genuinely different.",
-        "The TTL treats the symptom (a wedged socket), not the cause, and pays blind: too short tears down healthy exchanges, too long leaves the leak window open, and no value is derivable from anything. It is not needed as a floor either — the signal cannot 'fail to arrive', because nothing waits for it: it is read on every Send, i.e. exactly when a stale binding could first do harm.",
-        "It cost one optional field in bypass.Config and one passthrough in agent/wire.go. internal/outbound is unchanged."
-      ]
-    },
-    "decision_scope_argument_did_not_hold": {
-      "claim_that_was_deferred_on": "'Doing it properly means touching the rtnetlink watcher outbound.Selector, which widens the pass beyond BypassSink.'",
-      "verdict": "False in its premise, checked rather than taken on trust. Everything a push would have delivered is already published: Selector.Interface() is exported, kept under RWMutex, updated by the watcher, and ALREADY handed to the agent as Config.Physical (cmd/hop/main.go passes physical.Interface). The correct shape is cheaper than the shape whose expense justified the deferral.",
-      "citation": "The deferral cited 'Global Constraint 9, constraints.md'. See citation_hygiene above: that file does not exist anywhere in this repo or its history. The reference is gone from this document; the finding is recorded in implementation-notes.md so the next reader does not take it on faith the way two passes did."
-    },
-    "decision_own_flag": {
-      "answer": "Own flag, bypass_rebind. bypass_sink — the plausible reuse candidate named by the previous HANDOFF — was NOT reused.",
-      "arguments": [
-        "Mechanical, not aesthetic: bypass_sink=off makes Send return ErrDisabled on its first line, before any socket exists. The guard would go red under it for the wrong cause — 'nothing left the machine at all', not 'the socket did not change' — and would not distinguish a broken rebind from a switched-off path.",
-        "negcheck loses resolution on reuse: 'red without bypass_sink' would stop naming one cause.",
-        "Same argument the previous pass used to keep bypass_tcp_reject out of reject_mode. The line the codebase draws: one flag, one claim."
+  "plan_order": "9 (remainder) — Linux dataplane closed except T25-T27; §6.10 lists and the platform branches are what is left",
+  "closed_this_pass": [
+    {
+      "what": "Surface bypass.NAT.Stats() through netstack.Stack.Stats() (the previous HANDOFF's next_task, priority 1)",
+      "head": "449ba62",
+      "decision_log": "implementation-notes.md, section 'Этап 9 — счётчики bypass в снимке стека (`Stack.Stats`)'",
+      "shape": "BypassSink stayed Send-only; the counters arrive through an OPTIONAL interface BypassStatSource { Stats() bypass.Stats } and a type assertion in Stack.Stats(). Load-bearing argument: the ability belongs to whoever has sockets, the obligation would have fallen on everyone — including fakenet.Bypass, which deliberately depends on neither testing nor product packages. Same device as StreamResolver/FlushableResolver, in the same file.",
+      "price_named_out_loud": "A missed type assertion is silent — it reports zeros. That is why the registered guard (W49) puts a real bypass.NAT behind the stack rather than a fake sink.",
+      "two_side_decisions": [
+        "The idle sweep was REMOVED from bypass.NAT.Stats(): a getter that changes the observed is behavior, and behavior owes a flag. Price: with traffic stopped, bypass sockets now live until Close — see next_task priority 3.",
+        "Stats.Rejected no longer sums fail-close refusals with bypass-TCP refusals; the second half is BypassTCPRejected. The sum is preserved and no existing assertion moved."
       ],
-      "registered": "internal/policy/policies.go, next to BypassSink and BypassTCPReject. Two guards, both written and SEEN RED before the implementation, in a separate commit (0dbf087) — the order the last three passes followed. Red on the assertion, not on compilation: the Config.Interface field and the agent passthrough went into that same commit precisely so the claim failed rather than the build."
+      "registry": "docs/verification-agent.md §5.8 row W49 (TestStackStatsSeesRealBypassNAT). No flag: an observability fold nothing branches on is not a policy."
     },
-    "changed_files": [
-      {
-        "path": "internal/bypass/bypass.go",
-        "what": "New InterfaceFunc type and optional Config.Interface. socket gains iface (written once at creation — the binding is immutable, §6.8). currentInterface() reads the callback BEFORE taking n.mu (foreign callback, own lock) and reports 'unknown' for nil callback, error, or empty name. rebindLocked(iface) runs in socketFor under policy.BypassRebind and closes every socket whose non-empty iface differs, counting n.rebound. Stats gains Rebound."
-      },
-      {
-        "path": "internal/agent/wire.go",
-        "what": "Up() passes Interface: bypass.InterfaceFunc(a.cfg.Physical) into bypass.New — a passthrough of a value the agent already held, not a new event source. A nil Config.Physical converts to a nil InterfaceFunc and the NAT behaves exactly as before."
-      },
-      {
-        "path": "internal/policy/policies.go",
-        "what": "New policy BypassRebind (bypass_rebind), registered in All(). Doc carries the short form of why it is not bypass_sink."
-      }
-    ],
-    "new_tests": [
-      {
-        "file": "internal/bypass/rebind_test.go",
-        "tests": [
-          "TestBypassInterfaceChangeRebindsSocket",
-          "TestBypassKeepsSocketWhenInterfaceUnknown",
-          "TestBypassIdleSweepNeverCollectsSocketUnderTraffic"
-        ],
-        "note": "TestBypassInterfaceChangeRebindsSocket is a registered guard. The seen-is-refreshed-on-Send trap is closed twice over: the fake clock NEVER advances (sweepLocked cannot run at all while now.Sub(swept) < idle/2, so the idle sweep has nobody to collect — and the test asserts clk.Now() unchanged at the end), and the client keeps sending across the change, asserting the port does NOT move while the interface is stable and DOES move once it changes. Observable is the source port the listener sees, via listener.SetReadDeadline — fakenet.Bypass.WaitPackets is used nowhere, it waits forever. TestBypassIdleSweepNeverCollectsSocketUnderTraffic is documentation, not a guard: green under either state of the flag, it shows the sweep running on every Send for 7.5×Idle and never collecting the socket."
-      },
-      {
-        "file": "internal/agent/rebind_test.go",
-        "tests": [
-          "TestBypassSocketRebindsOnInterfaceChange"
-        ],
-        "note": "W47, the second registered guard: the Config.Physical → bypass.Config.Interface seam. Needed because Config.Interface is optional — a forgotten passthrough would leave the mechanism dead in production with the unit test green. Drives a real agent on a fake device with a listener on loopback and flips the interface name under live traffic."
-      }
-    ],
-    "stayed_green": [
-      "the whole internal/bypass suite — the existing tests pass no Config.Interface, so socket.iface is empty and never counts as stale: exactly the pre-policy behavior",
-      "T31 (TestBypassMDNSReachesPhysicalInterfaceAndReturnsViaNAT, internal/l3) — re-run under `unshare -Urn`",
-      "T17, T32, T33 (internal/netstack)",
-      "TestBypassSendErrorCountsAsBlocked (internal/netstack) — untouched, the UDP refusal path did not move"
-    ],
-    "deviations": [
-      "The signal is polled, not pushed — a departure from the shape the previous HANDOFF named first (NAT.Reset() from the watcher). Rejected in favour of something cheaper and more precise; argument in implementation-notes.md. Conservative in CLAUDE.md's sense: no new event source, no new goroutine, no change to the platform package.",
-      "The comparison runs on Send, so other clients' stale sockets are closed at the first Send by any client. While the NAT is entirely silent, stale sockets live on — harmless outbound (nothing goes out through them), with one residue: a receive goroutine could still accept a reply on the old interface in that window. That is exactly why the first Send closes ALL sockets with a foreign binding, not only the one it came for.",
-      "Stats grew a third field (Rebound) in a struct nothing in production reads yet (Stack.Stats does not fold it in — that is the next queue item). Added because the guard asserts the mechanism fired directly, not only via the port change."
-    ],
-    "spec_edits": [
-      "SPEC.md §6.8: new paragraph 'Следствие первое распространяется и на долгоживущие сокеты bypass' — the NAT remembers its binding, compares it on every send, closes what diverged; the idle sweep cannot play this role because service discovery retries continuously; a missing default route is not an interface change.",
-      "No §8.3 row: the claim is unit-level, exactly like both bypass_sink guards. No numbered T test was added."
-    ],
-    "not_done_on_purpose": [
-      "No L3 stand with a second veth (the shape HANDOFF suggested). It would exercise the kernel's SO_BINDTODEVICE rather than the decision to re-open the socket, and the kernel side of that path is already covered by T31.",
-      "No TTL. See decision_shape — shipping both without naming the load-bearing one is what the task forbade, and the TTL is not needed as a floor."
-    ]
+    {
+      "what": "IPv6 blocking under ipv6_block (queue item 1; SPEC §6.9). T28 written and green in netns",
+      "head": "ca7a096",
+      "decision_log": "implementation-notes.md, section 'Этап 8 — блокировка IPv6 (`ipv6_block`, T28, W48)' — six measurements, the mechanism, the policy border, four Deviations",
+      "measured_not_assumed": [
+        "With the tunnel up, IPv6 leaves through the PHYSICAL interface and the connection to an outside peer establishes. The tunnel table is empty for IPv6 and never participates in the lookup, because Up only ever ran `ip route add` — an IPv4-family command. So the leak goes PAST the TUN, and the !ok branch of netstack parsing has nothing to do with it: a packet that never reaches the device is a packet the stack never sees.",
+        "unreachable → ENETUNREACH, prohibit → EACCES, blackhole → EINVAL. unreachable chosen: blackhole is silence, which §5.6 forbids, and ENETUNREACH is the signal Happy Eyeballs falls back to IPv4 on without delay.",
+        "sysctl disable_ipv6 was rejected BY MEASUREMENT: it destroys global addresses and does not bring them back, so the snapshot diverges by three lines — the mechanism breaks §8.4 by construction.",
+        "The netstate snapshot did not see IPv6 rules at all (`ip -o rule show` is IPv4-only). A rules6 section was added; verified by the reverse experiment — Reclaim without its -6 half drops T29."
+      ],
+      "spec_correction": "SPEC §6.9 said IPv6 'is blocked at the level of TUN routes'. Measurement disproved it; the section is rewritten. This is the project's standing rule at work: the measurement wins, the spec is edited.",
+      "policy_border": "ipv6_block switches exactly one step of Up: `ip -6 rule add unreachable priority 32000`, installed FIRST and therefore removed LAST (the journal unwinds LIFO), so there is no moment where the tunnel is up and IPv6 is open. Not switched: rules6 in netstate (§8.4 contract) and the -6 half of Reclaim (a startup obligation, §6.2) — neither branches behavior, so neither could go red.",
+      "registry": "docs/verification-agent.md §5.8 row W48 (TestW48UpBlocksIPv6, privilege-free: the list of Up steps is a pure function, upSteps) and §6 flag row ipv6_block. T28 lives in internal/l3 and is NOT named in the policy registry, by the standing rule: negcheck runs `go test`, and L3 skips without HOP_L3, so it would be green under any state of the flag — exactly the fixture_bad shape."
+    },
+    {
+      "what": "doclint — a document's claim about state must rest on something executable (the parallel task; not part of plan_order)",
+      "head": "09af0d2",
+      "decision_log": "implementation-notes.md, section 'doclint — утверждение документа о состоянии обязано опираться на исполнимое', including where the recognition boundary was drawn and why",
+      "shape": "internal/doclint (logic) + cmd/doclint (thin wrapper, like negcheck). Four checks: a T*/W* number must exist as a Go test (the number in the Test* function name or in its doc comment); a policy name must be registered in internal/policy; a path must exist; a branch or commit named in HANDOFF.json must resolve in git (-git=false switches that half off, and CI uses it: a checkout has neither the pass branches nor the full history).",
+      "recognition_boundary": "Deliberately conservative — a linter that shouts at every other word gets switched off. Paths are read only out of backticks (in JSON, out of string values) and only when the first segment is an existing top-level entry: one condition drops every quotation from refs/ and every import. A bare filename WITH a line reference is not checked at all (that is how foreign code is cited; own code is cited by full path). .json is excluded from extensions — nodes.json/health.json live on the user's disk. A policy is recognised only as `name=` or as a table cell containing nothing else.",
+      "red_before_fixes": "34 findings, including all three known true positives (ipv6_block unregistered, T25-T28 missing, the stale branch block in this very file). Fixed by writing docs/not-yet-written.md where the absence is honest, and by correcting the document where the claim was simply false (PLAN.md pointed at this very file under a name it has never had; T31 existed but carried no number in its doc comment).",
+      "no_flag": "A linter is not a product policy, and realtimelint carries none either. Argued explicitly in implementation-notes.md rather than left implicit."
+    }
+  ],
+  "parallel_passes_trap": {
+    "what_happened": "Two of the three passes independently took the next free registry number and both landed W48. Nothing catches this inside a single pass: each read the registry, saw W47 as the last row, and was right at the time it looked.",
+    "resolved_how": "0e1a198. W48 stayed with ipv6_block, whose tests carry the number in their NAMES (TestW48UpBlocksIPv6); the snapshot guard became W49 and got its number into the doc comment of TestStackStatsSeesRealBypassNAT — which doclint then demanded, because a registry number with no test behind it is exactly its first check.",
+    "rule_for_the_next_parallel_run": "Before a parallel pass writes a registry row, the controller hands out the numbers — or every pass writes its number into the test itself, where the collision is a compile-time-visible fact rather than a merge surprise."
   },
   "next_task": {
     "priority": 1,
-    "name": "Surface bypass.NAT.Stats() through netstack.Stack.Stats()",
-    "why_first": "It is the last piece of the bypass path that is invisible rather than absent, and this pass just made it worse in one specific way: bypass.Stats now carries three counters (Sockets, Orphaned, Rebound) and production reads none of them. Rebound in particular is the only way to tell 'the interface keeps flapping' from 'the network is fine', and it currently exists only for a test to read.",
-    "current_state": [
-      "bypass.NAT.Stats() is unreachable in production: nothing outside internal/bypass/*_test.go calls it. Verified by grep at the time of writing.",
-      "netstack.Stack.Stats() (internal/netstack/netstack.go) folds in natTable's stats but not the bypass NAT's, even though the Stack holds the sink (Config.Bypass). The sink is typed as the netstack.BypassSink interface, which has Send only — so folding it in means either widening that interface or type-asserting for an optional Stats() method. That choice is the task.",
-      "Consequence today: the idle sweep of bypass sockets only ever runs on Send (Stats() is the other place it runs from, and nobody calls it), so after traffic stops the sockets persist until Down. Parity with natTable, not a regression — but it is the second reason to wire Stats up.",
-      "A neighbour the bypass_tcp_reject pass left: Stats.Rejected now counts bypass-TCP refusals alongside fail-close ones, and nothing in the snapshot distinguishes them."
-    ],
-    "goal": "Whatever eventually surfaces Stack.Stats (CLI status, metrics) can see bypass socket count, orphaned replies and rebinds. Decide and argue how the sink exposes them: widen netstack.BypassSink, or keep Send-only and type-assert an optional interface.",
-    "reuse": [
-      "internal/netstack/netstack.go — Stack.Stats() and the natTable folding it already does is the pattern to copy.",
-      "internal/bypass/bypass.go — Stats() already exists, already sweeps, already documented as unreachable in production (the doc comment says so in as many words; that comment must be corrected by this task, not left behind)."
-    ],
-    "test_gap": {
-      "stays_green": "the whole internal/bypass suite, T17, T31, T32, T33, TestBypassSendErrorCountsAsBlocked, and both bypass_rebind guards (TestBypassInterfaceChangeRebindsSocket, TestBypassSocketRebindsOnInterfaceChange).",
-      "missing_and_needed": "A test that drives a datagram through the Stack's bypass path and then reads a non-zero bypass socket count out of Stack.Stats() — i.e. asserting the fold, not the counter. internal/netstack already has the fake sink (internal/fakenet) and internal/agent/bypass_test.go already drives a real bypass.NAT end to end; either is a plausible home."
-    },
-    "flag_to_add": {
-      "name": "probably none",
-      "note": "Observability that nothing branches on is not a policy — there is no behavior to disable and no test that could go red for the right reason. If the task does grow a behavioral half (e.g. the sweep starts running off a ticker rather than off Send), THAT half gets the flag, and the guard is written before the implementation, as the last four passes did."
-    }
+    "name": "Refuse, don't silence, IPv6 connections that predate `up`",
+    "why_first": "The one §5.6 hole the IPv6 pass measured and deliberately left open. After the rule lands, an ALREADY ESTABLISHED IPv6 socket leaks nothing but hangs to its own TCP timeout, and send() still reports success. On a dual-stack desktop that is every open browser connection at the moment of `up`. §5.6 says refuse, never go silent — and this is silence.",
+    "measured_starting_point": "`ss --kill -6 -t dst [<addr>]` under `unshare -Urn` returns 0 and turns the connection into ECONNABORTED. CAP_NET_ADMIN is enough, no root. ss ships in the same iproute2 as ip, so no new dependency. It needs CONFIG_INET_DIAG_DESTROY, which is not universal — that is degradation, not breakage, and the pass must decide what happens without it.",
+    "shape_question": "One sweep right after the rule is installed suffices, because after the rule no NEW IPv6 connection can be established. Whether to shell out to ss or to speak SOCK_DESTROY over netlink directly is the design call; the platform layer today only shells out to ip.",
+    "flag": "its own, e.g. ipv6_kill_established. NOT ipv6_block: with ipv6_block=off no rule exists, so no socket would ever be stale and the guard would go red for the wrong cause. Same argument that kept bypass_rebind out of bypass_sink.",
+    "test_gap": "An L3 test that opens an IPv6 connection BEFORE `up` and asserts it is refused, not hung, after. The stand is already built: internal/l3/harness_test.go grew a veth peer with a TCP echo server on fd00:9:9::2 and waitAddrsSettled for this pass."
   },
-  "parallel_task": {
-    "nature": "PARALLEL — does not block the main pass order and is not part of plan_order. Runs on its own branch alongside the queue; whoever picks up next_task should ignore this block.",
-    "name": "doclint: prose claims about state must be machine-checkable",
-    "why": "Two rot incidents were found in one day, both of the same kind: prose asserting a state that nothing verifies. (1) 'Global Constraint 9, constraints.md' was cited by two consecutive passes to justify deferring the bypass-socket task; the file has never existed in any branch, and when the argument was finally checked on its merits the task turned out to cost one optional field and one wiring line. (2) PLAN.md claimed 'T21–T29 проходят в netns'; four of them (T25, T26, T27, T28) do not exist as Go tests at all. Neither error was catchable by any existing check. What did NOT rot: negcheck, realtimelint, and the T-number index — every rule with an executable check behind it survived.",
-    "goal": "A third linter in the family of cmd/negcheck and cmd/realtimelint, pointed at the documents instead of the code, wired into .github/workflows/ci.yml, red on each of the two incidents above.",
-    "checks_it_must_perform": [
-      "Every T*/W* number named in SPEC.md §8 tables, PLAN.md or docs/verification-agent.md either exists as a Go test (grep for the number in a test name or its doc comment, the way T31/T32/T33/W36/W47 are written today) or appears in ONE explicit not-yet-written list that the linter itself reads.",
-      "Every policy name mentioned in PLAN.md or docs/verification-agent.md is registered in internal/policy/policies.go. (ipv6_block is named in PLAN.md today and is NOT registered — that is a true positive, not a bug in the linter; it belongs in the not-yet list.)",
-      "Every file path mentioned in HANDOFF.json, PLAN.md, SPEC.md and implementation-notes.md exists. This is the constraints.md check, and it is the same rule already written by hand in this file's citation_hygiene block — the point of this task is that the rule stops depending on a human remembering it."
-    ],
-    "known_true_positives_that_must_be_red_before_being_fixed": [
-      "PLAN.md: ipv6_block named as a live policy — not registered in internal/policy.",
-      "PLAN.md: T25, T26, T27, T28 named — no such Go tests.",
-      "HANDOFF.json: 'branch' and 'branch_note' describe four worktree branches waiting to be merged. All four were merged into main and deleted; main is now f6a2728. This block is stale in exactly the way the linter is meant to catch, and is itself a good test case for the path/state check."
-    ],
-    "starting_point": {
-      "patch": "/tmp/hop-doc-fixes.patch — uncommitted corrections already made to PLAN.md in the main working tree (5 factual fixes: the false T21–T29 claim in two places, the macOS/Windows workflows described as running when they are skeletons, the T25/T28 references in 'что должно сломаться', and the 'что осталось' list). Apply it as your first commit so there is one copy of this change, not two.",
-      "note": "After the patch is applied on your branch, the copy in the main working tree is redundant and will be discarded — do not expect it to be there, and do not try to edit /home/shafed/github/hop directly."
+  "queue": [
+    {
+      "task": "Довести Stack.Stats() до пользователя",
+      "why": "The counters now reach the stack snapshot and stop there: the agent does not forward it (wire.go exposes only DNSStats), and neither ipc nor cmd/hop knows about it. Rebound, the counter the whole rebind pass was for, is still readable nowhere but a test.",
+      "shape_hint": "The pattern to copy is next door: Agent.DNSStats() in internal/agent/wire.go and its consumer in cmd/hop/watch.go. The pass's real question is whether the counters join agent.Snapshot (docs/verification-agent.md §2, 'снимок по частям не годится') or travel by a separate call the way DNSStats does.",
+      "flag": "probably none — the same observability"
     },
-    "second_smaller_rule": "HANDOFF.json should carry pointers and traps, not retellings. Its most useful content across four passes was file:line references and named traps ('seen is refreshed on every Send'). Its worst was a paraphrase of PLAN.md's scope for the routing_lists task that contradicted PLAN.md and had to be overridden. A retelling is a second copy of the truth and it drifts. Write this down wherever conventions between passes live.",
-    "flag_to_add": "Probably none — a linter is not a product policy, and cmd/realtimelint carries no flag either. If you disagree, say so explicitly in implementation-notes.md: the registry rule is about new policies, not about refusing to add one.",
-    "gate": "Same gate as any pass. The linter itself needs a test that is red without it, in whatever form cmd/realtimelint's own coverage takes — check how realtimelint is tested before inventing a shape."
+    {
+      "task": "Уборка простоя сокетов bypass без трафика",
+      "why": "The price the stats pass named out loud: with traffic stopped, bypass sockets live until Close. natTable has the same fate for the same reason — neither table has a background ticker.",
+      "shape_hint": "A ticker on clock.Clock, or an external sweep (natTable has Sweep() for this; bypass.NAT does not). This IS behavior: a flag and a red-first guard are obligatory.",
+      "flag": "needed"
+    },
+    {
+      "task": "§6.10 lists from disk and CLI",
+      "detail": "netstack.Routing and agent.Config.Routing exist and are honored, but nothing outside Go code fills them: cmd/hop/main.go never sets Config.Routing and internal/store has no settings file at all. Closing this means an on-disk format, a CLI surface (§5.9) and validation of user-supplied prefixes and ports — a store question, not a verdict question.",
+      "note": "agent.Config.DNSUpstreams has exactly the same missing half and the same shape; solve both at once or neither."
+    },
+    {
+      "task": "T25, T26, T27 on L3",
+      "detail": "The three L3 tests listed in docs/not-yet-written.md with their reasons. All three wait on the same thing — a stand with a second interface. T28's stand (internal/l3/harness_test.go) is now most of it.",
+      "note": "The property behind each is already held one level down (W36 for T25; T14/T16 for T26; T12/T13 for T27), so this is coverage at the kernel level, not an open hole."
+    },
+    {
+      "task": "macOS dataplane",
+      "detail": "utun via AF_SYSTEM, SIOCAIFADDR, PF_ROUTE",
+      "note": "Two Linux-shaped mechanisms must be re-answered there, not ported: bypass_rebind compares interface NAMES, so outbound.Selector on macOS/Windows must publish the same thing (internal/outbound/selector_other.go is the stub), and ipv6_block is an `ip -6 rule` — the other platforms need their own way to refuse IPv6 while the tunnel is up, and refusing is not optional (§5.6)."
+    },
+    {
+      "task": "Windows dataplane",
+      "detail": "Wintun + wintun.dll delivery — §7 already resolved: pull from the official archive at build time, verify SHA-256 and vendor signature.",
+      "note": "platform.New() explicitly errors on both OSes today — correct behavior; a silent stub would give a green L3 with nothing actually checked. The .github/workflows/l3-macos.yml and l3-windows.yml jobs are skeletons that build and vet, and say so."
+    },
+    {
+      "task": "Свести §6.1 регистра и docs/not-yet-written.md в один источник",
+      "why": "There are two lists of what is deliberately unwritten: the prose paragraph in docs/verification-agent.md §6.1 and the machine-readable one. The paragraph has already drifted — it counts W14 and W33 as unwritten while their tests exist. Either the paragraph shrinks to reasons plus a pointer, or doclint learns to check the reverse direction.",
+      "size": "small, documents only"
+    },
+    {
+      "task": "Дать номера регистра тестам, закрывающим W29-W31",
+      "why": "§6.1 claims TestReportFailureHasOneCallSite covers them; the test carries no number, so three registry rows sit in the unwritten list although the check exists. Exactly the case T31 was in before doclint.",
+      "size": "small"
+    }
+  ],
+  "repo_hygiene_finding": {
+    "what": "Two compiled binaries, hop and hopd, are tracked in git (~48 MB each). They predate all of these passes — the last commit touching them is ba4459c.",
+    "why_it_matters_here": "They are also a source of false matches for any tool that greps the tree: doclint skips them only because it reads named documents, and a registry grep for a number hits the binaries' string tables.",
+    "not_done": "Removing them rewrites nothing but the index, yet it is a repository decision, not a pass decision. Left for the human."
   },
   "gate": {
     "commands": [
       "go test ./...",
       "go test -race <affected packages>",
+      "go run ./cmd/doclint .",
       "go run ./cmd/negcheck",
       "go run ./cmd/realtimelint ."
     ],
     "notes": {
-      "negcheck": "runs every guard twice (with/without its policy) via `go test -count=1`; 39 policies as of this pass, ~20-35 min wall clock on this machine — this is expected, not a hang; don't rely on go test's cache. Per-task gate only needs the new policy's own guard under HOP_DISABLE=<name>; the controller runs the full one at the end of the pass.",
+      "doclint": "New this pass. Fast. Runs in CI as `go run ./cmd/doclint -git=false .` — a checkout has neither the pass branches nor the full history, so the git half is off there and on locally.",
+      "negcheck": "runs every guard twice (with/without its policy) via `go test -count=1`; 40 policies as of this pass, ~20-35 min wall clock on this machine — this is expected, not a hang; don't rely on go test's cache. Per-task gate only needs the new policy's own guard under HOP_DISABLE=<name>; the controller runs the full one at the end.",
       "realtimelint": "does not accept ./... as an argument — pass literally `.`",
-      "l3_how_to_run": "Build once, run under an unprivileged user namespace: `go test -c -o /tmp/l3.test ./internal/l3` then `HOP_L3=1 unshare -Urn /tmp/l3.test` (add `-test.v -test.run '<pattern>'` to scope it). This works without root — unshare -Urn grants CAP_NET_ADMIN inside the fresh netns. Building the test binary once and reusing it across repeated unshare invocations is much faster than `go test` per run when iterating.",
-      "gate_correction": "go run ./cmd/realtimelint . is red on main and stayed exactly as red: 3 hits in internal/dnstest/realserver_test.go (lines 32, 72, 104) from commit 7916b55, no new ones — verified by comparing the full output, not the exit code. go vet ./... is likewise red at internal/engine/dialer.go:168 (copylocks in xray-core's SocketConfig), predating all these passes. `gofmt -l ./internal` reports internal/l2/dns_test.go, also pre-existing and untouched. The honest gate is 'no *new* findings' against these three.",
+      "l3_how_to_run": "Build once, run under an unprivileged user namespace: `go test -c -o /tmp/l3.test ./internal/l3` then `HOP_L3=1 unshare -Urn /tmp/l3.test` (add `-test.v -test.run '<pattern>'` to scope it). This works without root — unshare -Urn grants CAP_NET_ADMIN inside the fresh netns. Reusing the built binary across repeated unshare invocations is much faster than `go test` per run.",
+      "known_red_that_is_not_yours": "go vet ./... is red at internal/engine/dialer.go (copylocks in xray-core's SocketConfig). `go run ./cmd/realtimelint .` is red with 3 hits in internal/dnstest/realserver_test.go. `gofmt -l ./internal` reports internal/l2/dns_test.go. All three predate these passes; the honest gate is 'no NEW findings', compared on the full output rather than the exit code.",
       "flake": "internal/l2 TestT10SlowNodeKeepsConnectionAlive occasionally flakes on timing under load; re-run it alone before recording it as a regression."
     },
     "rule": "every new policy must ship with a test that is red without it"
-  },
-  "queue_after_bypass_rebind": [
-    {
-      "task": "IPv6 blocking under ipv6_block",
-      "red_without_it": "T28, internal/l3/tunnel_test.go"
-    },
-    {
-      "task": "macOS dataplane",
-      "detail": "utun via AF_SYSTEM, SIOCAIFADDR, PF_ROUTE",
-      "note": "bypass_rebind is Linux-shaped only in its source: the NAT compares interface NAMES, and Selector.Interface on macOS/Windows must publish the same thing for the mechanism to keep working there. internal/outbound/selector_other.go is the stub to look at."
-    },
-    {
-      "task": "Windows dataplane",
-      "detail": "Wintun + wintun.dll delivery — §7 already resolved: pull from the official archive at build time, verify SHA-256 and vendor signature.",
-      "note": "platform.New() explicitly errors on both OSes today — correct behavior; a silent stub would give a green L3 with nothing actually checked"
-    },
-    {
-      "task": "§6.10 lists from disk and CLI",
-      "detail": "netstack.Routing and agent.Config.Routing exist and are honored, but nothing outside Go code fills them: cmd/hop/main.go never sets Config.Routing and the store has no settings file at all (internal/store holds nodes, groups, health, secrets). Closing this means an on-disk format, a CLI surface (§5.9) and validation of user-supplied prefixes/ports — a store question, not a verdict question.",
-      "note": "agent.Config.DNSUpstreams has exactly the same missing half and the same shape; solve both at once or neither."
-    }
-  ]
+  }
 }
