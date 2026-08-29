@@ -158,6 +158,9 @@ func (n *NAT) socketFor(src netip.AddrPort) (*socket, error) {
 
 	now := n.clk.Now()
 	n.sweepLocked(now)
+	if known {
+		n.rebindLocked(iface)
+	}
 
 	if sock, ok := n.socks[src]; ok {
 		sock.seen = now
@@ -218,6 +221,39 @@ func (n *NAT) receive(sock *socket) {
 		sock.seen = n.clk.Now()
 		n.mu.Unlock()
 		n.cfg.Reply(packet.BuildUDP(peer, sock.src, buf[:read]))
+	}
+}
+
+// rebindLocked закрывает сокеты, привязанные не к нынешнему исходящему
+// интерфейсу. «Следствие первое» §6.8: привязка свежего сокета неизменна —
+// перепривязать его нельзя даже с правами, поэтому смена сети означает
+// передозвон, а не переустановку SO_BINDTODEVICE. Следующий Send заведёт
+// сокет заново, уже с нынешней привязкой.
+//
+// Закрываются все чужие по привязке сокеты, а не только тот, за которым
+// пришли. Событие общее: интерфейс сменился для всей машины, и оставленный
+// сокет продолжал бы не только слать через прежний интерфейс, но и принимать
+// на нём ответы своей горутиной receive, отдавая их в туннель.
+//
+// Уборка простоя тут ни при чём и заменить это не может: sock.seen
+// обновляется на каждый Send, и клиент, ретраящий обнаружение служб, держит
+// мёртвый по привязке сокет вечно молодым.
+//
+// Пустое sock.iface означает «привязка неизвестна» — так выглядит сокет,
+// заведённый без Config.Interface. Сравнивать его не с чем, и трогать его
+// нельзя: это в точности прежнее поведение, которое Config.Interface == nil и
+// обещает.
+func (n *NAT) rebindLocked(iface string) {
+	if !policy.BypassRebind.On() {
+		return
+	}
+	for src, sock := range n.socks {
+		if sock.iface == "" || sock.iface == iface {
+			continue
+		}
+		delete(n.socks, src)
+		_ = sock.conn.Close()
+		n.rebound++
 	}
 }
 
