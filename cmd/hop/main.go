@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -50,6 +51,7 @@ func main() {
 		list   = flag.Bool("nodes", false, "показать узлы из стора и выйти")
 		rm     = flag.String("rm", "", "удалить узел или группу по id и выйти")
 		probe  = flag.Bool("probe", false, "проверить узлы через outbound без туннеля и выйти")
+		routes = flag.Bool("routing", false, "показать списки §6.10 и апстримы §5.7 из настроек и выйти")
 	)
 	flag.Parse()
 
@@ -96,6 +98,18 @@ func main() {
 		fail(withStore(func(st *store.Store) error {
 			listNodes(st, os.Stdout)
 			return nil
+		}))
+		return
+	case *routes:
+		// Читающий режим, и он же — проверка файла: settings.json с кривым
+		// правилом до этого места не доводит, потому что отказывает store.Open
+		// (§5.6). Отдельной команды «проверить конфиг» поэтому не нужно.
+		root, err := storeRoot()
+		if err != nil {
+			fail(err)
+		}
+		fail(withStore(func(st *store.Store) error {
+			return showSettings(st, filepath.Join(root, "settings.json"), os.Stdout)
 		}))
 		return
 	}
@@ -192,7 +206,7 @@ func run(log *slog.Logger, cl control, tokenFile string, beat time.Duration, p t
 	tr := newTransport(cl, tokenFile, beat, log)
 	defer tr.close()
 
-	a, err = agent.New(agent.Config{
+	cfg := agent.Config{
 		Store:    st,
 		Health:   hm,
 		Trans:    tr,
@@ -209,7 +223,12 @@ func run(log *slog.Logger, cl control, tokenFile string, beat time.Duration, p t
 		// Разница только в том, кто сокет открывает — здесь bypass.NAT,
 		// а не резолвер.
 		BypassControl: bypassControl,
-	})
+	}
+	// Списки §6.10 и апстримы §5.7 — из настроек стора. Отдельным вызовом, а
+	// не полями литерала: шов молчалив, и W52 с W53 смотрят именно на него.
+	applySettings(&cfg, st)
+
+	a, err = agent.New(cfg)
 	if err != nil {
 		return err
 	}

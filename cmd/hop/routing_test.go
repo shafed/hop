@@ -134,7 +134,7 @@ func TestRoutingWithoutFileShowsDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := out.String()
-	for _, want := range []string{"умолчания", "224.0.0.251", "1.1.1.1:53"} {
+	for _, want := range []string{"умолчания", "224.0.0.251", "§5.7"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("в выводе -routing без файла нет %q:\n%s", want, got)
 		}

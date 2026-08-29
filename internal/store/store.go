@@ -34,6 +34,7 @@ const (
 	sectionGroups section = 1 << iota
 	sectionNodes
 	sectionHealth
+	sectionSettings
 )
 
 // Store — персистентность узлов, групп и живости (§3.4).
@@ -65,6 +66,10 @@ type Store struct {
 	// healthByNode — срез живости: то, чему можно верить после паузы (§2).
 	// Пополняется PutHealth, отдаётся Health, переживает рестарт.
 	healthByNode map[string]health.NodeHealth
+	// settings — настройки §6.10 и §5.7, прочитанные при Open. Только
+	// чтение: файл принадлежит человеку, стор его не правит и заводит лишь
+	// пустым, если файла нет.
+	settings Settings
 	// lastHealthAt — когда живость последний раз дошла до диска. По часам
 	// стора: дебаунс §2 не имеет права тратить настоящее время (см. health.go).
 	lastHealthAt time.Time
@@ -137,6 +142,9 @@ func (s *Store) load() error {
 		return err
 	}
 	s.readHealth()
+	if err := s.readSettings(); err != nil {
+		return err
+	}
 
 	if err := s.fixPerms(); err != nil {
 		return err
@@ -231,6 +239,7 @@ func files() []struct {
 		{groupsFile, publicPerm, sectionGroups},
 		{nodesFile, secretPerm, sectionNodes},
 		{healthFile, publicPerm, sectionHealth},
+		{settingsFile, publicPerm, sectionSettings},
 	}
 }
 
@@ -445,6 +454,8 @@ func (s *Store) encodeLocked(sec section) ([]byte, error) {
 		return encodeNodes(s.groupOrder, s.groups, s.nodes)
 	case sectionHealth:
 		return encodeHealth(s.healthByNode)
+	case sectionSettings:
+		return encodeSettings(s.settings)
 	}
 	return nil, fmt.Errorf("неизвестная секция %d", sec)
 }
