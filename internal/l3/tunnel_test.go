@@ -204,6 +204,123 @@ func TestAttachWithWrongTokenIsRejected(t *testing.T) {
 	}
 }
 
+// T28 — §8.4: `up`, IPv6-запрос → заблокирован, не ушёл мимо туннеля (§6.9).
+// Охраняется политикой ipv6_block.
+//
+// Почему тест обязан быть на L3, а не в netstack: пакет, не дошедший до TUN,
+// netstack не видит вовсе. Замер (implementation-notes.md, «Этап 8 —
+// блокировка IPv6») показал ровно это: при поднятом туннеле `ip -6 route get`
+// ведёт на физический интерфейс через таблицу main, соединение с внешним
+// пиром устанавливается и данные до него доходят. Таблица туннеля в IPv6
+// пуста и в поиске не участвует — то есть «IPv6 умирает в ветке !ok разбора»
+// (internal/netstack) описывает только тот IPv6, который в туннель попал, а
+// утечка идёт мимо него.
+//
+// Три утверждения, и каждое своё:
+//  1. до пира не дошло — контроль показывает, что стенд способен утечь;
+//  2. приложение получило отказ, а не молчание (§5.6);
+//  3. IPv4 при этом по-прежнему в туннеле — закрыт IPv6, а не всё подряд.
+func TestT28IPv6IsBlocked(t *testing.T) {
+	requireNetns(t)
+
+	peer := startPeer(t)
+	defer peer.stop()
+
+	mustRun(t, "ip", "addr", "add", localCIDR, "dev", "veth0")
+	mustRun(t, "ip", "-6", "addr", "add", local6CIDR, "dev", "veth0", "nodad")
+	mustRun(t, "ip", "link", "set", "veth0", "up")
+	waitAddrsSettled(t, "veth0")
+
+	// Контроль стенда. Без него краснота этого теста ничего не значила бы:
+	// netns без IPv6 дал бы «заблокирован» даром, и тест был бы зелен по
+	// причине, не имеющей отношения к политике.
+	c := dialPeer6(t)
+	if err := echo(c, "до туннеля"); err != nil {
+		t.Fatalf("стенд не даёт IPv6 до пира и до туннеля — проверять нечего: %v", err)
+	}
+	c.Close()
+
+	s := startService(t, orphanDeadline)
+	s.startAgent(filepath.Join(t.TempDir(), "token"))
+
+	// 1. Мимо туннеля не ушло. Пир слушает на своём IPv6-адресе и отвечает
+	// эхом на всё; установившееся соединение означало бы, что пакет вышел на
+	// физический интерфейс и вернулся.
+	target := fmt.Sprintf("[%s]:%d", peer6Addr, peerPort)
+	err, took := connect(target, 2*time.Second)
+	if err == nil {
+		t.Fatalf("IPv6-соединение с внешним пиром установилось при поднятом туннеле: "+
+			"трафик ушёл мимо туннеля (%s)", sh("ip", "-6", "route", "get", peer6Addr))
+	}
+
+	// 2. Отказ, а не молчание (§5.6): то же различие, что меряют T23-fast и
+	// T23b, и та же граница между unreachable и blackhole.
+	if !isUnreachable(err) {
+		t.Fatalf("IPv6 отказал не маршрутизацией, а иначе: %v за %v — "+
+			"похоже на молчаливый дроп, а §5.6 требует отказа", err, took)
+	}
+	if took > 500*time.Millisecond {
+		t.Fatalf("отказ IPv6 занял %v — это не отказ, а ожидание", took)
+	}
+	if err := udpProbe(target, 500*time.Millisecond); !isUnreachable(err) {
+		t.Fatalf("датаграмма IPv6 не получила отказа: %v", err)
+	}
+
+	// 3. Закрыт IPv6, а не всё: IPv4 по-прежнему уходит в туннель.
+	if got := sh("ip", "route", "get", "203.0.113.7"); !strings.Contains(got, ifname) {
+		t.Fatalf("IPv4 перестал уходить в туннель: %s", got)
+	}
+	t.Logf("IPv6 отказал за %v: %v; правила IPv6: %s", took, err, strings.TrimSpace(rules6()))
+}
+
+// Вторая половина того же: блокировка обязана быть снята вместе с туннелем и
+// уложиться в снапшот §8.4. Правило IPv6 живёт в собственной базе, поэтому
+// пережить down оно может независимо от всего, что снимает T22.
+func TestT28IPv6ReturnsAfterDown(t *testing.T) {
+	requireNetns(t)
+
+	peer := startPeer(t)
+	defer peer.stop()
+
+	mustRun(t, "ip", "addr", "add", localCIDR, "dev", "veth0")
+	mustRun(t, "ip", "-6", "addr", "add", local6CIDR, "dev", "veth0", "nodad")
+	mustRun(t, "ip", "link", "set", "veth0", "up")
+	waitAddrsSettled(t, "veth0")
+
+	s := startService(t, orphanDeadline)
+	tok := filepath.Join(t.TempDir(), "token")
+	a := s.startAgent(tok)
+
+	_ = a.cmd.Process.Signal(syscall.SIGTERM)
+	_, _ = a.cmd.Process.Wait()
+	s.stop()
+	waitLink(t, ifname, false)
+
+	if r := rules6(); strings.Contains(r, "32000:") {
+		t.Fatalf("правило блокировки IPv6 пережило down: %s", r)
+	}
+	c := dialPeer6(t)
+	defer c.Close()
+	if err := echo(c, "после down"); err != nil {
+		t.Fatalf("IPv6 не вернулся после down: %v", err)
+	}
+	s.verifySnapshot()
+}
+
+// dialPeer6 — то же, что dialPeer, по IPv6. Отдельная функция, а не параметр:
+// адрес IPv6 в строке подключения берётся в скобки, и одна общая обёртка
+// свелась бы к тому же ветвлению, только спрятанному.
+func dialPeer6(t *testing.T) net.Conn {
+	t.Helper()
+	var c net.Conn
+	waitUntil(t, 5*time.Second, "IPv6-соединения с пиром", func() bool {
+		var err error
+		c, err = net.DialTimeout("tcp6", fmt.Sprintf("[%s]:%d", peer6Addr, peerPort), time.Second)
+		return err == nil
+	})
+	return c
+}
+
 // T29 — смерть самого владельца маршрутов. §6.2 покрывает смерть агента, но не
 // смерть сервиса. Тест смотрит, какие правила переживают `kill -9` сервиса.
 func TestT29ServiceDeath(t *testing.T) {

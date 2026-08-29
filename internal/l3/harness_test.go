@@ -137,15 +137,38 @@ func (s *service) cleanup() {
 
 // dropHopRules снимает всё, что раскладывает hopd, по приоритету. Приоритеты
 // выбраны так, чтобы уборка не могла случайно снять чужое правило.
+//
+// Оба семейства: правило блокировки IPv6 (§6.9) живёт в собственной базе, и
+// `ip rule del` его не видит. Забытая половина не мешала бы упавшему тесту, а
+// пачкала бы снапшот следующего — то есть красила бы T22 чужой краснотой.
 func dropHopRules() {
-	for _, prio := range []string{"31000", "31500", "32000"} {
-		for i := 0; i < 32; i++ {
-			if exec.Command("ip", "rule", "del", "priority", prio).Run() != nil {
-				break
+	for _, family := range [][]string{{"ip", "rule", "del"}, {"ip", "-6", "rule", "del"}} {
+		for _, prio := range []string{"31000", "31500", "32000"} {
+			for i := 0; i < 32; i++ {
+				args := append(append([]string(nil), family...), "priority", prio)
+				if exec.Command(args[0], args[1:]...).Run() != nil {
+					break
+				}
 			}
 		}
 	}
 }
+
+// waitAddrsSettled ждёт, пока с адресов интерфейса уйдёт флаг tentative.
+//
+// DAD меняет вывод `ip addr` асинхронно, уже после того как команда вернула
+// успех, а §8.4 сравнивает снапшоты побайтово: снятый внутри этого окна
+// снапшот не совпадёт с самим собой через секунду, и упадёт не то, что
+// проверяется.
+func waitAddrsSettled(t *testing.T, dev string) {
+	t.Helper()
+	waitUntil(t, 10*time.Second, "завершения DAD на "+dev, func() bool {
+		return !strings.Contains(sh("ip", "-o", "addr", "show", "dev", dev), "tentative")
+	})
+}
+
+// rules6 — правила маршрутизации IPv6. Отдельная база, отдельная команда.
+func rules6() string { return sh("ip", "-o", "-6", "rule", "show") }
 
 // verifySnapshot — общий платформенный контракт §8.4: снапшот после down
 // обязан совпасть с исходным.
