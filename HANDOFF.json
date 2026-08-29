@@ -2,89 +2,87 @@
   "status": "machine-readable — only for the next AI session, not for human reading. Human-readable history/decisions live in PLAN.md and implementation-notes.md.",
   "convention": "This file carries POINTERS AND TRAPS, not retellings. A задача is cited by its section in PLAN.md or SPEC.md, never paraphrased here: a paraphrase is a second copy of the truth and it drifts (it already did once, for routing_lists). What belongs here instead: file and symbol pointers, measured facts, rejected shapes with their arguments, and the traps that cost the last passes time. Written down in full in implementation-notes.md, section 'doclint — утверждение документа о состоянии обязано опираться на исполнимое'.",
   "branch": "main",
-  "branch_note": "The ipv6_kill_established pass is four implementation/documentation commits ending at 808712f, based directly on 9cca057 = main at the start of the pass, followed by this handoff update. It was independently rechecked and fast-forwarded into local main. Nothing was pushed.",
+  "branch_note": "FOUR passes ran in parallel worktrees off 9cca057's successor 25d57f6 and are all merged into local main in this order: pass/stats-to-user (ff), pass/bypass-idle, pass/registry-docs, pass/routing-lists. The merge commits are 43005d5, 67d080f and 11be8f7; every conflict was in a document, none in Go code. Nothing was pushed; the four branches still exist locally, their worktrees were removed.",
   "citation_hygiene": {
     "rule": "Every path, T/W number, policy name and git ref named in this file must exist. This is no longer a convention a human has to remember — `go run ./cmd/doclint .` checks it, and CI runs it as `go run ./cmd/doclint -git=false .`.",
     "why_this_block_still_exists": "It records what the check is FOR. Two consecutive passes cited 'Global Constraint 9, constraints.md' — a file that never existed in any branch — and the citation was what justified deferring a task that, when finally checked on its merits, cost one optional field and one wiring line. The rule that citation stood in for: a pass closes its own queue item and does not widen into neighbouring modules; where the correct shape does require changing another package, that is recorded in Deviations with an argument — it is not grounds to defer the task silently.",
-    "exceptions_list": "docs/not-yet-written.md — the single list doclint reads. It goes red in BOTH directions: a line that has become unnecessary is a finding too, so the list cannot rot into a dumping ground."
+    "exceptions_list": "docs/not-yet-written.md — the single list doclint reads. It goes red in BOTH directions: a line that has become unnecessary is a finding too, so the list cannot rot into a dumping ground.",
+    "new_this_pass": "doclint now also reads the PROSE list of the deliberately-unwritten in docs/verification-agent.md §6.1 and reds when the prose declares a number unwritten while a test with that number exists. The section that the check reads is opened by a whole line `<!-- doclint:unwritten -->`; only a bold bullet head is read as a declaration. Before it existed the prose had drifted on three numbers (W8, W14, W33) — including one the previous HANDOFF did not know about."
   },
-  "plan_order": "9 (remainder) — Linux dataplane closed except T25-T27; §6.10 lists and the platform branches are what is left",
+  "plan_order": "9 (remainder) — Linux dataplane closed except T25-T27; §5.9 (CLI surface) is what stage 9 still owes, and three registered-but-unwritten policies live there",
   "closed_this_pass": [
     {
-      "what": "Surface bypass.NAT.Stats() through netstack.Stack.Stats() (the previous HANDOFF's next_task, priority 1)",
-      "head": "449ba62",
-      "decision_log": "implementation-notes.md, section 'Этап 9 — счётчики bypass в снимке стека (`Stack.Stats`)'",
-      "shape": "BypassSink stayed Send-only; the counters arrive through an OPTIONAL interface BypassStatSource { Stats() bypass.Stats } and a type assertion in Stack.Stats(). Load-bearing argument: the ability belongs to whoever has sockets, the obligation would have fallen on everyone — including fakenet.Bypass, which deliberately depends on neither testing nor product packages. Same device as StreamResolver/FlushableResolver, in the same file.",
-      "price_named_out_loud": "A missed type assertion is silent — it reports zeros. That is why the registered guard (W49) puts a real bypass.NAT behind the stack rather than a fake sink.",
-      "two_side_decisions": [
-        "The idle sweep was REMOVED from bypass.NAT.Stats(): a getter that changes the observed is behavior, and behavior owes a flag. Price: with traffic stopped, bypass sockets now live until Close — see next_task priority 3.",
-        "Stats.Rejected no longer sums fail-close refusals with bypass-TCP refusals; the second half is BypassTCPRejected. The sum is preserved and no existing assertion moved."
-      ],
-      "registry": "docs/verification-agent.md §5.8 row W49 (TestStackStatsSeesRealBypassNAT). No flag: an observability fold nothing branches on is not a policy."
+      "what": "Довести Stack.Stats() до пользователя (the previous HANDOFF's next_task, priority 1)",
+      "head": "1d075f1",
+      "decision_log": "implementation-notes.md, section 'Этап 9 — счётчики стека доходят до пользователя (`StackStats`, W54)'",
+      "shape": "Agent.StackStats() (netstack.Stats, bool) in internal/agent/wire.go, next to DNSStats, plus a DEBUG line «стек» in cmd/hop/watch.go. The `bool` is false before Up and after Down.",
+      "rejected_shape": "Folding the counters into agent.Snapshot, which §2 of docs/verification-agent.md seems to demand ('снимок по частям не годится'). Rejected on two facts: layer 1 of the assembly is declared dependency-free and Snapshot lives in internal/agent/agent.go, so the field would drag netstack in — and a mirrored struct in agent would be a second copy of the truth; and §2's argument is about state a test assembles from several getters, while these counters are cumulative.",
+      "reset_semantics_named": "Counters live exactly as long as the Stack: Up builds a new one and the count restarts. There is no in-place reset — zeroing on read would make the snapshot change the observed, the same argument that moved the idle sweep out of bypass.NAT.Stats().",
+      "lock_order_note": "a.mu is released BEFORE stack.Stats(). bypass.NAT calls a.deliverBypass from its reader goroutine and that takes a.mu; today Reply is invoked outside n.mu (internal/bypass/bypass.go), so there is no cycle — but it would be one edit away, and the price is a deadlock, not a red test.",
+      "registry": "docs/verification-agent.md §5.8 row W54. No flag (same argument as W49). Two guards, deliberately different in kind: TestW54AgentPublishesStackStats (internal/agent) is about the honesty of absence; TestW54EveryStackCounterReachesTheLog (cmd/hop) is about drift — it compares the label table with the fields of netstack.Stats through reflect, so a new counter cannot be added without reaching the user. Verified by adding a throwaway field: the check named it.",
+      "deliberately_not_done": "The IPv6 sweep count and the unsupported-kernel degradation (W50) stay a hopd log. Different owner (platform layer in the SERVICE), one-shot event, and turning it into a cumulative number would need an ipc field and its own reset semantics."
     },
     {
-      "what": "IPv6 blocking under ipv6_block (queue item 1; SPEC §6.9). T28 written and green in netns",
-      "head": "ca7a096",
-      "decision_log": "implementation-notes.md, section 'Этап 8 — блокировка IPv6 (`ipv6_block`, T28, W48)' — six measurements, the mechanism, the policy border, four Deviations",
+      "what": "Уборка простоя сокетов bypass без трафика (queue item; the price the stats pass named out loud)",
+      "head": "5244948",
+      "decision_log": "implementation-notes.md, section 'Этап 9 — уборка простоя сокетов bypass без трафика (`bypass_idle_sweep`, W51)'",
+      "shape": "A background ticker on clock.Clock inside bypass.NAT (sweepLoop/sweepNow), period Idle/2, stopped by `done` from Close and awaited by the same WaitGroup as the reader goroutines. An external Sweep() was rejected: bypass.NAT has no owner with a loop of its own — natTable.Sweep() proves the point, it exists since the previous stage and is called nowhere in the product, only in the B3 measurement.",
+      "measured_not_assumed": "A ticker created INSIDE the goroutine loses the ticks of an injected clock: clock.Fake counts the first tick from NewTicker, and an Advance that outran the scheduler delivered nothing. Green on a single run, red on `go test -count=20 -race`. The ticker moved into New. On a system clock the defect would have been invisible.",
+      "policy_border": "bypass_idle_sweep switches ONLY the background half. The sweep inside Send stays on under any flag state — it predates this pass and has its own green test (TestBypassIdleClosesSocket), so putting it under the new flag would make the guard red for two reasons at once. Disabled, the flag leaves neither goroutine nor ticker.",
+      "registry": "docs/verification-agent.md §5.8 row W51 and §6 flag row bypass_idle_sweep. Guard: TestW51IdleSocketIsCollectedWithoutTraffic. Independently rechecked by the controller: green normally, red with HOP_DISABLE=bypass_idle_sweep («Sockets = 1, ожидался 0») and nothing else in the package goes red.",
+      "price_named_out_loud": "natTable (internal/netstack/udp.go) still has the same fate for the same reason — see queue."
+    },
+    {
+      "what": "Два маленьких пункта очереди про регистр: номера для W29-W31 и сведение двух списков ненаписанного",
+      "head": "1e780c3",
+      "decision_log": "implementation-notes.md, section 'doclint — второе направление: проза, объявившая номер ненаписанным'",
       "measured_not_assumed": [
-        "With the tunnel up, IPv6 leaves through the PHYSICAL interface and the connection to an outside peer establishes. The tunnel table is empty for IPv6 and never participates in the lookup, because Up only ever ran `ip route add` — an IPv4-family command. So the leak goes PAST the TUN, and the !ok branch of netstack parsing has nothing to do with it: a packet that never reaches the device is a packet the stack never sees.",
-        "unreachable → ENETUNREACH, prohibit → EACCES, blackhole → EINVAL. unreachable chosen: blackhole is silence, which §5.6 forbids, and ENETUNREACH is the signal Happy Eyeballs falls back to IPv4 on without delay.",
-        "sysctl disable_ipv6 was rejected BY MEASUREMENT: it destroys global addresses and does not bring them back, so the snapshot diverges by three lines — the mechanism breaks §8.4 by construction.",
-        "The netstate snapshot did not see IPv6 rules at all (`ip -o rule show` is IPv4-only). A rules6 section was added; verified by the reverse experiment — Reclaim without its -6 half drops T29."
+        "Of W29/W30/W31 only W29 was true: TestReportFailureHasOneCallSite (internal/engine/callsite_test.go) walks the tree from the module root, so a new package is linted automatically. It now carries the number.",
+        "W30 and W31 are behavioural rows and that AST test can never close them — and the end-to-end path does not exist in the product either: internal/agent/dialer.go says outright that the dialer does not call health.ReportFailure, the verdict is set in internal/engine/classify.go. Both stayed in docs/not-yet-written.md with THAT reason instead of the inherited one.",
+        "The prose of §6.1 was wrong about W14 and W33 (their tests exist) and about W8, which the previous HANDOFF did not even list."
       ],
-      "spec_correction": "SPEC §6.9 said IPv6 'is blocked at the level of TUN routes'. Measurement disproved it; the section is rewritten. This is the project's standing rule at work: the measurement wins, the spec is edited.",
-      "policy_border": "ipv6_block switches exactly one step of Up: `ip -6 rule add unreachable priority 32000`, installed FIRST and therefore removed LAST (the journal unwinds LIFO), so there is no moment where the tunnel is up and IPv6 is open. Not switched: rules6 in netstate (§8.4 contract) and the -6 half of Reclaim (a startup obligation, §6.2) — neither branches behavior, so neither could go red.",
-      "registry": "docs/verification-agent.md §5.8 row W48 (TestW48UpBlocksIPv6, privilege-free: the list of Up steps is a pure function, upSteps) and §6 flag row ipv6_block. T28 lives in internal/l3 and is NOT named in the policy registry, by the standing rule: negcheck runs `go test`, and L3 skips without HOP_L3, so it would be green under any state of the flag — exactly the fixture_bad shape."
+      "shape": "The second of the two outcomes the previous HANDOFF offered: doclint learned the reverse direction rather than the paragraph being shrunk. Argument: shrinking removes today's divergence, not the mechanism; the reasons would still be prose, and the discipline of returning to them has now lost three times. ~40 lines and two fixtures.",
+      "also": "The list of green numbers ('Реализовано и зелено: W1–W3, …') is gone from §6.1 — it was a second source of truth that went stale on every new registry row. Replaced by 'everything except what is listed below', which doclint and go test actually hold up.",
+      "trap_hit_on_the_way": "A doc comment that mentions a number in order to say the test does NOT cover it is still read as a claim of coverage — doclint went red on it. Neighbouring numbers are now named in words."
     },
     {
-      "what": "Refuse, don't silence, IPv6 TCP connections that predate `up` (ipv6_kill_established, W50)",
-      "head": "808712f",
-      "decision_log": "implementation-notes.md, section 'Этап 8 — отказ соединениям IPv6 старше туннеля (`ipv6_kill_established`, W50)'",
-      "shape": "Immediately after the ipv6_block rule, Linux dumps TCP6 sockets with inet_diag and destroys eligible pre-existing sockets via a hand-serialized SOCK_DESTROY request. It repeats while a round destroys anything, at most four rounds, to narrow the connect()/diag race. `ss --kill` was rejected by measurement: it returns 0 on EPERM and its default TCP state filter misses SYN_SENT.",
-      "boundary": "Only non-local, non-listening, genuine IPv6 sockets are targets; own addresses, ::1 and IPv4-mapped sockets are left alone. The step exists only when BOTH ipv6_block and ipv6_kill_established are on. It has no rollback because socket destruction is deliberately irreversible and sockets are outside the netstate snapshot.",
-      "degradation": "A kernel without INET_DIAG_DESTROY does not bring Up down: the blocking rule is already installed, so confidentiality is preserved; hopd logs a Warn with the reason and the count left alive. This loses prompt refusal, not the block.",
-      "registry": "docs/verification-agent.md §5.8 row W50 (TestW50UpSweepsSilencedIPv6) and §6 flag row ipv6_kill_established. TestW50IPv6EstablishedIsAbortedNotSilenced is the real-kernel half and deliberately stays outside the registry because it skips without HOP_L3.",
-      "post_pass_verification": [
-        "Full `go test ./...` passed outside the network-restricted sandbox; the sandbox-only run failed solely because internal/engine could not listen on 127.0.0.1:0.",
-        "The affected-package race run passed; doclint is clean; W50 is green normally, red with HOP_DISABLE=ipv6_kill_established, and green (skipped by policy boundary) with HOP_DISABLE=ipv6_block.",
-        "The real W50 L3 test passed in unshare -Urn: hopd destroyed two sockets; ESTABLISHED and SYN_SENT both returned ECONNABORTED in microseconds.",
-        "Full negcheck was run after the report, outside the network-restricted sandbox: all 41 policies are guarded by a red test. The first sandboxed attempt produced only eight oracle defects from forbidden loopback listen calls and is not a product result.",
-        "The report's IPv4 follow-up was measured correctly on 203.0.113.2, outside LocalPrefixes. In 5/5 isolated-netns runs the post-up route was hopt0/table 8421 and the pre-up direct TCP connection received an immediate RST; it never continued directly. No IPv4 SOCK_DESTROY policy is justified by this scenario. The temporary measurement test was removed and the worktree was clean afterward."
-      ]
-    },
-    {
-      "what": "doclint — a document's claim about state must rest on something executable (the parallel task; not part of plan_order)",
-      "head": "09af0d2",
-      "decision_log": "implementation-notes.md, section 'doclint — утверждение документа о состоянии обязано опираться на исполнимое', including where the recognition boundary was drawn and why",
-      "shape": "internal/doclint (logic) + cmd/doclint (thin wrapper, like negcheck). Four checks: a T*/W* number must exist as a Go test (the number in the Test* function name or in its doc comment); a policy name must be registered in internal/policy; a path must exist; a branch or commit named in HANDOFF.json must resolve in git (-git=false switches that half off, and CI uses it: a checkout has neither the pass branches nor the full history).",
-      "recognition_boundary": "Deliberately conservative — a linter that shouts at every other word gets switched off. Paths are read only out of backticks (in JSON, out of string values) and only when the first segment is an existing top-level entry: one condition drops every quotation from refs/ and every import. A bare filename WITH a line reference is not checked at all (that is how foreign code is cited; own code is cited by full path). .json is excluded from extensions — nodes.json/health.json live on the user's disk. A policy is recognised only as `name=` or as a table cell containing nothing else.",
-      "red_before_fixes": "34 findings, including all three known true positives (ipv6_block unregistered, T25-T28 missing, the stale branch block in this very file). Fixed by writing docs/not-yet-written.md where the absence is honest, and by correcting the document where the claim was simply false (PLAN.md pointed at this very file under a name it has never had; T31 existed but carried no number in its doc comment).",
-      "no_flag": "A linter is not a product policy, and realtimelint carries none either. Argued explicitly in implementation-notes.md rather than left implicit."
+      "what": "§6.10 lists from disk and CLI, together with the identical missing half of DNSUpstreams (queue item)",
+      "head": "db922ed",
+      "decision_log": "implementation-notes.md, section 'Этап 9 — списки §6.10 и апстримы §5.7 на диске (`settings_file`, W52, W53)'",
+      "shape": "settings.json — a fourth section of the §2 layout in internal/store/settings.go, 0644, written through the store's existing writer/fixPerms/sweep. Read at Open, never written by hop. cmd/hop/routing.go behind `hop -routing` (a temporary flag in the Р40 row with -sub/-nodes/-probe), and cmd/hop/main.go applies the settings to agent.Config through applySettings.",
+      "two_side_decisions": [
+        "Settings.Routing is a POINTER: 'no section' means the §6.10 defaults, 'section present and empty' means empty lists, i.e. the user removed service discovery — which §6.10 explicitly allows ('умолчание, а не пол'). A slice could not express the difference. Guarded by S43.",
+        "The rule type is netstack.Rule, so internal/store now imports internal/netstack (and through it gvisor). A twin type in the store plus a mapping in cmd/hop was rejected: the mapping would drift silently and store tests would not catch it, because it would not live in the store. Recorded in Deviations."
+      ],
+      "validation": "All refusals, never silent defaults — the nodes.json side of Р13, not the health.json side: a silently dropped `block udp/137` is a decision of the user's that disappears without a word. Broken JSON, an empty file, a version from the future, an unparsable prefix, an unmasked prefix (192.168.10.5/24), an unknown proto, a port out of range, an empty rule `{}` and a hostname or portless DNS upstream all refuse the start with a message that names the fix; the file is left byte-for-byte alone. Measured live by the controller, not only by tests: exit=1, file hash unchanged.",
+      "registry": "docs/verification-agent.md §5.8 rows W52 and W53 (numbers are in the test names, cmd/hop/routing_test.go), §6 flag row settings_file, and docs/verification-store.md rows S40-S46. Guards verified by the controller under HOP_DISABLE=settings_file: exactly S40, S41, S43, S44, W52, W53 and the -routing rendering test go red.",
+      "left_open_on_purpose": "No `--json` for -routing (nothing else has it either; the schema gets fixed once, with the subcommands), and no WRITING of settings from the CLI at all — `routing add`/`routing rm` are marked in SPEC.md as deliberately absent in v1, the file is edited by hand."
     }
   ],
   "parallel_passes_trap": {
-    "what_happened": "Two of the three passes independently took the next free registry number and both landed W48. Nothing catches this inside a single pass: each read the registry, saw W47 as the last row, and was right at the time it looked.",
-    "resolved_how": "0e1a198. W48 stayed with ipv6_block, whose tests carry the number in their NAMES (TestW48UpBlocksIPv6); the snapshot guard became W49 and got its number into the doc comment of TestStackStatsSeesRealBypassNAT — which doclint then demanded, because a registry number with no test behind it is exactly its first check.",
-    "rule_for_the_next_parallel_run": "Before a parallel pass writes a registry row, the controller hands out the numbers — or every pass writes its number into the test itself, where the collision is a compile-time-visible fact rather than a merge surprise."
+    "what_happened_before": "Two of three passes independently took the next free registry number and both landed W48. Nothing catches this inside a single pass: each read the registry, saw W47 as the last row, and was right at the time it looked.",
+    "what_was_done_this_time": "The controller handed out the numbers BEFORE the passes started (W51 to the idle sweep, W52-W53 to the lists, W54 kept for its own pass) and required each number to stand in the test NAME. No collision occurred. Repeat this: it is the cheap half.",
+    "what_the_zones_did_not_catch": "Every merge conflict of the four passes landed in exactly three places, and a next parallel run should expect them: the tail of the §5.8 table, the flag table in §6, and the tail of implementation-notes.md. Two more shapes cost a minute each: the §6.1 line that counted the green numbers (now deleted, so it can no longer conflict), and a heading level — pass sections in implementation-notes.md are `###`, and a pass that writes `##` is not wrong enough to notice on its own.",
+    "rule_for_the_next_parallel_run": "Hand out registry numbers in advance and require them in test names; name the zones per-file; and expect to resolve document tails by hand — that part is the controller's job, not a defect of the split."
   },
   "next_task": {
     "priority": 1,
-    "name": "Довести Stack.Stats() до пользователя",
-    "why_first": "The counters already reach netstack.Stack.Stats() but stop there: the agent forwards only DNSStats, and neither ipc nor cmd/hop exposes the stack counters. Rebound and the new IPv6 sweep outcome are currently observable only in tests or hopd logs.",
-    "shape_question": "Decide whether counters join agent.Snapshot (docs/verification-agent.md §2 says a snapshot in pieces is not a snapshot) or travel through a separate call like Agent.DNSStats() in internal/agent/wire.go and cmd/hop/watch.go. Include the IPv6 sweep count and unsupported-kernel degradation only if their ownership and lifetime fit the same snapshot; do not silently turn a log event into a cumulative counter without specifying reset semantics.",
-    "flag": "probably none — observability does not branch product behavior"
+    "name": "§5.9 — поверхность CLI этапа 9: подкоманды, коды возврата, --json",
+    "why_first": "Stage 9 is the remaining plan item and three registered policies are waiting for the same code: `event_broadcast`, `exit_codes` and `json_schema` sit in docs/not-yet-written.md under «Политики» with the reason 'кода нет'. The temporary flags have now grown to six (-sub, -node, -nodes, -rm, -probe, -routing, Р40 in docs/verification-agent.md): they were always meant to become subcommands all at once, and each new flag makes that conversion bigger.",
+    "shape_question": "Decide the subcommand grammar and the exit-code map (§5.9 fixes 0/1/2/3) BEFORE writing the --json schema, and fix the schema in one place: S33 of docs/verification-store.md already says the check holds on the function that shapes the output, not on the command. `hop -routing` (cmd/hop/routing.go) is the newest reading command and the most convenient first customer for both.",
+    "flag": "three already exist and are registered — exit_codes, json_schema, event_broadcast; their rows leave docs/not-yet-written.md as the code lands"
   },
   "queue": [
     {
-      "task": "Уборка простоя сокетов bypass без трафика",
-      "why": "The price the stats pass named out loud: with traffic stopped, bypass sockets live until Close. natTable has the same fate for the same reason — neither table has a background ticker.",
-      "shape_hint": "A ticker on clock.Clock, or an external sweep (natTable has Sweep() for this; bypass.NAT does not). This IS behavior: a flag and a red-first guard are obligatory.",
-      "flag": "needed"
+      "task": "Уборка простоя natTable без трафика",
+      "why": "The price the bypass pass named out loud in its turn: bypass.NAT now collects idle sockets by itself, natTable (internal/netstack/udp.go) still waits for the next packet or for close(). Same defect, same cure.",
+      "shape_hint": "bypass.NAT's sweepLoop is the worked example, including the trap: create the ticker in the constructor, not inside the goroutine, or an injected clock delivers no ticks at all. natTable.Sweep() already exists as the forced-turn entry point.",
+      "flag": "needed — this is behavior, and its guard must be red without it"
     },
     {
-      "task": "§6.10 lists from disk and CLI",
-      "detail": "netstack.Routing and agent.Config.Routing exist and are honored, but nothing outside Go code fills them: cmd/hop/main.go never sets Config.Routing and internal/store has no settings file at all. Closing this means an on-disk format, a CLI surface (§5.9) and validation of user-supplied prefixes and ports — a store question, not a verdict question.",
-      "note": "agent.Config.DNSUpstreams has exactly the same missing half and the same shape; solve both at once or neither."
+      "task": "Сквозной путь «отказ трафика → живость» (W30, W31)",
+      "why": "Now honestly named as unwritten with a real reason instead of an inherited one: the dialer deliberately does not call health.ReportFailure, the verdict lives in internal/engine/classify.go, and neither T20 nor TestStreamErrorIsNotFatal goes through the agent. Closing this means either an end-to-end test through the assembly or an argued statement that the rows describe a path the product does not have.",
+      "size": "medium; the answer may be a documented refusal rather than a test"
     },
     {
       "task": "T25, T26, T27 on L3",
@@ -100,16 +98,6 @@
       "task": "Windows dataplane",
       "detail": "Wintun + wintun.dll delivery — §7 already resolved: pull from the official archive at build time, verify SHA-256 and vendor signature.",
       "note": "platform.New() explicitly errors on both OSes today — correct behavior; a silent stub would give a green L3 with nothing actually checked. The .github/workflows/l3-macos.yml and l3-windows.yml jobs are skeletons that build and vet, and say so."
-    },
-    {
-      "task": "Свести §6.1 регистра и docs/not-yet-written.md в один источник",
-      "why": "There are two lists of what is deliberately unwritten: the prose paragraph in docs/verification-agent.md §6.1 and the machine-readable one. The paragraph has already drifted — it counts W14 and W33 as unwritten while their tests exist. Either the paragraph shrinks to reasons plus a pointer, or doclint learns to check the reverse direction.",
-      "size": "small, documents only"
-    },
-    {
-      "task": "Дать номера регистра тестам, закрывающим W29-W31",
-      "why": "§6.1 claims TestReportFailureHasOneCallSite covers them; the test carries no number, so three registry rows sit in the unwritten list although the check exists. Exactly the case T31 was in before doclint.",
-      "size": "small"
     }
   ],
   "gate": {
@@ -121,8 +109,8 @@
       "go run ./cmd/realtimelint ."
     ],
     "notes": {
-      "doclint": "New this pass. Fast. Runs in CI as `go run ./cmd/doclint -git=false .` — a checkout has neither the pass branches nor the full history, so the git half is off there and on locally.",
-      "negcheck": "runs every guard twice (with/without its policy) via `go test -count=1`; 41 policies as of this pass, ~20-35 min wall clock on this machine — this is expected, not a hang; don't rely on go test's cache. It needs permission to listen on loopback: a network-restricted sandbox creates false oracle defects. Per-task gate only needs the new policy's own guard under HOP_DISABLE=<name>; the controller runs the full one at the end.",
+      "doclint": "Fast. Runs in CI as `go run ./cmd/doclint -git=false .` — a checkout has neither the pass branches nor the full history, so the git half is off there and on locally.",
+      "negcheck": "runs every guard twice (with/without its policy) via `go test -count=1`; 43 policies as of this pass, ~20-35 min wall clock on this machine — this is expected, not a hang; don't rely on go test's cache. It needs permission to listen on loopback: a network-restricted sandbox creates false oracle defects. Per-task gate only needs the new policy's own guard under HOP_DISABLE=<name>; the controller runs the full one at the end.",
       "realtimelint": "does not accept ./... as an argument — pass literally `.`",
       "l3_how_to_run": "Build once, run under an unprivileged user namespace: `go test -c -o /tmp/l3.test ./internal/l3` then `HOP_L3=1 unshare -Urn /tmp/l3.test` (add `-test.v -test.run '<pattern>'` to scope it). This works without root — unshare -Urn grants CAP_NET_ADMIN inside the fresh netns. Reusing the built binary across repeated unshare invocations is much faster than `go test` per run.",
       "known_red_that_is_not_yours": "go vet ./... is red at internal/engine/dialer.go (copylocks in xray-core's SocketConfig). `go run ./cmd/realtimelint .` is red with 3 hits in internal/dnstest/realserver_test.go. `gofmt -l ./internal` reports internal/l2/dns_test.go. All three predate these passes; the honest gate is 'no NEW findings', compared on the full output rather than the exit code.",
