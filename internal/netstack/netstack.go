@@ -99,6 +99,13 @@ type Config struct {
 	Bypass   BypassSink
 	Clock    clock.Clock
 
+	// Routing — списки §6.10: что выпустить в локальную сеть, что
+	// заблокировать (routing.go). nil означает умолчания §6.10 — тот же
+	// приём, что у Config.DNSUpstreams в связке. Исключения §5.6 (локальные
+	// сети, DHCP, NTP) подмешиваются к любому непустому списку: убрать их
+	// конфигурацией нельзя.
+	Routing *Routing
+
 	// Healthy — есть ли живой узел (§5.6). На этапе 5 сюда придёт health.
 	// nil означает «нет»: fail-close — консервативная сторона.
 	Healthy func() bool
@@ -168,7 +175,7 @@ func New(cfg Config) (*Stack, error) {
 	s := &Stack{
 		cfg:   cfg,
 		dev:   cfg.Device,
-		flows: newFlowTable(cfg.Clock, cfg.FlowIdle),
+		flows: newFlowTable(cfg.Clock, cfg.FlowIdle, resolveRouting(cfg.Routing)),
 		done:  make(chan struct{}),
 	}
 	s.nat = newNATTable(s, cfg.Clock, cfg.UDPIdle)

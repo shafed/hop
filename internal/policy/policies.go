@@ -288,6 +288,23 @@ var (
 		},
 	}
 
+	// RoutingLists — списки §6.10 приходят из конфигурации, а не зашиты в
+	// verdict.go. Выключение возвращает жёсткий набор: конфиг игнорируется
+	// целиком, и стек ведёт себя ровно как до этой политики. Краснеют оба
+	// направления — добавленное конфигом правило (T32) и убранное из конфига
+	// обнаружение служб, — потому что при выключенной политике конфиг не
+	// читается вовсе. T17 и T31 при этом зелены при любом её состоянии: они
+	// гоняют умолчания, а умолчания совпадают с прежним жёстким набором.
+	RoutingLists = &Policy{
+		Name: "routing_lists",
+		Doc:  "списки bypass/block §6.10 приходят из конфигурации (§6.10, T32)",
+		Guards: []Guard{
+			{Pkg: "./internal/netstack", Test: "^TestRoutingBypassListComesFromConfig$"},
+			{Pkg: "./internal/netstack", Test: "^TestRoutingConfigCanDropServiceDiscovery$"},
+			{Pkg: "./internal/netstack", Test: "^TestT32ConfiguredBypassLeavesTunnel$"},
+		},
+	}
+
 	// XrayDrain — дренаж прежнего инстанса Xray при смене набора узлов
 	// (§5.8, Р32 регистра связки, этап С). Выключение убивает прежний инстанс
 	// сразу, и обновление подписки рвёт живые соединения — а §5.5 обещает
@@ -488,6 +505,7 @@ func All() []*Policy {
 		RejectMode,
 		BypassSink,
 		NATKey,
+		RoutingLists,
 		KOfN,
 		Tolerance,
 		SwitchReason,

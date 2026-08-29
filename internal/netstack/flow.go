@@ -18,6 +18,11 @@ import (
 type flowTable struct {
 	clk  clock.Clock
 	idle time.Duration
+	// rt — списки §6.10, разрешённые один раз при сборке стека. Таблица
+	// держит их у себя, а не спрашивает конфиг на каждом пакете: вердикт
+	// принимается один раз, и список, поменявшийся посреди жизни потока,
+	// нарушил бы §3.4 куда незаметнее, чем сама смена списка.
+	rt *Routing
 
 	mu    sync.Mutex
 	m     map[flow]*flowEntry
@@ -29,8 +34,8 @@ type flowEntry struct {
 	seen time.Time
 }
 
-func newFlowTable(clk clock.Clock, idle time.Duration) *flowTable {
-	return &flowTable{clk: clk, idle: idle, m: make(map[flow]*flowEntry), swept: clk.Now()}
+func newFlowTable(clk clock.Clock, idle time.Duration, rt *Routing) *flowTable {
+	return &flowTable{clk: clk, idle: idle, rt: rt, m: make(map[flow]*flowEntry), swept: clk.Now()}
 }
 
 // verdict возвращает вердикт потока, принимая его при первой встрече.
@@ -45,7 +50,7 @@ func (t *flowTable) verdict(f flow, healthy func() bool) Verdict {
 		e.seen = now
 		return e.v
 	}
-	v := classify(f, healthy())
+	v := classify(f, healthy(), t.rt)
 	t.m[f] = &flowEntry{v: v, seen: now}
 	return v
 }

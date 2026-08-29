@@ -65,21 +65,22 @@ var (
 	addrBcast = netip.AddrFrom4([4]byte{255, 255, 255, 255})
 )
 
-// classify — вердикт по §3.4. Чистая функция от потока и одного факта «есть ли
-// живой узел»: всё, что она знает, видно в сигнатуре, поэтому она проверяется
-// таблицей без единого пакета.
+// classify — вердикт по §3.4. Чистая функция от потока, одного факта «есть ли
+// живой узел» и списков §6.10: всё, что она знает, видно в сигнатуре, поэтому
+// она проверяется таблицей без единого пакета. Списки пришли из конфигурации
+// и уже разрешены (resolveRouting), поэтому rt здесь никогда не nil.
 //
 // Порядок — часть контракта, а не деталь реализации. Системный DNS обычно и
 // есть локальный роутер: при обратном порядке запрос на 192.168.1.1:53 уходит
 // в локальную сеть как bypass при формально работающем перехвате. Ровно это и
 // краснит T16 при verdict_order=bypass_first.
-func classify(f flow, healthy bool) Verdict {
+func classify(f flow, healthy bool, rt *Routing) Verdict {
 	if f.proto != uint8(header.TCPProtocolNumber) && f.proto != uint8(header.UDPProtocolNumber) {
 		return Block
 	}
 
 	dns := isDNS(f)
-	bypass := isBypass(f)
+	bypass := isBypass(f, rt)
 
 	if policy.VerdictOrder.On() {
 		if dns {
@@ -97,7 +98,7 @@ func classify(f flow, healthy bool) Verdict {
 		}
 	}
 
-	if isBlocked(f) {
+	if isBlocked(f, rt) {
 		return Block
 	}
 	if !healthy {
@@ -112,46 +113,15 @@ func isDNS(f flow) bool { return f.dst.Port() == portDNS }
 // isBypass — пункт 2 §3.4 в объёме §6.10 «мимо туннеля, в локальную сеть»,
 // плюс исключения §5.6, разрешённые всегда (DHCP, NTP).
 //
-// Это не reject.Excluded, хотя списки похожи: там вопрос «на что респондер не
-// имеет права отвечать» и любой multicast консервативно попадает в «не наше
-// дело», здесь — «что выпустить в локальную сеть», и multicast §6.10 делит на
-// разрешённое обнаружение служб и блокируемое остальное.
-func isBypass(f flow) bool {
-	a := f.dst.Addr()
-	if a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() {
-		return true
-	}
-	if f.proto != uint8(header.UDPProtocolNumber) {
-		return false
-	}
-	switch f.dst.Port() {
-	case portDHCPSv, portDHCPCl:
-		// DHCP DISCOVER уходит широковещательно, до всякого адреса.
-		return true
-	case portNTP:
-		return true
-	case portMDNS:
-		// Блокировать нельзя: сломаются Bonjour, AirPlay, AirPrint и поиск
-		// принтеров — заметнее всего на macOS.
-		return a == addrMDNS
-	case portSSDP:
-		return a == addrSSDP
-	}
-	return false
-}
+// Сам список живёт в Routing и приходит из конфигурации (routing.go); здесь
+// остаётся только «совпало ли». Это не reject.Excluded, хотя списки похожи:
+// там вопрос «на что респондер не имеет права отвечать» и любой multicast
+// консервативно попадает в «не наше дело», здесь — «что выпустить в локальную
+// сеть», и multicast §6.10 делит на разрешённое обнаружение служб и
+// блокируемое остальное.
+func isBypass(f flow, rt *Routing) bool { return matchAny(rt.Bypass, f) }
 
 // isBlocked — «Блокируем» из §6.10: широковещательный NetBIOS и прочий
-// multicast и broadcast за пределами перечисленного выше.
-func isBlocked(f flow) bool {
-	a := f.dst.Addr()
-	if a == addrBcast || a.IsMulticast() {
-		return true
-	}
-	if f.proto == uint8(header.UDPProtocolNumber) {
-		switch f.dst.Port() {
-		case 135, 137, 138, 139:
-			return true
-		}
-	}
-	return false
-}
+// multicast и broadcast за пределами разрешённого выше. Список — оттуда же,
+// из конфигурации.
+func isBlocked(f flow, rt *Routing) bool { return matchAny(rt.Block, f) }

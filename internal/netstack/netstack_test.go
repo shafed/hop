@@ -38,7 +38,10 @@ type harness struct {
 
 // newHarness поднимает стек поверх поддельного PacketDevice (§8.1): без TUN,
 // без прав, на всех трёх ОС.
-func newHarness(t *testing.T, healthy bool) *harness {
+//
+// opts правят Config до сборки стека — ими пользуется T32, которому нужны
+// списки §6.10 из конфигурации, а не умолчания.
+func newHarness(t *testing.T, healthy bool, opts ...func(*Config)) *harness {
 	t.Helper()
 	h := &harness{
 		dev:    packettest.NewFake(1500),
@@ -49,14 +52,19 @@ func newHarness(t *testing.T, healthy bool) *harness {
 	}
 	h.alive.Store(healthy)
 
-	st, err := New(Config{
+	cfg := Config{
 		Device:   h.dev,
 		Dialer:   h.dialer,
 		Resolver: h.res,
 		Bypass:   h.byp,
 		Clock:    clock.NewFake(time.Unix(1, 0)),
 		Healthy:  h.alive.Load,
-	})
+	}
+	for _, o := range opts {
+		o(&cfg)
+	}
+
+	st, err := New(cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

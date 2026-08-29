@@ -56,7 +56,7 @@ func TestClassify(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := classify(c.f, c.healthy); got != c.want {
+			if got := classify(c.f, c.healthy, DefaultRouting()); got != c.want {
 				t.Fatalf("вердикт %v, ожидался %v", got, c.want)
 			}
 		})
@@ -77,7 +77,7 @@ func TestRejectVerdictNeverEndsInSilence(t *testing.T) {
 		dst := netip.MustParseAddrPort(d)
 		for _, proto := range []uint8{protoTCP, protoUDP} {
 			f := flow{proto: proto, src: client, dst: dst}
-			if classify(f, false) != Reject {
+			if classify(f, false, DefaultRouting()) != Reject {
 				continue
 			}
 			var pkt []byte

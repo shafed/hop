@@ -60,6 +60,12 @@ type Config struct {
 	// internal/outbound. nil означает, что настоящий резолвер не собирается:
 	// без прямого пути bootstrap даёт петлю §5.7(а).
 	DialDirect resolver.DialDirectFunc
+	// Routing — списки §6.10, из которых netstack берёт вердикт bypass/block.
+	// nil означает умолчания §6.10; исключения §5.6 остаются в силе при любом
+	// непустом списке (netstack.DefaultRouting, resolveRouting). Ровно как
+	// DNSUpstreams: поле конфигурации связки есть, CLI и диск до него ещё не
+	// доросли.
+	Routing *netstack.Routing
 	// Bypass — куда уходит то, что выпущено мимо туннеля (§6.10). Этап 8.
 	Bypass netstack.BypassSink
 	// BypassControl — привязка сокетов bypass к физическому интерфейсу (§6.8).
@@ -324,6 +330,7 @@ func (a *Agent) Up() error {
 		Dialer:   newDialer(a.hm, a.engine),
 		Resolver: a.res,
 		Bypass:   sink,
+		Routing:  a.cfg.Routing,
 		Clock:    a.clk,
 		Healthy:  a.hm.Healthy,
 	})
