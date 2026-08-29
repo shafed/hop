@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/shafed/hop/internal/policy"
 	"github.com/shafed/hop/internal/store"
 )
 
@@ -384,6 +385,13 @@ func TestW58EveryReadingCommandTakesJSON(t *testing.T) {
 // Поэтому здесь подменяется настоящий os.Stdout, а не буфер команды: мусорит
 // чужая библиотека мимо наших писателей, и увидеть её можно только там.
 func TestW58MachineOutputIsAloneOnStdout(t *testing.T) {
+	// Без json_schema машинного вывода нет вовсе, и утверждение «в канале
+	// только JSON» в такой сборке невыразимо: краснеть этой проверке
+	// полагалось бы по чужому флагу, а охраной она не служит ни одному. Тот же
+	// приём, которым W50 пропускается без ipv6_block.
+	if !policy.JSONSchema.On() {
+		t.Skip("json_schema выключен: машинного вывода нет, проверять в канале нечего")
+	}
 	storeWithDeadNode(t)
 
 	r, w, err := os.Pipe()
@@ -405,9 +413,9 @@ func TestW58MachineOutputIsAloneOnStdout(t *testing.T) {
 		t.Fatal(readErr)
 	}
 
-	if code != 3 {
-		t.Fatalf("проба мёртвого узла дала %d, ожидалась 3", code)
-	}
+	// Код здесь не проверяется намеренно: его держит W56, а эта проверка про
+	// поток. Тест, краснеющий за двоих, не говорит, что именно сломано.
+	_ = code
 	var v any
 	if err := json.Unmarshal(out, &v); err != nil {
 		t.Fatalf("stdout не разбирается как JSON (%v), а --json — контракт с автоматикой:\n%s", err, out)
