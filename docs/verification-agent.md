@@ -389,6 +389,8 @@ W22 существует потому, что пересборка на кажд
 | W48 | `up` раскладывает правило `ip -6 rule unreachable` — IPv6 закрыт намеренно (§6.9)                      | `ipv6_block`    |
 | W49 | счётчики приёмника bypass видны в `Stack.Stats()`, и видны на настоящем `bypass.NAT`                   | —               |
 | W50 | `up` разрушает соединения IPv6, установленные до него: отказ, а не молчание (§5.6)                     | `ipv6_kill_established` |
+| W52 | списки §6.10 из `settings.json` доезжают до `agent.Config.Routing`                                     | `settings_file` |
+| W53 | апстримы §5.7 из того же файла доезжают до `agent.Config.DNSUpstreams`                                 | `settings_file` |
 
 W47 — проброс, а не поведение: `Config.Physical` доходит до
 `bypass.Config.Interface`. Без него весь механизм в продукте мёртв при зелёном
@@ -454,6 +456,7 @@ W36 проверяет обе стороны fail-close: Xray получает `
 | `bypass_rebind`   | сокет bypass переживает смену интерфейса | W47           |
 | `ipv6_block`      | `up` не закрывает IPv6, и он течёт мимо  | W48, T28      |
 | `ipv6_kill_established` | соединения IPv6 старше туннеля молчат вместо отказа | W50 |
+| `settings_file` | `settings.json` не читается, настройки пусты всегда | W52, W53, S40, S41 |
 
 `switch_reason`, `reject_mode`, `traffic_kills`, `error_classify` уже в реестре
 и здесь только переиспользуются — связка обязана краснить их сквозным путём, а
