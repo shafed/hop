@@ -1,11 +1,13 @@
 package netstack
 
 import (
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/shafed/hop/internal/clock"
 	"github.com/shafed/hop/internal/packettest"
+	"github.com/shafed/hop/internal/policy"
 )
 
 // waitNATStats ждёт, пока снимок стека не покажет want записей и want
@@ -65,4 +67,61 @@ func TestW59IdleEntryIsCollectedWithoutTraffic(t *testing.T) {
 
 	waitNATStats(t, h, 0, 0, "клиент замолчал дольше UDPIdle, а запись и сокет "+
 		"всё ещё в снимке: уборка по-прежнему едет только на чужом событии")
+}
+
+// TestW59SweepDoesNotOutliveClose — цена механизма, измеренная явно. Фоновая
+// уборка — это горутина и тикер, то есть ровно та пара, которой свойственно
+// пережить владельца. Стек заводится и закрывается, не отправив ни одной
+// датаграммы: горутин чтения NAT нет вовсе, поэтому всё, что видно счётчику
+// горутин, — это уборщик natTable.
+//
+// Проверка не охраняет политику: при выключенной она пропускается — уборщика
+// нет, течь нечему. Охраняет TestW59IdleEntryIsCollectedWithoutTraffic.
+func TestW59SweepDoesNotOutliveClose(t *testing.T) {
+	if !policy.NATIdleSweep.On() {
+		t.Skip("nat_idle_sweep выключен: фоновой уборки нет, течь нечему")
+	}
+
+	before := runtime.NumGoroutine()
+
+	dev := packettest.NewFake(1500)
+	st, err := New(Config{
+		Device:  dev,
+		Clock:   clock.NewFake(time.Unix(1, 0)),
+		UDPIdle: time.Millisecond, // тикер на настоящих часах должен успеть тикнуть
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Стек тут заведён с фейковыми часами, но с реальным периодом тикера в
+	// продукте (Millisecond) это не нужно — важно лишь, что New завёл
+	// горутину. Она молчит, пока часы стоят; следит тест только за тем, что
+	// New не потерялась и Close её остановил.
+
+	done := make(chan error, 1)
+	go func() { done <- st.Run() }()
+
+	deadline := time.Now().Add(packettest.WaitTimeout) //hop:realtime
+	for runtime.NumGoroutine() <= before {
+		if time.Now().After(deadline) { //hop:realtime
+			t.Fatalf("после New горутин %d, было %d: фоновая уборка не заведена",
+				runtime.NumGoroutine(), before)
+		}
+		time.Sleep(time.Millisecond) //hop:realtime
+	}
+
+	dev.Close()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	st.Close()
+
+	deadline = time.Now().Add(packettest.WaitTimeout) //hop:realtime
+	for runtime.NumGoroutine() > before {
+		if time.Now().After(deadline) { //hop:realtime
+			t.Fatalf("горутины не остановились после Close: сейчас %d, было %d — "+
+				"уборщик пережил владельца", runtime.NumGoroutine(), before)
+		}
+		time.Sleep(5 * time.Millisecond) //hop:realtime
+	}
 }
