@@ -86,6 +86,11 @@ type StreamResolver interface {
 // правилами маршрутизации выше туннельного и в таблицу туннеля не заходят
 // (§6.2). Здесь второй рубеж — на случай, если правило не встало.
 //
+// Несёт только IPv4/UDP: обратный путь bypass — та же таблица трансляций, что
+// у UDP full-cone §5.3 (§6.8). TCP с вердиктом bypass до приёмника не доходит
+// вовсе — стек отвечает на него RST сам (refuseBypassTCP, §5.6), — поэтому
+// реализации не нужно уметь отказывать по протоколу.
+//
 // Срез действителен только на время вызова.
 type BypassSink interface {
 	Send(pkt []byte) error
@@ -264,10 +269,27 @@ func (s *Stack) handle(pkt []byte) {
 		}
 		s.tcp.inject(pkt) // DNS поверх TCP: поток надо сначала терминировать
 	case Bypass:
+		// TCP до приёмника не доходит вовсе: путь bypass — UDP-NAT (§6.8), и
+		// поток по нему не пройдёт ни при каком состоянии сокета. Раз отказ
+		// известен здесь и навсегда, §5.6 требует сказать о нём вслух, а не
+		// дать приложению висеть до connect timeout (T33).
+		//
+		// Проверка стоит до Send, а не после его ErrUnsupported, намеренно:
+		// иначе отказ зависел бы от того, есть ли приёмник вообще (в продукте
+		// до этапа 9 его не было, в половине тестов его нет) и какой ошибкой
+		// он ответил. Утверждение уровня вердикта — «bypass не несёт TCP» —
+		// и живёт на уровне вердикта.
+		if f.proto == uint8(header.TCPProtocolNumber) {
+			s.refuseBypassTCP(pkt)
+			return
+		}
 		// Отказ Send (ErrDisabled, ErrUnsupported, ошибка сокета — включая
 		// outbound.ErrNoInterface, «нет физического интерфейса, честнее
 		// отказать, чем зациклить») — это дроп, а не тишина: doc-комментарий
 		// Stats.Blocked («дропнуто по §6.9/§6.10») уже покрывает этот случай.
+		//
+		// ICMP unreachable здесь не строится, и это решение, а не пропуск:
+		// см. implementation-notes.md, «Этап 9 — RST для TCP в локальную сеть».
 		if s.cfg.Bypass == nil {
 			s.count(&s.blocked)
 		} else if err := s.cfg.Bypass.Send(pkt); err != nil {
@@ -293,6 +315,27 @@ func (s *Stack) handle(pkt []byte) {
 		}
 		s.tcp.inject(pkt)
 	}
+}
+
+// refuseBypassTCP отвечает RST на TCP-поток, которому достался вердикт bypass.
+//
+// Зовётся reject.RST, а не reject.Reply: Reply молчит на всё, что §5.6
+// выпускает всегда (reject.Excluded), и локальная сеть стоит в этом списке
+// первой строкой — Reply вернул бы nil ровно там, где отказ и нужен. Шов между
+// двумя списками закреплён TestBypassTCPNeedsRSTBecauseReplyStaysSilent.
+//
+// nil означает «ответа не положено» — сам RST (иначе петля) или мусор; такой
+// пакет остаётся дропом и виден в Stats.Blocked. Дропом же он остаётся при
+// выключенной политике: молчание должно быть наблюдаемым, а не бесследным.
+func (s *Stack) refuseBypassTCP(pkt []byte) {
+	if policy.BypassTCPReject.On() {
+		if r := reject.RST(pkt); r != nil {
+			s.count(&s.rejected)
+			s.write(r)
+			return
+		}
+	}
+	s.count(&s.blocked)
 }
 
 // Deliver отдаёт клиенту готовый пакет из обратного пути bypass-NAT (§6.10).

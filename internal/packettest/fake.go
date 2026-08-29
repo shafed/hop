@@ -3,6 +3,7 @@
 package packettest
 
 import (
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -151,26 +152,46 @@ func (f *FakeDevice) WritePackets(bufs [][]byte) error {
 // (§5.6: закрытие — отказ, а не молчание).
 func (f *FakeDevice) ExpectRST(t testing.TB) []byte {
 	t.Helper()
-	emitted := f.Emitted()
-	for _, p := range emitted {
-		if flags, ok := tcpFlags(p); ok && flags&tcpRST != 0 {
-			return p
-		}
-	}
-	t.Fatalf("RST не найден среди %d записанных пакетов", len(emitted))
-	return nil
+	return f.expect(t, "RST", func(p []byte) bool {
+		flags, ok := tcpFlags(p)
+		return ok && flags&tcpRST != 0
+	})
 }
 
 // ExpectICMPUnreach требует ICMP destination unreachable с заданным кодом
 // (3 — port unreachable, 1 — host unreachable).
 func (f *FakeDevice) ExpectICMPUnreach(t testing.TB, code byte) []byte {
 	t.Helper()
-	emitted := f.Emitted()
-	for _, p := range emitted {
-		if typ, c, ok := icmpTypeCode(p); ok && typ == icmpDestUnreach && c == code {
-			return p
+	return f.expect(t, fmt.Sprintf("ICMP unreachable code=%d", code), func(p []byte) bool {
+		typ, c, ok := icmpTypeCode(p)
+		return ok && typ == icmpDestUnreach && c == code
+	})
+}
+
+// expect ждёт пакет, удовлетворяющий want, не дольше WaitTimeout.
+//
+// Ждёт, а не смотрит на уже записанное: Emitted осушает очередь, поэтому
+// «сначала WaitEmitted, потом ExpectRST» отдавало бы пустоту, а «сразу
+// ExpectRST» гонялось бы с насосом. Ожидание с заведомым концом — то же
+// свойство, ради которого написан WaitEmitted: отличить отказ от молчания
+// можно только им.
+func (f *FakeDevice) expect(t testing.TB, what string, want func([]byte) bool) []byte {
+	t.Helper()
+	deadline := clock.System{}.After(WaitTimeout)
+	seen := 0
+	for {
+		emitted := f.Emitted()
+		seen += len(emitted)
+		for _, p := range emitted {
+			if want(p) {
+				return p
+			}
+		}
+		select {
+		case <-f.written:
+		case <-deadline:
+			t.Fatalf("%s не найден среди %d записанных пакетов за %v", what, seen, WaitTimeout)
+			return nil
 		}
 	}
-	t.Fatalf("ICMP unreachable code=%d не найден среди %d записанных пакетов", code, len(emitted))
-	return nil
 }

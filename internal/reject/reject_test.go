@@ -148,6 +148,47 @@ func TestExclusions(t *testing.T) {
 	}
 }
 
+// RST отвечает там, где Reply молчит: вызывающий с вердиктом bypass уже решил,
+// что поток отвергнут, и список исключений §5.6 не должен ему мешать. Обе
+// половины в одном тесте — это и есть шов, ради которого RST отделён от Reply
+// (netstack.refuseBypassTCP, T33).
+func TestRSTAnswersWhereReplyStaysSilent(t *testing.T) {
+	for _, dst := range []string{"192.168.1.10:445", "127.0.0.1:8080", "169.254.1.1:80"} {
+		pkt := packettest.TCPSyn(client, ap(dst), 7)
+		if out := Reply(pkt); out != nil {
+			t.Fatalf("Reply ответил на исключение §5.6 (%s): % x", dst, out)
+		}
+		out := RST(pkt)
+		if out == nil {
+			t.Fatalf("RST не построен для %s", dst)
+		}
+		ip := header.IPv4(out)
+		if got := ip.DestinationAddress().String(); got != client.Addr().String() {
+			t.Fatalf("RST адресован %s, ожидался клиент %s", got, client.Addr())
+		}
+		if header.TCP(ip.Payload()).Flags()&header.TCPFlagRst == 0 {
+			t.Fatalf("построен не RST: % x", out)
+		}
+	}
+}
+
+// RST — только про TCP, и петли он не заводит: ни на собственный ответ, ни на
+// то, что TCP не является, отвечать нечем.
+func TestRSTOnlyForTCPAndNotForItself(t *testing.T) {
+	lan := ap("192.168.1.10:445")
+	own := RST(packettest.TCPSyn(client, lan, 7))
+	for name, pkt := range map[string][]byte{
+		"собственный RST": own,
+		"UDP":             packettest.UDP(client, lan, []byte("x")),
+		"мусор":           {0x45},
+		"пусто":           nil,
+	} {
+		if out := RST(pkt); out != nil {
+			t.Fatalf("%s: построен RST: % x", name, out)
+		}
+	}
+}
+
 // Ответ на RST породил бы петлю: наш RST вернулся бы к нам и снова вызвал RST.
 func TestNoReplyToRST(t *testing.T) {
 	rst := Reply(packettest.TCPSyn(client, remote, 1000))
