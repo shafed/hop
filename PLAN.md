@@ -21,10 +21,11 @@ TUN, трафик идёт через выбранный узел, каждый 
 настоящему реестру netstack, а не только колбэком в тесте. `BypassSink` тоже
 подключён к настоящему NAT-пути (§6.10, §6.8, `internal/bypass`) — вердикт
 `bypass` больше не дропает пакет молча, тот класс лжи, что был у `Interrupt`,
-закрыт. Остались L2-хвост этапа 6, платформенный и конфигурационный хвост этапа
-8 и CLI. Самая дорогая из оставшихся дыр — bypass/block-списки §6.10, всё ещё
-захардкоженные в `internal/netstack/verdict.go` вместо того, чтобы приходить из
-конфигурации.
+закрыт. Списки bypass/block §6.10 перестали быть кодом: `netstack.Routing` —
+значение конфигурации, и `verdict.go` только спрашивает у него «совпало ли».
+Остались L2-хвост этапа 6, платформенный и конфигурационный хвост этапа 8 и CLI.
+Самая дорогая из оставшихся дыр — TCP в локальную сеть, который вердикт `bypass`
+до сих пор дропает молча вместо RST.
 
 Сквозное правило: **оракул раньше функциональности.** Поддельный `PacketDevice`
 (§8.1), fault injector, тестовые VLESS-инбаунды и инъектируемые часы строятся до
@@ -535,9 +536,13 @@ health-пробы и HTTP-подписки. `AgentUID` удалён; cleanup с�
 **Что осталось.** `BypassSink` стал реальным NAT-путём через тот же
 `outbound.Selector` (`internal/bypass`, провод в `internal/agent/wire.go` и
 `internal/netstack/netstack.go`) — только UDP, TCP в локальную сеть остаётся
-дропом (см. `implementation-notes.md`, «Deviations»). Списки bypass/block §6.10
-всё ещё захардкожены в `internal/netstack/verdict.go` и должны приходить из
-конфигурации. Нужно закрыть IPv6, провести смену сети до selector и health, а
+дропом (см. `implementation-notes.md`, «Deviations»); это следующий незакрытый
+пункт: отвечать на него RST тем же `internal/reject`, что обслуживает вердикт
+`Reject`. Списки bypass/block §6.10 из кода ушли: `netstack.Routing` —
+два списка правил «префикс + протокол + порт», `netstack.Config.Routing` и
+`agent.Config.Routing` (пусто — умолчания §6.10), исключения §5.6 из
+конфигурации не вынимаются, обнаружение служб — вынимается. Нужно закрыть IPv6,
+провести смену сети до selector и health, довести списки §6.10 до диска и CLI, а
 затем реализовать и прогнать платформенные ветки macOS и Windows, включая Wintun
 и проверенную поставку `wintun.dll`.
 
@@ -550,11 +555,14 @@ kernel-тест binding, `internal/netstack/interrupt_test.go` на каждый
 L3-тест bypass построен: `internal/l3/bypass_test.go`,
 `TestBypassMDNSReachesPhysicalInterfaceAndReturnsViaNAT` (T31, §8.4) —
 mDNS-запрос из туннеля виден на физическом интерфейсе, ответ возвращается
-клиенту через NAT. macOS и Windows прогоняются по расписанию, с T22 и T23-slow
+клиенту через NAT. Списки §6.10 из конфигурации проверяет T32 (§8.3) плюс пять
+тестов вердикта в `internal/netstack/routing_test.go`. macOS и Windows прогоняются по расписанию, с T22 и T23-slow
 первыми.
 
 **Что должно сломаться при выключении.** Отсутствие binding → W36/T25;
-`ipv6_block=off` → T28; `bypass_sink=off` →
+`ipv6_block=off` → T28; `routing_lists=off` → T32 и два теста вердикта из
+`routing_test.go` краснеют, а T17 и T31 остаются зелёными: умолчания совпадают
+с прежним жёстким набором. `bypass_sink=off` →
 `TestBypassSendsDatagramFromBoundSocket` и `TestBypassReplyReturnsToClient`
 (`internal/bypass`) и T31 (L3) краснеют, а T17 остаётся зелёным, потому что он
 проверяет только вердикт, не доставку. Без реестра релеев
