@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -148,35 +149,65 @@ func TestT23SlowTearsDown(t *testing.T) {
 //
 // Плюс подпроверка плана: в зазоре трафик отказывался, а не висел — тот же
 // механизм, что в T23-fast, другой исход.
+//
+// Последнее утверждение опирается на живой узел стенда (stand_test.go), и это
+// не украшение. Прежняя редакция сравнивала «отвергается или нет» на пустом
+// сторе и была зелена по чужой причине: стор брался из $HOME разработчика,
+// узлы в нём были, и §5.6 держал трафик открытым первые 30 секунд стартового
+// бюджета Р5. На пустом сторе — то есть в CI — та же проверка обязана была
+// краснеть: fail-close отвергает так же, как респондер сервиса, и по одной
+// ошибке ECONNREFUSED их не различить. Различает их только успех: трафик
+// после реаттача обязан дойти до «интернет-сервера» за узлом.
 func TestT24ReattachWithinDeadline(t *testing.T) {
+	requireNetns(t)
+
+	peer := startPeer(t)
+	defer peer.stop()
+	setupSiteNet(t)
+	addNode(t, storeRoot(t), siteAddr, vlessPort)
+
 	s := startService(t, 30*time.Second)
 	tok := filepath.Join(t.TempDir(), "token")
 	s.startAgent(tok)
 
+	site := net.JoinHostPort(siteAddr, strconv.Itoa(sitePort))
 	idxBefore := linkIndex(t, ifname)
 	killAgentAndWaitOrphaned(t, s)
 
 	// Зазор: отказ, а не ожидание.
-	if err, took := connect("203.0.113.7:80", time.Second); !isUnreachable(err) || took > 500*time.Millisecond {
+	if err, took := connect(site, time.Second); !isUnreachable(err) || took > 500*time.Millisecond {
 		t.Fatalf("в зазоре трафик висел вместо отказа: %v за %v", err, took)
 	}
+	seen := len(peer.counts(t).SiteConns)
 
 	s.startAgent(tok) // тот же токен: реаттач, а не новый туннель
 
 	if got := linkIndex(t, ifname); got != idxBefore {
 		t.Fatalf("индекс интерфейса %s, был %s — интерфейс пересоздан", got, idxBefore)
 	}
-	if st := s.status(); !strings.Contains(st, "phase=up") {
-		t.Fatalf("status = %q, ожидалось phase=up", st)
+	if ph := s.phase(); ph != "up" {
+		t.Fatalf("phase = %q, ожидалось up", ph)
 	}
 	if !strings.Contains(tunnelRoutes(), "default dev "+ifname) {
 		t.Fatalf("маршрут туннеля потерялся: %s", tunnelRoutes())
 	}
 	// Отказ снят: устройство снова читает агент, а не респондер сервиса.
 	// Иначе оба процесса делили бы один дескриптор и растащили бы пакеты.
-	if err, _ := connect("203.0.113.7:80", 500*time.Millisecond); isUnreachable(err) {
-		t.Fatalf("после реаттача трафик всё ещё отвергается сервисом: %v", err)
-	}
+	// Успех соединения и приход на тот конец — одно условие, а не два подряд:
+	// стек терминирует TCP у себя и отвечает SYN-ACK раньше, чем релей дойдёт
+	// до узла, поэтому connect возвращается до того, как пир что-то увидел
+	// (замерено: первая же проверка счётчика после успешного connect давала
+	// ноль). Ждать надо обоих.
+	waitUntil(t, 10*time.Second, "трафика через туннель после реаттача", func() bool {
+		c, err := net.DialTimeout("tcp", site, time.Second)
+		if err != nil {
+			return false
+		}
+		defer c.Close()
+		_, _ = c.Write([]byte("после реаттача\n"))
+		time.Sleep(200 * time.Millisecond) //hop:realtime
+		return len(peer.counts(t).SiteConns) > seen
+	})
 }
 
 // Мусорный токен не продлевает окно и не забирает туннель: иначе локальный
@@ -194,13 +225,12 @@ func TestAttachWithWrongTokenIsRejected(t *testing.T) {
 	}
 	// Агент с чужим токеном: реаттач не пройдёт, и он поднимет новый туннель —
 	// но не заберёт текущий. Смотрим на то, что состояние не стало up от Attach.
-	out := sh(hopAgent(t), "-socket", s.sock, "-status")
-	if !strings.Contains(out, "phase=orphaned") {
-		t.Fatalf("до попытки status = %q", strings.TrimSpace(out))
+	if ph := s.phase(); ph != "orphaned" {
+		t.Fatalf("до попытки phase = %q", ph)
 	}
 	tryAttach(t, s.sock, bad)
-	if st := s.status(); !strings.Contains(st, "phase=orphaned") {
-		t.Fatalf("после мусорного Attach status = %q, ожидалось orphaned", st)
+	if ph := s.phase(); ph != "orphaned" {
+		t.Fatalf("после мусорного Attach phase = %q, ожидалось orphaned", ph)
 	}
 }
 
@@ -370,7 +400,7 @@ func killAgentAndWaitOrphaned(t *testing.T, s *service) {
 	a := s.agents[len(s.agents)-1]
 	a.kill()
 	waitUntil(t, 5*time.Second, "перехода в orphaned", func() bool {
-		return strings.Contains(s.status(), "phase=orphaned")
+		return s.phase() == "orphaned"
 	})
 }
 

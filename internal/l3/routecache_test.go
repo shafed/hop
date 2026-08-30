@@ -129,6 +129,10 @@ func dialPeer(t *testing.T) net.Conn {
 type peerProc struct {
 	cmd *exec.Cmd
 	in  io.WriteCloser
+	// out остаётся открытым после «ready»: через него же пир отвечает на
+	// «counts» (stand_test.go). Буферизованный ридер один на весь процесс —
+	// второй съел бы часть чужой строки.
+	out *bufio.Reader
 }
 
 func (p *peerProc) stop() {
@@ -175,7 +179,8 @@ func startPeer(t *testing.T) *peerProc {
 		t.Fatalf("сигнал пиру: %v", err)
 	}
 
-	line, err := bufio.NewReader(out).ReadString('\n')
+	p.out = bufio.NewReader(out)
+	line, err := p.out.ReadString('\n')
 	if err != nil || !strings.HasPrefix(line, "ready") {
 		t.Fatalf("пир не поднялся: %q, %v", line, err)
 	}
@@ -185,7 +190,8 @@ func startPeer(t *testing.T) *peerProc {
 // peerMain — точка входа пира. Живёт в своём netns, поэтому трогает интерфейсы
 // без оглядки.
 func peerMain() {
-	if _, err := bufio.NewReader(os.Stdin).ReadString('\n'); err != nil {
+	in := bufio.NewReader(os.Stdin)
+	if _, err := in.ReadString('\n'); err != nil {
 		fmt.Fprintln(os.Stderr, "пир: нет сигнала:", err)
 		os.Exit(1)
 	}
@@ -205,6 +211,11 @@ func peerMain() {
 	// протокол на другом порту, TCP-эхо не трогает.
 	startMDNSResponder()
 
+	// Вторая сеть стенда — T25, T26, T27 (stand_test.go). Та же связка «ещё
+	// один адрес, ещё один слушатель»: сеть, которую туннель забирает себе, в
+	// отличие от 10.9.9.0/24, выпущенной исключением §5.6.
+	startSiteSide()
+
 	// Второй слушатель, тот же эхо-протокол по IPv6 — для T28. Отдельный
 	// сокет, а не dual-stack на "[::]": T28 утверждает, что до пира не дошло
 	// именно по IPv6, и слушатель, принимающий заодно IPv4, это утверждение
@@ -222,7 +233,11 @@ func peerMain() {
 		os.Exit(1)
 	}
 	fmt.Println("ready")
-	acceptEcho(ln)
+	go acceptEcho(ln)
+
+	// Дальше пир живёт управляющим протоколом: строка «counts» — строка JSON
+	// в ответ. Выход — по EOF на stdin, то есть по peerProc.stop.
+	serveStand(in)
 }
 
 func acceptEcho(ln net.Listener) {
