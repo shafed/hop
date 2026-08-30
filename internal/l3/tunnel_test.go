@@ -166,8 +166,8 @@ func TestT24ReattachWithinDeadline(t *testing.T) {
 	if got := linkIndex(t, ifname); got != idxBefore {
 		t.Fatalf("индекс интерфейса %s, был %s — интерфейс пересоздан", got, idxBefore)
 	}
-	if st := s.status(); !strings.Contains(st, "phase=up") {
-		t.Fatalf("status = %q, ожидалось phase=up", st)
+	if ph := s.phase(); ph != "up" {
+		t.Fatalf("phase = %q, ожидалось up", ph)
 	}
 	if !strings.Contains(tunnelRoutes(), "default dev "+ifname) {
 		t.Fatalf("маршрут туннеля потерялся: %s", tunnelRoutes())
@@ -194,13 +194,12 @@ func TestAttachWithWrongTokenIsRejected(t *testing.T) {
 	}
 	// Агент с чужим токеном: реаттач не пройдёт, и он поднимет новый туннель —
 	// но не заберёт текущий. Смотрим на то, что состояние не стало up от Attach.
-	out := sh(hopAgent(t), "-socket", s.sock, "-status")
-	if !strings.Contains(out, "phase=orphaned") {
-		t.Fatalf("до попытки status = %q", strings.TrimSpace(out))
+	if ph := s.phase(); ph != "orphaned" {
+		t.Fatalf("до попытки phase = %q", ph)
 	}
 	tryAttach(t, s.sock, bad)
-	if st := s.status(); !strings.Contains(st, "phase=orphaned") {
-		t.Fatalf("после мусорного Attach status = %q, ожидалось orphaned", st)
+	if ph := s.phase(); ph != "orphaned" {
+		t.Fatalf("после мусорного Attach phase = %q, ожидалось orphaned", ph)
 	}
 }
 
@@ -370,7 +369,7 @@ func killAgentAndWaitOrphaned(t *testing.T, s *service) {
 	a := s.agents[len(s.agents)-1]
 	a.kill()
 	waitUntil(t, 5*time.Second, "перехода в orphaned", func() bool {
-		return strings.Contains(s.status(), "phase=orphaned")
+		return s.phase() == "orphaned"
 	})
 }
 

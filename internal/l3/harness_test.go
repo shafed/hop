@@ -17,6 +17,7 @@
 package l3
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -52,6 +53,13 @@ func requireNetns(t *testing.T) {
 	}
 	if _, err := exec.LookPath("ip"); err != nil {
 		t.Skip("нет iproute2")
+	}
+	// Стор — свой на каждый тест. Без этого агент открывает настоящий стор
+	// разработчика (`os.UserConfigDir`, cmd/hop/store.go): netns изолирует
+	// сеть, но не $HOME, а стор берёт эксклюзивный flock на всё время жизни
+	// (§6.14). Тест, положивший узел стенда, положил бы его человеку.
+	if os.Getenv("HOP_STORE") == "" {
+		t.Setenv("HOP_STORE", t.TempDir())
 	}
 }
 
@@ -189,7 +197,7 @@ type agent struct {
 // commandAgent собирает команду агента, но не запускает её.
 func commandAgent(t *testing.T, sock, tokenFile string) *exec.Cmd {
 	t.Helper()
-	cmd := exec.Command(hopAgent(t),
+	cmd := exec.Command(hopAgent(t), "agent",
 		"-socket", sock,
 		"-ifname", ifname,
 		"-addr", addr,
@@ -222,7 +230,7 @@ func (s *service) startAgent(tokenFile string) *agent {
 	// дойдёт до агента. Тест, который убьёт агента в этом зазоре, промахнётся
 	// мимо проверяемого свойства и будет мигать.
 	waitUntil(s.t, 10*time.Second, "агент дошёл до phase=up", func() bool {
-		return strings.Contains(s.status(), "phase=up")
+		return s.phase() == "up"
 	})
 	waitUntil(s.t, 10*time.Second, "агент сохранил attach-token", func() bool {
 		st, err := os.Stat(tokenFile)
@@ -239,15 +247,35 @@ func (a *agent) kill() {
 	_, _ = a.cmd.Process.Wait()
 }
 
-// status спрашивает сервис отдельным коротким соединением: оно не владеет
+// phase спрашивает сервис отдельным коротким соединением: оно не владеет
 // туннелем, и его обрыв ребра не вызывает.
-func (s *service) status() string {
+//
+// Спрашивает машинным выводом (`hop status --json`, §5.9), а не человеческой
+// строкой: человеческая строка — оформление и меняется вместе с ним, а схему
+// `--json` охраняет json_schema (cmd/hop/output.go). До перехода на подкоманды
+// здесь стоял снятый флаг `-status`, и стенд молча перестал спрашивать вообще.
+func (s *service) phase() string {
 	s.t.Helper()
-	out, err := exec.Command(hopAgent(s.t), "-socket", s.sock, "-status").Output()
+	return phaseAt(s.t, s.sock)
+}
+
+// phaseAt — то же, но по сокету: нужен там, где сервис спрашивают до того, как
+// у теста есть *service, и там, где отказ команды сам является ответом.
+func phaseAt(t *testing.T, sock string) string {
+	t.Helper()
+	out, err := exec.Command(hopAgent(t), "status", "-socket", sock, "--json").Output()
 	if err != nil {
-		s.t.Fatalf("status: %v", err)
+		t.Fatalf("hop status --json: %v", err)
 	}
-	return strings.TrimSpace(string(out))
+	var v struct {
+		Tunnel struct {
+			Phase string `json:"phase"`
+		} `json:"tunnel"`
+	}
+	if err := json.Unmarshal(out, &v); err != nil {
+		t.Fatalf("разбор `hop status --json` (%q): %v", out, err)
+	}
+	return v.Tunnel.Phase
 }
 
 // --- сборка бинарей ---
