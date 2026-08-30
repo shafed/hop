@@ -398,19 +398,32 @@ func (s *Store) Flush() error {
 //
 // Пишет всегда, если есть что: дебаунс живости (§2) — это про частоту, а не
 // про право потерять последнее состояние (§4 регистра).
+//
+// Если писать НЕЧЕГО — замок не берётся вовсе. Это не оптимизация, а починка
+// замеренного дефекта: чтение стора идёт без замка (см. load), но Close брал
+// его безусловно, и читающая команда при занятом сторе печатала весь ответ, а
+// потом ждала пять секунд и отдавала код 1. Замер на живом бинаре (записан в
+// implementation-notes.md, «Замер: держит ли агент flock всю жизнь»): 201
+// строка вывода в stdout и код 1 следом. Отказ после напечатанного ответа —
+// это ложь про собственный успех, и мониторингу вокруг кодов возврата (§5.9)
+// она обходится дороже всего.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return nil
 	}
+	dirty := s.dirty
 	s.mu.Unlock()
 
-	err := s.transact(func() error {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		return s.writeDirtyLocked()
-	})
+	var err error
+	if dirty != 0 {
+		err = s.transact(func() error {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			return s.writeDirtyLocked()
+		})
+	}
 
 	s.mu.Lock()
 	s.closed = true
