@@ -222,3 +222,57 @@ func TestS46SettingsAreHandedOutAsCopy(t *testing.T) {
 		t.Errorf("правка отданных апстримов дошла до стора: %v", second.DNSUpstreams)
 	}
 }
+
+// TestW67AutoconnectPersistsAcrossReopen — §6.13: `hop autoconnect off`
+// обязан пережить перезапуск, иначе состояние «в сторе» ничем не отличалось
+// бы от состояния в памяти одного процесса. Стор закрывается и открывается
+// заново на том же каталоге — единственный способ отличить настоящую запись
+// на диск от поля, которое просто держится в структуре до конца процесса.
+//
+// Заодно проверяет умолчание §6.13 («включено по умолчанию»): свежий стор,
+// которого SetAutoconnect ни разу не касался, обязан отвечать true.
+func TestW67AutoconnectPersistsAcrossReopen(t *testing.T) {
+	root := t.TempDir()
+
+	st, err := Open(root, clock.System{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Settings().AutoconnectOn() {
+		t.Fatal("свежий стор: автоподключение должно быть включено по умолчанию (§6.13)")
+	}
+
+	if err := st.SetAutoconnect(false); err != nil {
+		t.Fatalf("SetAutoconnect(false): %v", err)
+	}
+	if st.Settings().AutoconnectOn() {
+		t.Fatal("SetAutoconnect(false) не изменил то, что отдаёт Settings() в том же процессе")
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := Open(root, clock.System{})
+	if err != nil {
+		t.Fatalf("стор не открылся повторно: %v", err)
+	}
+	defer reopened.Close()
+	if reopened.Settings().AutoconnectOn() {
+		t.Fatal("автоподключение = off не пережило перезапуск — settings.json не хранит выбор")
+	}
+
+	if err := reopened.SetAutoconnect(true); err != nil {
+		t.Fatalf("SetAutoconnect(true): %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	turnedOn, err := Open(root, clock.System{})
+	if err != nil {
+		t.Fatalf("стор не открылся третий раз: %v", err)
+	}
+	defer turnedOn.Close()
+	if !turnedOn.Settings().AutoconnectOn() {
+		t.Fatal("автоподключение = on не пережило перезапуск")
+	}
+}

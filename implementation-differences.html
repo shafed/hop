@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Что реализовано иначе, чем планировали</title>
+  <style>
+    :root { --ink:#18212b; --muted:#617080; --paper:#f7f5ef; --card:#fff; --line:#dcd8cd; --accent:#175c54; --warn:#9a4f16; --bad:#8d2f3a; --ok:#26734d; }
+    * { box-sizing:border-box }
+    body { margin:0; color:var(--ink); background:var(--paper); font:16px/1.58 system-ui,-apple-system,"Segoe UI",sans-serif }
+    main { max-width:980px; margin:auto; padding:56px 24px 80px }
+    h1 { max-width:760px; margin:0 0 12px; font:700 clamp(34px,6vw,58px)/1.04 Georgia,serif; letter-spacing:-.03em }
+    h2 { margin:48px 0 16px; font-size:24px }
+    h3 { margin:0 0 6px; font-size:18px }
+    p { margin:8px 0 }
+    .lead { max-width:780px; color:var(--muted); font-size:19px }
+    .summary { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin:30px 0 }
+    .metric,.item,.note { background:var(--card); border:1px solid var(--line); border-radius:14px }
+    .metric { padding:18px }
+    .metric b { display:block; font-size:28px }
+    .metric span,.small { color:var(--muted); font-size:14px }
+    .item { margin:12px 0; padding:20px 22px }
+    .tag { display:inline-block; margin-bottom:10px; padding:3px 9px; border-radius:999px; font-size:12px; font-weight:700; letter-spacing:.03em; text-transform:uppercase }
+    .intent { color:var(--accent); background:#e1f1ed }.limit { color:var(--warn); background:#fff0dc }.gap { color:var(--bad); background:#f9e2e5 }.closed { color:var(--ok); background:#e3f3e8 }
+    .compare { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:12px }
+    .compare div { padding:12px 14px; background:#f7f8f8; border-radius:9px }
+    .compare b { display:block; margin-bottom:3px; font-size:13px; color:var(--muted); text-transform:uppercase }
+    code { padding:.1em .35em; background:#eef0ef; border-radius:5px; font-size:.9em }
+    .note { padding:18px 22px; border-left:5px solid var(--accent) }
+    footer { margin-top:48px; padding-top:18px; border-top:1px solid var(--line); color:var(--muted); font-size:14px }
+    @media (max-width:700px) { .summary,.compare { grid-template-columns:1fr } main { padding-top:34px } }
+  </style>
+</head>
+<body><main>
+  <h1>Что мы сделали иначе, чем хотели</h1>
+  <p class="lead">Простой разбор <code>implementation-notes.md</code>. Здесь отделены осознанные изменения проекта от настоящих незакрытых ограничений. Старые проблемы, которые ниже в заметках уже исправлены, не считаются текущими.</p>
+
+  <div class="summary">
+    <div class="metric"><b>9</b><span>заметных изменений подхода</span></div>
+    <div class="metric"><b>7</b><span>актуальных ограничений</span></div>
+    <div class="metric"><b>4</b><span>важных старых проблемы уже закрыты</span></div>
+  </div>
+
+  <div class="note"><strong>Главный вывод.</strong> Ядро проекта на Linux получилось рабочим, но продукт стал менее кроссплатформенным и местами более консервативным, чем задумывался. Самые существенные остатки — Windows, ограниченный bypass и задержка обнаружения «молчащего» мёртвого узла.</div>
+
+  <h2>Актуальные расхождения и ограничения</h2>
+
+  <article class="item"><span class="tag gap">Не закончено</span><h3>Windows пока не является полноценной платформой</h3><div class="compare"><div><b>Хотели</b>Рабочий сервис, Wintun и передача пакетов через named pipe.</div><div><b>Получилось</b><code>hopd</code> остаётся консольной программой без обработчика Windows SCM, а Windows-датаплейн не завершён.</div></div><p>Простыми словами: установщик может зарегистрировать службу, но Windows не сможет нормально запустить её как системную службу. Проверка библиотеки Wintun есть, полноценного движения трафика — ещё нет.</p></article>
+
+  <article class="item"><span class="tag gap">Не закончено</span><h3>Полноценные L3-тесты есть только на Linux</h3><div class="compare"><div><b>Хотели</b>Проверять реальное сетевое поведение на Linux, macOS и Windows.</div><div><b>Получилось</b>Реальный L3-стенд написан только для Linux; для macOS и Windows остались каркасы и отдельные проверки поставки.</div></div><p>То есть поведение с настоящим виртуальным интерфейсом на двух системах пока не доказано автоматическими тестами.</p></article>
+
+  <article class="item"><span class="tag limit">Ограничение v1</span><h3>Bypass — не универсальный обход туннеля</h3><div class="compare"><div><b>Хотели</b>Локальный трафик из списка исключений отправлять мимо туннеля.</div><div><b>Получилось</b>Реально наружу через bypass проходит UDP. TCP в локальную сеть получает RST, а не идёт напрямую.</div></div><p>Для обнаружения устройств по UDP этого хватает, но правило bypass для TCP означает «быстро отказать», а не «соединить напрямую».</p></article>
+
+  <article class="item"><span class="tag gap">Крайний случай</span><h3>DHCP и IPv6 mDNS через туннель не поддержаны честно</h3><p>DHCP требует сохранить служебный исходный порт 68, чего текущий непривилегированный UDP NAT не делает. IPv6 mDNS <code>ff02::fb</code> не доходит до классификатора, потому что у туннельного интерфейса нет IPv6-адреса. Обычную настройку сети самой ОС это не ломает, но транзитные сценарии не соответствуют первоначальному обещанию.</p></article>
+
+  <article class="item"><span class="tag gap">Бюджет времени</span><h3>Переключение с мёртвого узла может начаться позже обещанных 5 секунд</h3><div class="compare"><div><b>Хотели</b>Переключиться не позже пяти секунд после отказа.</div><div><b>Получилось</b>Пять секунд считаются от первой неудачной проверки, а она при отсутствии трафика может начаться лишь через период опроса — до 30 секунд.</div></div><p>Если трафик активно идёт, его ошибки ускоряют обнаружение. Проблема остаётся для соединения, которое просто замолчало.</p></article>
+
+  <article class="item"><span class="tag gap">Не закончено</span><h3>Автоподключение пока нельзя включить командой</h3><p>Команда <code>autoconnect</code> отказывает: нужного поля ещё нет в пользовательских настройках. Автозапуск пока определяется установщиком, а не переключателем в хранилище, как требовала спецификация.</p></article>
+
+  <article class="item"><span class="tag limit">Безопасность модели</span><h3>Full-cone UDP принимает ответ от любого адреса</h3><p>Такова выбранная модель NAT: она нужна для корректных ответов mDNS и full-cone поведения, но устройство в локальной сети, знающее временный порт, теоретически может подложить UDP-пакет. В заметках это признано допустимым свойством, а не ошибкой.</p></article>
+
+  <h2>Осознанно поменяли архитектуру</h2>
+
+  <article class="item"><span class="tag intent">Осознанное решение</span><h3>UDP обходит gVisor</h3><p>План предполагал netstack поверх всего <code>PacketDevice</code>. На практике gVisor обслуживает TCP, а UDP разбирается вручную и проходит через собственную full-cone NAT-таблицу. Причина: готовый UDP-forwarder gVisor привязывает состояние к паре «отправитель + получатель» и тем самым нарушает требуемую NAT-модель.</p></article>
+
+  <article class="item"><span class="tag intent">Осознанное решение</span><h3>Отказ после смерти агента делает сервис, а не маршруты ОС</h3><p>Reject-маршруты хорошо закрывали новые соединения, но уже открытые молча зависали. Поэтому сервис продолжает читать пакеты и сам отвечает RST/ICMP. Это сложнее, зато одинаково работает по смыслу на всех ОС и не оставляет молчаливое окно.</p></article>
+
+  <article class="item"><span class="tag intent">Осознанное решение</span><h3>Attach-token хранится на диске</h3><p>Изначально токен хотели держать только в памяти. Но после <code>kill -9</code> новый процесс не смог бы узнать старый токен и повторно подключиться. Теперь он лежит в защищённом runtime-каталоге с правами 0700/0600. Это означает, что главной границей безопасности остаются права пользователя и проверка UID/SID.</p></article>
+
+  <article class="item"><span class="tag intent">Осознанное решение</span><h3>«Чистый рестарт» всё равно кратко включает отказ</h3><p>План обещал полностью миновать окно отказа. Реализация лишь сокращает его до времени перезапуска: иначе в зазоре пакеты молча исчезали бы, что хуже короткого явного отказа.</p></article>
+
+  <article class="item"><span class="tag intent">Осознанное решение</span><h3>Доступ к IPC дан группе пользователей</h3><p>Сокет, доступный только владельцу, не подходит: сервис работает от root, агент — от обычного пользователя. На Unix используется группа <code>hop</code>, на Windows — класс интерактивных пользователей. Владение конкретным туннелем всё равно проверяется отдельно по UID/SID.</p></article>
+
+  <article class="item"><span class="tag intent">Осознанное решение</span><h3>Вердикт принимается до gVisor и хранится в таблице потоков</h3><p>Спецификация не описывала отдельную таблицу потоков. Она появилась, чтобы один поток не менял маршрут посреди жизни и чтобы новые потоки можно было немедленно закрывать при fail-close.</p></article>
+
+  <article class="item"><span class="tag intent">Осознанное решение</span><h3>Появился пятый вердикт: <code>block</code></h3><p>Кроме четырёх исходных решений понадобился молчаливый дроп для multicast/broadcast-трафика, где ответ сам по себе был бы неправильным. Это отличается от reject: reject сообщает отправителю об отказе, block намеренно ничего не отвечает.</p></article>
+
+  <article class="item"><span class="tag intent">Изменение интерфейса</span><h3>CLI местами отличается от примеров спецификации</h3><p><code>hop bypass on|off</code> и <code>hop auto on|off</code> используют аргумент, а не флаг <code>--on</code>. Добавлена команда <code>probe</code>. Потоковый JSON — это последовательность отдельных JSON-значений, а не один бесконечно растущий массив. Схема <code>status</code> расширена половинами <code>tunnel</code> и <code>agent</code>.</p></article>
+
+  <article class="item"><span class="tag intent">Изменение поставки</span><h3>Пакеты v1 не подписаны и не ставятся двойным кликом</h3><p>Вместо полностью «нативной» установки выбрана установка из командной строки с явным подтверждением. Для первой версии это уменьшило объём инфраструктуры подписи, но пользовательский опыт проще не стал.</p></article>
+
+  <h2>Что уже было исправлено</h2>
+  <article class="item"><span class="tag closed">Закрыто позже</span><h3>Не считать текущими проблемами</h3><p>Поздние разделы заметок закрывают: разрыв активных TCP-соединений при смерти узла; перепривязку UDP bypass после смены интерфейса; показ полной информации <code>status</code> через сокет агента; выдачу <code>nodes</code> через тот же сокет с разбиением на кадры. Ранние абзацы об этих дырах — история разработки.</p></article>
+
+  <footer>Источник: <code>implementation-notes.md</code>. Отчёт описывает состояние так, как оно зафиксировано в заметках, и намеренно не включает мелкие перестановки тестовых помощников, счётчиков и внутренних пакетов.</footer>
+</main></body></html>
