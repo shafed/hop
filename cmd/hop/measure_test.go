@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,17 +16,19 @@ import (
 	"github.com/shafed/hop/internal/subscription"
 )
 
-// Замеры прохода «`hop nodes` через сокет §3.3», сохранённые исполнимыми.
+// Замеры проходов «`hop nodes` через сокет §3.3» (W65) и «уборка при Open не
+// ждёт замок» (S47), сохранённые исполнимыми.
 //
-// Не охрана, а замер: утверждений о продукте эти функции не проверяют и падать
-// им не от чего — они печатают числа, на которых стоят решения прохода
-// (форма ответа и опровержение довода про flock). Записанные в
-// implementation-notes.md числа обязаны воспроизводиться этой командой, иначе
-// раздел заметок становится вторым экземпляром правды.
+// Не охрана, а замер: утверждений о продукте эти функции почти не проверяют и
+// падать им не от чего — они печатают числа, на которых стоят решения проходов
+// (форма ответа, опровержение довода про flock, цена уборки под замком).
+// Записанные в implementation-notes.md числа обязаны воспроизводиться этой
+// командой, иначе раздел заметок становится вторым экземпляром правды.
 //
-//	go test ./cmd/hop -run TestW65Measure -v -count=1
+//	go test ./cmd/hop -run 'TestW65Measure|TestS47Measure' -v -count=1
 //
-// Охраняют те же механизмы W65 и W66 — они обычные тесты и идут в общем гейте.
+// Охраняют те же механизмы W65, W66 и S47 — они обычные тесты и идут в общем
+// гейте.
 
 // measureStore заводит настоящий стор с n узлами, разобранными из настоящих
 // ссылок: сокращать до store.Node руками значило бы мерить не то, что кладёт
@@ -224,7 +227,10 @@ func TestW65MeasureAgentDoesNotHoldTheLock(t *testing.T) {
 	<-done
 
 	t.Logf("стор %s, узлов %d", root, len(nodes))
-	t.Logf("модель агента: транзакций %d, замок держался в среднем %s, дольше всего %s",
+	// «Flush занял», а не «замок держался»: измеряется от вызова, то есть
+	// вместе с ожиданием замка. Разница не косметическая — S47 нашёлся ровно
+	// в ней (см. TestS47MeasureSweepLockUnderALiveWriter).
+	t.Logf("модель агента: транзакций %d, Flush занимал в среднем %s, дольше всего %s",
 		rounds.Load(),
 		time.Duration(total.Load()/max(rounds.Load(), 1)).Round(time.Microsecond),
 		time.Duration(worst.Load()).Round(time.Microsecond))
@@ -240,4 +246,83 @@ func TestW65MeasureAgentDoesNotHoldTheLock(t *testing.T) {
 	}
 	t.Logf("для второй половины замера — держать замок дольше lockTimeout (5 с) чужим процессом:\n"+
 		"    flock -x %s sleep 8 & HOP_STORE=%s hop nodes", lock, root)
+}
+
+// TestS47MeasureSweepLockUnderALiveWriter — во что обходится читателю уборка
+// мусора при Open, когда чужая запись идёт прямо сейчас.
+//
+// Модель та же, что у W65, с одной разницей: писатель без паузы. Пауза там
+// стоит нарочно, чтобы мерить замок, а не планировщик; здесь она мешает — окно
+// временного файла узкое, и попасть в него надо много раз, чтобы увидеть
+// выброс.
+//
+// Числа, ради которых замер сохранён. До починки худший `hop nodes` из сорока —
+// от 457 мс до 2.063 с в пяти прогонах при медиане 4 мс: выброс, а не общее
+// замедление, и попадает в него тот Open, что пришёлся на окно временного
+// файла. Писатель платил столько же по-своему: его худший Flush — 51 мс во всех
+// пяти прогонах, ровно круг опроса lockRetry (50 мс), потерянный в пользу
+// читателя, ушедшего подметать. Контроль, по которому видно, что дело не в
+// планировщике, — тот же прогон без временных файлов вовсе:
+//
+//	HOP_DISABLE=atomic_write go test ./cmd/hop -run TestS47Measure -v -count=1
+//
+// он давал 7 мс худшего и до починки, и 1.2 мс худшего Flush. Сам механизм
+// охраняется S47 — TestS47OpenDoesNotWaitForTheSweepLock, internal/store.
+func TestS47MeasureSweepLockUnderALiveWriter(t *testing.T) {
+	agentStore := measureStore(t, 200)
+	root := os.Getenv("HOP_STORE")
+	nodes := agentStore.Nodes("sub-0123456789ab")
+
+	var stop atomic.Bool
+	var rounds, worst atomic.Int64
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; !stop.Load(); i++ {
+			hs := make([]health.NodeHealth, 0, len(nodes))
+			for j, nd := range nodes {
+				hs = append(hs, health.NodeHealth{
+					NodeID: nd.ID, State: health.Alive,
+					RTT:         time.Duration(i+j) * time.Millisecond,
+					LastProbeAt: time.Now(), //hop:realtime
+				})
+			}
+			agentStore.PutHealth(hs)
+			start := time.Now() //hop:realtime
+			if err := agentStore.Flush(); err != nil {
+				t.Errorf("модель агента: запись отказала: %v", err)
+				return
+			}
+			// Вместе с ожиданием замка: писатель до починки стоял за читателем,
+			// ушедшим подметать, и это вторая половина той же цены.
+			if d := int64(time.Since(start)); d > worst.Load() { //hop:realtime
+				worst.Store(d)
+			}
+			rounds.Add(1)
+		}
+	}()
+
+	const runs = 40
+	sock := t.TempDir() + "/связки-нет.sock"
+	took := make([]time.Duration, 0, runs)
+	for i := 0; i < runs; i++ {
+		c, _, errs := testCLI(t)
+		start := time.Now() //hop:realtime
+		code := c.dispatch([]string{"nodes", "-client-socket", sock})
+		took = append(took, time.Since(start)) //hop:realtime
+		if code != 0 {
+			t.Errorf("`hop nodes` при пишущем без пауз агенте дал %d: %s", code, errs.String())
+		}
+	}
+	stop.Store(true)
+	<-done
+
+	slices.Sort(took)
+	t.Logf("стор %s, узлов %d", root, len(nodes))
+	t.Logf("писатель без пауз: транзакций %d, дольше всего Flush занял %s",
+		rounds.Load(), time.Duration(worst.Load()).Round(time.Microsecond))
+	t.Logf("hop nodes: медиана %s, девятый дециль %s, худший %s",
+		took[len(took)/2].Round(time.Millisecond),
+		took[len(took)*9/10].Round(time.Millisecond),
+		took[len(took)-1].Round(time.Millisecond))
 }
