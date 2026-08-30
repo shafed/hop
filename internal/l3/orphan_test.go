@@ -168,3 +168,40 @@ func TestW70DownRemovesTheOrphanTheAgentDoesNotOwn(t *testing.T) {
 		t.Fatalf("после `hop up` phase = %q, ожидалось up", ph)
 	}
 }
+
+// W70, вторая половина: штатный путь остался штатным.
+//
+// Проход, починивший `hop down` для осиротевшего туннеля, поставил `dropOrphan`
+// на дорогу КАЖДОЙ команды `down` — в том числе той, где связка сама подняла
+// туннель и сама его снимает. До этого прохода стенд не звал `hop down` вовсе,
+// то есть штатный путь не охранял никто, а теперь на нём стоит новый код,
+// который ходит к сервису после каждого успешного `Down` связки.
+//
+// Проверяется, что он там ничего не делает: одно «туннель снят», ни слова про
+// осиротевший туннель, интерфейс исчез, сервис в down. Слово «осиротевший» —
+// не косметика: оно и есть признак того, что сработала ветка, которой на этом
+// пути срабатывать нечем, и пользователю рассказали про уборку чужого туннеля
+// там, где он снял свой.
+func TestW70NormalDownStaysNormal(t *testing.T) {
+	s := startService(t, orphanDeadline)
+	tok := filepath.Join(t.TempDir(), "token")
+	s.startAgent(tok)
+
+	out, code := runHop(t, exec.Command(hopAgent(t),
+		"down", "-client-socket", s.client, "-socket", s.sock, "-token-file", tok))
+	if code != 0 {
+		t.Fatalf("штатный `hop down` дал %d: %s", code, out)
+	}
+	if n := strings.Count(out, "туннель снят"); n != 1 {
+		t.Errorf("«туннель снят» встретилось %d раз, ожидался ровно один:\n%s", n, out)
+	}
+	if strings.Contains(out, "осиротевш") {
+		t.Errorf("на штатном пути сработала уборка осиротевшего туннеля:\n%s", out)
+	}
+
+	waitLink(t, ifname, false)
+	if ph := phaseAt(t, s.sock, noSocket(t)); ph != "down" {
+		t.Fatalf("после штатного `hop down` сервис в фазе %q", ph)
+	}
+	s.verifySnapshot()
+}
