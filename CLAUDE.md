@@ -1,55 +1,48 @@
 # hop
 
-VPN-утилита поверх Xray-core: TUN, набор узлов, автопереключение по живости.
+VPN utility over Xray-core: TUN device, node set, automatic switching on liveness.
 
-## Лицензии референсов — читать можно, копировать нельзя
+## refs/ — read, never copy
 
-`refs/` — чужие исходники для чтения. Копирование кода оттуда меняет лицензию
-всего продукта:
+Copying from the GPL-3.0 sources relicenses the whole product.
 
-| Копировать нельзя (GPL-3.0) | Копировать можно               |
-| --------------------------- | ------------------------------ |
-| sing-box, sing-tun          | wireguard-go (MIT)             |
-| nekoray                     | Xray-core (MPL-2.0)            |
-| hiddify-app, hiddify-core   | gvisor.dev/gvisor (Apache-2.0) |
+- **Never copy:** sing-box, sing-tun, nekoray, hiddify-app, hiddify-core.
+- **May copy:** wireguard-go (MIT), Xray-core (MPL-2.0), gvisor.dev/gvisor (Apache-2.0).
 
-netstack брать из `gvisor.dev/gvisor`, не из `sing-tun/gtcpip` — это форк под
-GPL-3.0.
+Take netstack from `gvisor.dev/gvisor`, not `sing-tun/gtcpip` — that is a GPL-3.0
+fork. Do not edit or build `refs/`; it lives outside git.
 
-`refs/` не редактировать и не собирать, он вне git.
+## SPEC.md is not the source of truth
 
-## SPEC.md — не источник истины
+Measure before deriving anything from a claim about how a mechanism or syscall
+behaves. Where measurement and spec disagree, measurement wins: correct the spec,
+record the measurement in `implementation-notes.md`. §6.8 once asserted that
+`SO_BINDTODEVICE` requires `CAP_NET_RAW`, and an architecture choice rested on
+that false fact.
 
-Расхождение замера со спекой решается в пользу замера, а не наоборот: спека
-правится, замер записывается в `implementation-notes.md`. Утверждение вида
-«системный вызов требует привилегий», «механизм работает так» — замерять до
-того, как из него выведен выбор архитектуры или написан код, а не принимать
-на слово документа или чужого исходника в `refs/`.
+If the implementation must still deviate: take the conservative option, record it
+under "Deviations" in `implementation-notes.md`, continue.
 
-Пример цены ошибки: §6.8 утверждал, что `SO_BINDTODEVICE` требует
-`CAP_NET_RAW`, и на этом стоял выбор архитектуры (`ip rule` по UID вместо
-привязки сокета) — раздел был написан связно и неверен в факте, проверяемом
-двадцатью строками на C.
+## Every "the mechanism exists" test ships with a negative control
 
-Если реализация всё же вынуждена отойти от спеки — консервативный вариант,
-запись в `implementation-notes.md` под «Deviations», продолжать.
+Break the mechanism on purpose and require red. A green test is indistinguishable
+from a vacuous one, and no gate command can tell them apart.
 
-## Каждый новый тест на «механизм существует» — с отрицательным контролем
+A green control is not proof the test is vacuous — it may mean the wrong mechanism
+was disabled. The §6.8 outbound binding, for one, has two switchable sites:
+`outbound.Selector.Control` for the agent's own sockets, and `sockopt.Interface`
+in `internal/engine/dialer.go` for Xray's dial to the node. Look for the second
+site before concluding either way.
 
-Сломать проверяемый механизм нарочно и потребовать красный. Зелёный тест не
-отличить от пустого никаким прогоном гейта: два прохода независимо прислали
-тест, зелёный с выключенным механизмом (счётчик горутин, который их не
-различает; грамматика, сверенная с собственной копией списка).
+## Gate
 
-Зелёный контроль — не обязательно доказательство пустоты: он может значить,
-что сломан не тот механизм. У §6.8 привязка исходящих сокетов выключается в
-двух разных местах (`outbound.Selector.Control` для сокетов агента и
-`sockopt.Interface` в `internal/engine/dialer.go` для дозвона Xray до узла);
-контроль первого места оставил T25 зелёным и чуть не сошёл за подтверждение.
-Прежде чем делать любой вывод из зелёного контроля — искать второе место.
+Commands and the known, deliberately-unfixed noise: `HANDOFF.json` → `gate`. One
+source only; a copy here would drift from what passes actually run.
 
-## Гейт
+## Subagents
 
-Команды и известный, не подлежащий починке шум — в `HANDOFF.json` → `gate`.
-Держать одним источником: копия здесь разойдётся с тем, что реально гоняют
-проходы.
+Running passes as subagents in separate worktrees is expected, and choosing the
+model per task is expected with it — a heavier model where the pass has to make an
+architectural decision, a lighter one for local mechanical work. Divide zones
+per-file and hand out registry numbers before the passes start:
+`HANDOFF.json` → `parallel_passes_trap`.
