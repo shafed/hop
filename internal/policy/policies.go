@@ -150,10 +150,16 @@ var (
 	// трафиком, живёт до следующей пробы — то есть до 45 с вместо 5 с.
 	TrafficKills = &Policy{
 		Name: "traffic_kills",
-		Doc:  "ошибки трафика §6.15 убивают узел наравне с пробами (A5, A29)",
+		Doc:  "ошибки трафика §6.15 убивают узел наравне с пробами (A5, A29, W30)",
+		// Третий охраняющий — сквозной, а не модульный: A5 и A29 зовут
+		// ReportFailure сами, то есть проверяют политику от того места, куда
+		// вердикт уже доехал. W30 начинает с SYN'а в датаплейне и проходит
+		// связку целиком, поэтому выключенная политика краснит его по всей
+		// длине пути, а не только в живости.
 		Guards: []Guard{
 			{Pkg: "./internal/health", Test: "^TestA5TrafficFailuresKillNode$"},
 			{Pkg: "./internal/health", Test: "^TestA29SwitchUnderTrafficIsFast$"},
+			{Pkg: "./internal/agent", Test: "^TestW30DialFailureFromDataplaneReachesHealth$"},
 		},
 	}
 
