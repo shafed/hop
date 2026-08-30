@@ -58,6 +58,14 @@
       "size": "medium; the decision is already made, what remains is files and one honest test"
     },
     {
+      "task": "D45 краснеет таймаутом, а не утверждением — и это десять минут каждого negcheck",
+      "measured": "`HOP_DISABLE=dns_aaaa_nodata go test ./internal/resolver -run ^TestD45AAAAIsSynthesizedNodata$ -timeout 25s` — не падает утверждением, а виснет и падает по таймауту, стек указывает на internal/resolver/upstream.go:199 (askUDP). Найдено при прогоне negcheck на слитом дереве: процесс шесть минут с нулевым CPU, состояние Sl. У negcheck таймаут по умолчанию 10 мин, то есть эта одна политика стоит ~10 минут каждого полного прогона (25–35 мин всего).",
+      "why_it_is_a_defect_of_the_guard": "Красный по таймауту — слабее красного по утверждению: его даёт что угодно (зависшая машина, чужой дедлок), и он не отличает «механизм выключен» от «повисло другое». §8 требует, чтобы тест падал БЕЗ фикса, а не чтобы он не заканчивался без фикса.",
+      "mechanism_read_not_measured": "С выключенной политикой AAAA уходит наверх, а ожидание апстрима идёт по фейковым часам, которые тест не крутит: ждать ему нечего и некогда. Прочитано, не замерено — измерен только сам факт зависания и место в стеке.",
+      "shape_question": "Либо тест ограничивает ожидание сам (крутит модельные часы до дедлайна апстрима и требует ответ/отказ), либо negcheck зовёт go test с коротким -timeout и считает таймаут отдельным исходом, а не красным. Второе чинит все такие политики сразу, но превращает «повисло» в «не сработало» для всех — решать надо явно.",
+      "size": "small, and it pays for itself in every negcheck run"
+    },
+    {
       "task": "Агент не переживает недоступный сервис",
       "measured": "`hop agent` with no hopd: «фоновая половина hop недоступна: сокет /run/hop.sock: dial unix /run/hop.sock: connect: no such file or directory», exit 2, immediately — no wait, no retry (measured this round, see autostart_decision.facts_that_shaped_it).",
       "why_it_matters_now": "Harmless while the agent is started by hand; a restart loop the moment §6.13's third third is real — a user not yet in group `hop`, or a login racing hopd at boot, gets an agent that dies at every start.",
