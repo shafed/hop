@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -227,7 +228,12 @@ func commandAgent(t *testing.T, sock, clientSock, tokenFile string) *exec.Cmd {
 	return cmd
 }
 
-func (s *service) startAgent(tokenFile string) *agent {
+// spawnAgent запускает агента и не ждёт от него ничего.
+//
+// Отделено от startAgent ради теста, которому нужен агент БЕЗ поднятого
+// туннеля (W69): при выключенном автоподключении §6.13 фазы up не будет
+// вовсе, и ожидание внутри startAgent просто истекло бы.
+func (s *service) spawnAgent(tokenFile string) *agent {
 	s.t.Helper()
 	cmd := commandAgent(s.t, s.sock, s.client, tokenFile)
 	if err := cmd.Start(); err != nil {
@@ -241,6 +247,29 @@ func (s *service) startAgent(tokenFile string) *agent {
 			_, _ = a.cmd.Process.Wait()
 		}
 	})
+	return a
+}
+
+// waitClientSocket ждёт, пока агент начнёт отвечать на сокете §3.3.
+//
+// Признак — удавшийся dial, а не появление файла: файл остаётся от убитого
+// агента, и ожидание файла вернулось бы мгновенно, ещё до того как новый
+// агент вообще запустился.
+func (s *service) waitClientSocket() {
+	s.t.Helper()
+	waitUntil(s.t, 10*time.Second, "агент открыл сокет клиентов "+s.client, func() bool {
+		c, err := net.Dial("unix", s.client)
+		if err != nil {
+			return false
+		}
+		_ = c.Close()
+		return true
+	})
+}
+
+func (s *service) startAgent(tokenFile string) *agent {
+	s.t.Helper()
+	a := s.spawnAgent(tokenFile)
 	waitLink(s.t, ifname, true)
 	// Ждать интерфейса мало: он появляется в сервисе ещё до того, как ответ
 	// дойдёт до агента. Тест, который убьёт агента в этом зазоре, промахнётся

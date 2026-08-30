@@ -105,18 +105,25 @@ func (t *transport) Acquire(p tunnel.Params) (packet.PacketDevice, error) {
 }
 
 func (t *transport) acquire(p tunnel.Params) (ipc.Result, error) {
+	// attachErr и hadToken запоминаются не для лога: без них отказ ниже не
+	// сможет сказать, ПОЧЕМУ туннель не забрали, — а без этого он не отказ по
+	// §5.6, а сообщение о фазе.
+	var attachErr error
+	hadToken := false
 	if tok, err := loadToken(t.store); err == nil {
+		hadToken = true
 		res, err := t.cl.Attach(tok)
 		if err == nil {
 			t.log.Info("реаттач по токену удался")
 			return res, nil
 		}
+		attachErr = err
 		t.log.Debug("реаттач не удался, поднимаем заново", "err", err)
 	}
 
 	res, err := t.cl.Start(p)
 	if err != nil {
-		return ipc.Result{}, err
+		return ipc.Result{}, t.explainStart(err, hadToken, attachErr)
 	}
 	if err := saveToken(t.store, res.Token); err != nil {
 		// К этому месту сервис уже создал интерфейс и разложил маршруты.
@@ -127,6 +134,73 @@ func (t *transport) acquire(p tunnel.Params) (ipc.Result, error) {
 		return ipc.Result{}, t.rollback(fmt.Errorf("токен не сохранён: %w", err), res.FD)
 	}
 	return res, nil
+}
+
+// explainStart заменяет отказ машины состояний отказом, который что-то значит
+// пользователю (§5.6, W69).
+//
+// Отказ Start бывает по фазе, и одна из фаз — orphaned. Машина говорит про неё
+// «операция недопустима в текущем состоянии: orphaned, ожидалось down»: фраза
+// верна и бесполезна. Пользователь фазу не наблюдает (`hop status` показывает
+// её только когда связки нет вовсе), снять её ему нечем, и ни одного слова о
+// том, что делать, в ней нет. §5.6 требует от закрытия ровно обратного —
+// назвать себя и оставить выход, а выход обязан существовать; вторую половину
+// чинит runDown (W70).
+//
+// Заменяет, а не оборачивает: исходная фраза — это и есть дефект, и подклеенная
+// в хвост она вернула бы жаргон туда, откуда его убирают. Для разбора она
+// уезжает в debug.
+//
+// Все прочие отказы Start проходят насквозь: фаза up значит, что туннель уже
+// поднят этим же агентом, и там сказать нечего сверх сказанного.
+func (t *transport) explainStart(cause error, hadToken bool, attachErr error) error {
+	st, err := t.cl.Status()
+	if err != nil || st.Phase != tunnel.Orphaned {
+		return cause
+	}
+	t.log.Debug("Start отказал в окне orphaned", "err", cause)
+
+	dev := st.Device
+	if dev == "" {
+		dev = "интерфейс"
+	}
+	why := "attach-token того сеанса не найден (" + t.store + ")"
+	if hadToken {
+		// Токен есть, а сервис его не принял: это уже не потеря файла, и
+		// назвать её потерей значило бы соврать. Сама причина приезжает
+		// строкой — через IPC ошибки едут текстом, не типом.
+		why = fmt.Sprintf("сохранённый attach-token (%s) сервис не принял: %v", t.store, attachErr)
+	}
+	return fmt.Errorf("туннель %s ещё жив, но осиротел%s, а забрать его нечем: %s. "+
+		"Снять сейчас — `hop down`, после чего `hop up` поднимет новый; "+
+		"либо подождать %s: сервис уберёт туннель сам (§6.2), и `hop up` пройдёт",
+		dev, detachSuffix(st.DetachReason), why, leftText(st.OrphanLeft))
+}
+
+// detachSuffix — почему агента не стало, словами. Значения tunnel.Reason —
+// имена рёбер §6.2, и показывать их пользователю значило бы менять один жаргон
+// на другой.
+func detachSuffix(r tunnel.Reason) string {
+	switch r {
+	case tunnel.ReasonClosed:
+		return " (прежний агент оборвал соединение: kill -9 или падение)"
+	case tunnel.ReasonHeartbeat:
+		return " (прежний агент перестал отвечать)"
+	case tunnel.ReasonRestart:
+		return " (прежний агент ушёл на перезапуск)"
+	default:
+		return ""
+	}
+}
+
+// leftText — остаток дедлайна для человека. Округление до секунды, потому что
+// наносекунды в совете «подождите» — шум; остаток меньше секунды называется
+// словами, иначе совет читается как «подождать 0 с».
+func leftText(left time.Duration) string {
+	if left < time.Second {
+		return "меньше секунды"
+	}
+	return fmt.Sprintf("%d с", int(left.Round(time.Second).Seconds()))
 }
 
 // rollback снимает только что поднятый туннель и закрывает присланный

@@ -18,6 +18,7 @@ import (
 	"github.com/shafed/hop/internal/outbound"
 	"github.com/shafed/hop/internal/policy"
 	"github.com/shafed/hop/internal/store"
+	"github.com/shafed/hop/internal/tunnel"
 )
 
 // Поверхность CLI §5.9: подкоманды, флаги-модификаторы, коды возврата.
@@ -643,12 +644,22 @@ func (c *cli) runUp(o *options, _ []string) error {
 //
 // Сервис остаётся запасным адресатом для осиротевшего туннеля: агента нет,
 // интерфейс жив, и убрать его иначе нечем.
+//
+// Связка отвечает не за всякий туннель: осиротевший (§6.2) ей не принадлежит,
+// её `Down` про него не знает и возвращает успех, ничего не сделав. Отсюда
+// вторая половина — сверка с сервисом (W70): «туннель снят» обязано означать,
+// что туннеля нет, а не что связке нечего было снимать.
 func (c *cli) runDown(o *options, _ []string) error {
 	cl, agentErr := agent.DialClient(o.client)
 	if agentErr == nil {
 		defer cl.Close()
 		if err := cl.Down(); err != nil {
 			return err
+		}
+		if dropped, err := c.dropOrphan(o); err != nil {
+			return err
+		} else if dropped {
+			return nil
 		}
 		fmt.Fprintln(c.stdout, "туннель снят")
 		return nil
@@ -666,6 +677,40 @@ func (c *cli) runDown(o *options, _ []string) error {
 	}
 	fmt.Fprintln(c.stderr, "связки нет: туннель снят напрямую через сервис (уборка осиротевшего туннеля §6.2)")
 	return removeToken(o.tokenFile)
+}
+
+// dropOrphan снимает туннель, которого у связки нет, а у сервиса он есть.
+//
+// Зовётся после успешного `Down` связки и только тогда: в обычном случае связка
+// уже сняла свой туннель, сервис отвечает down, и функция ничего не делает —
+// цена одно соединение с сервисом на команду.
+//
+// Отказ сервиса — не отказ команды: сокет §3.1 может быть недоступен (чужая
+// группа §6.1, другой путь), а связка свою половину сняла честно. Молча
+// вернуть false в этом случае — не то же самое, что промолчать о живом
+// туннеле: про живой туннель мы тогда просто не знаем, и утверждать о нём
+// нечего. Единственное, о чём здесь нельзя молчать, — отказ самого Stop: там
+// туннель точно есть и он точно остался.
+func (c *cli) dropOrphan(o *options) (bool, error) {
+	scl, err := ipc.Connect(o.socket)
+	if err != nil {
+		return false, nil
+	}
+	defer scl.Close()
+
+	st, err := scl.Status()
+	if err != nil || st.Phase == tunnel.Down {
+		return false, nil
+	}
+	if err := scl.Stop(); err != nil {
+		return false, fmt.Errorf("осиротевший туннель (%s) остался: сервис не снял его: %w", st.Phase, err)
+	}
+	fmt.Fprintln(c.stderr, "у связки туннеля не было; осиротевший туннель снят напрямую через сервис (§6.2)")
+	if err := removeToken(o.tokenFile); err != nil {
+		return true, err
+	}
+	fmt.Fprintln(c.stdout, "туннель снят")
+	return true, nil
 }
 
 // runEvents — §1/С5. Без `--follow` печатает кольцо и выходит, с ним не
