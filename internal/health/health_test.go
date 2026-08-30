@@ -608,9 +608,7 @@ func TestA22PinnedNodeIsNotReplacedWhenDead(t *testing.T) {
 	f.prober.setRTT("B", 200*ms)
 	f.startAndSettle()
 
-	if err := f.mgr.Pin("B"); err != nil {
-		t.Fatalf("Pin: %v", err)
-	}
+	f.pin("B")
 	if snap := f.mgr.Snapshot(); snap.Auto || snap.Active != "B" {
 		t.Fatalf("после Pin: active=%q auto=%v, ожидалось B и выключенная автоматика", snap.Active, snap.Auto)
 	}
@@ -640,9 +638,7 @@ func TestA23AutoOnReturnsAutomation(t *testing.T) {
 	f.prober.setRTT("B", 200*ms)
 	f.startAndSettle()
 
-	if err := f.mgr.Pin("B"); err != nil {
-		t.Fatalf("Pin: %v", err)
-	}
+	f.pin("B")
 	f.prober.setFailing("B", true)
 	f.advanceRound(DefaultActiveInterval)
 	f.advanceRound(DefaultActiveInterval)

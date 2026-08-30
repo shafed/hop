@@ -59,8 +59,16 @@ func TestT9BlackholeBreaksLiveConnection(t *testing.T) {
 	if got := h.mgr.Snapshot().Active; got != spare {
 		t.Errorf("активен %q, ожидался %s", got, spare)
 	}
-	if last := lastEvent(t, h); last.Reason != health.ReasonDead {
-		t.Errorf("причина %v, ожидалась dead", last.Reason)
+	// Ждём событие ИМЕННО о переходе на spare, а не «последнее собранное»:
+	// стартовый выбор несёт причину dead по построению (§5.5 — выбирать было
+	// не из чего), и утверждение о последнем событии он закрывает собой.
+	// Замерено на этом самом тесте: в зелёном прогоне список событий состоял
+	// из ОДНОГО — `from="" to="B1" reason=dead`, — то есть проверка причины
+	// смотрела на стартовый выбор, а событие смерти к тому моменту ещё не
+	// доехало. Та же форма краснела в T10 (там причины разные), здесь она не
+	// краснела никогда — и потому не проверяла ничего.
+	if ev := h.waitSwitchTo(spare, budget); ev.Reason != health.ReasonDead {
+		t.Errorf("причина %v, ожидалась dead", ev.Reason)
 	}
 }
 
@@ -91,10 +99,11 @@ func TestT10SlowNodeKeepsConnectionAlive(t *testing.T) {
 	h.node[active].inj.SetSlow(250 * time.Millisecond)
 	h.node[active].inj.SetMode(faultinject.ModeSlow)
 
-	h.waitActive(spare, 15*time.Second)
-
-	if last := lastEvent(t, h); last.Reason != health.ReasonFaster {
-		t.Fatalf("причина %v, ожидалась faster: медленный узел не мёртв", last.Reason)
+	// Ждём именно событие перехода, а не снимок: утверждение теста — о причине
+	// ЭТОГО переключения, а «последнее собранное» событие в этот момент вполне
+	// может быть ещё стартовым выбором (см. waitSwitchTo).
+	if ev := h.waitSwitchTo(spare, 15*time.Second); ev.Reason != health.ReasonFaster {
+		t.Fatalf("причина %v, ожидалась faster: медленный узел не мёртв", ev.Reason)
 	}
 	if got := h.interruptCount() - interruptsBefore; got != 0 {
 		t.Errorf("соединения рвали %d раз, ожидалось 0", got)
@@ -289,15 +298,6 @@ func TestProbeTargetBlockedByOneURL(t *testing.T) {
 	if blocked.Requests() == 0 {
 		t.Error("заблокированный URL не опрашивался — стенд собран не так")
 	}
-}
-
-func lastEvent(t *testing.T, h *harness) health.SwitchEvent {
-	t.Helper()
-	evs := h.events()
-	if len(evs) == 0 {
-		t.Fatal("событий переключения не было вовсе")
-	}
-	return evs[len(evs)-1]
 }
 
 func isTimeout(err error) bool {

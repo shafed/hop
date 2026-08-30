@@ -13,10 +13,12 @@ package l2
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time" //hop:realtime
 
@@ -43,12 +45,19 @@ type harness struct {
 	eng  *engine.Engine
 	mgr  *health.Manager
 	node map[string]*node
+	// order — узлы в порядке заведения: имена у них уникальные на процесс
+	// (см. newHarness), поэтому перечислить их иначе неоткуда.
+	order []string
 
 	mu          sync.Mutex
 	conns       []net.Conn
 	interrupts  int
 	switchEvent []health.SwitchEvent
 }
+
+// standSeq нумерует стенды: имена узлов обязаны быть уникальными на процесс,
+// а не на стенд. Обоснование — в newHarness.
+var standSeq atomic.Int64
 
 type options struct {
 	nodes []string
@@ -76,9 +85,25 @@ func newHarness(t *testing.T, opt options) *harness {
 	h.tgt = probetarget.New()
 	t.Cleanup(h.tgt.Close)
 
+	// Имена узлов уникальны на процесс, а не на стенд. Причина не в
+	// аккуратности: internal/engine держит карту «узел → куда сообщать отказ
+	// дозвона» в пакетной переменной, и ключ ей — id узла (dialer.go,
+	// nodeDials). Так и задумано — движок в продукте один, а при пересборке по
+	// подписке старый Xray дренируется параллельно с новым, и отказ его
+	// запоздалого дозвона обязан прийти тому же узлу (см. dialer_test.go,
+	// «поздний Close не должен удалить привязку нового инстанса»).
+	//
+	// Стенд же строит за именем «A» каждый раз ДРУГОЙ узел на другом порту.
+	// Xray дозванивается с повторами, повторы переживают конец теста, и порт
+	// закрытого инжектора отдаёт им ECONNREFUSED уже тогда, когда имя «A»
+	// принадлежит стенду следующего теста. Отказ приходил ему — два таких, и
+	// живой узел умирал по счётчику трафика §6.15, не сделав ни одной плохой
+	// пробы. Именно так краснел T10: «причина dead, ожидалась faster».
+	seq := standSeq.Add(1)
 	var nodes []engine.Node
-	for _, id := range opt.nodes {
-		srv, err := xraytest.NewServer(xraytest.Options{UUID: uuidFor(id)})
+	for _, letter := range opt.nodes {
+		id := fmt.Sprintf("%s%d", letter, seq)
+		srv, err := xraytest.NewServer(xraytest.Options{UUID: uuidFor(letter)})
 		if err != nil {
 			t.Fatalf("инбаунд %s: %v", id, err)
 		}
@@ -92,6 +117,7 @@ func newHarness(t *testing.T, opt options) *harness {
 
 		host, port := splitAddr(t, inj.Addr())
 		h.node[id] = &node{id: id, srv: srv, inj: inj}
+		h.order = append(h.order, id)
 		nodes = append(nodes, engine.Node{
 			ID: id, Protocol: "vless", Server: host, Port: port,
 			Transport: "raw", Security: "none",
@@ -128,7 +154,7 @@ func newHarness(t *testing.T, opt options) *harness {
 	}}
 
 	var hnodes []health.Node
-	for _, id := range opt.nodes {
+	for _, id := range h.order {
 		hnodes = append(hnodes, health.Node{ID: id, Supported: true})
 	}
 	mgr := health.New(health.Config{
@@ -230,6 +256,35 @@ func (h *harness) waitActive(want string, budget time.Duration) {
 	h.waitFor("активным не стал "+want, budget, func() bool {
 		return h.mgr.Snapshot().Active == want
 	})
+}
+
+// waitSwitchTo ждёт СОБЫТИЯ о переходе на узел и возвращает его.
+//
+// Ждать снимка и после этого читать последнее собранное событие — гонка:
+// Snapshot().Active меняется под замком менеджера, а событие едет к подписчику
+// через очередь и отдельную горутину-насос (health/events.go), и приходит
+// заметно позже. Тест, спросивший «какое событие последнее» сразу после
+// снимка, читает предыдущее — на стенде это стартовый выбор, у которого
+// причина dead по построению (§5.5: выбирать было не из чего). T10 краснел
+// «причина dead, ожидалась faster» ровно так, ничего не сломав в продукте:
+// переключение было правильным, тест смотрел не на него.
+//
+// Событие сильнее снимка ещё и для счётчика разрывов: Interrupt вызывается в
+// emitLocked до того, как событие уйдёт в очередь, значит к приходу события
+// разрывы этого переключения уже посчитаны.
+func (h *harness) waitSwitchTo(want string, budget time.Duration) health.SwitchEvent {
+	h.t.Helper()
+	var got health.SwitchEvent
+	h.waitFor("события перехода на "+want, budget, func() bool {
+		for _, ev := range h.events() {
+			if ev.To == want {
+				got = ev
+				return true
+			}
+		}
+		return false
+	})
+	return got
 }
 
 func (h *harness) waitFor(what string, budget time.Duration, cond func() bool) {
