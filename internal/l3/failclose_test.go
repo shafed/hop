@@ -46,9 +46,13 @@ func TestT27FailCloseKeepsTrafficOffTheDirectPath(t *testing.T) {
 	if err, _ := connect(site, 2*time.Second); err != nil {
 		t.Fatalf("«интернет-сервер» недостижим напрямую до туннеля — проверять нечего: %v", err)
 	}
-	if n := len(peer.counts(t).SiteConns); n != 1 {
-		t.Fatalf("пир насчитал %d соединений до туннеля, ожидалось 1", n)
-	}
+	// Ждать, а не сравнивать сразу: пир записывает соединение в своей горутине
+	// accept, и она успевает не всегда — замер дал промах примерно на каждом
+	// третьем прогоне. Промах читался бы как «стенд недостижим», то есть
+	// красил бы тест ложно и ровно в том месте, где он проверяет стенд.
+	waitUntil(t, 5*time.Second, "записи соединения на стороне пира", func() bool {
+		return len(peer.counts(t).SiteConns) == 1
+	})
 
 	s := startService(t, orphanDeadline)
 	s.startAgent(filepath.Join(t.TempDir(), "token"))
