@@ -139,10 +139,18 @@ func run(log *slog.Logger, cl control, tokenFile, clientSocket string, beat time
 	defer l.Close()
 	log.Info("сокет клиентов открыт", "путь", clientSocket)
 
-	if err := a.Up(); err != nil {
-		return err
+	// §6.13: автоподключение решает сам агент, читая стор при старте —
+	// инсталлятора, которому спека отдаёт автозапуск СЕРВИСА, в репозитории
+	// нет, а решение «поднимать ли туннель, раз агент уже запущен» его и не
+	// касается. shouldAutoUp — cmd/hop/autoconnect.go.
+	if shouldAutoUp(st) {
+		if err := a.Up(); err != nil {
+			return err
+		}
+		log.Info("туннель поднят", "интерфейс", p.Name)
+	} else {
+		log.Info("автоподключение выключено (§6.13): туннель не поднят, ждём `hop up`")
 	}
-	log.Info("туннель поднят", "интерфейс", p.Name)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
