@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"github.com/shafed/hop/internal/clock"
 	"github.com/shafed/hop/internal/engine"
 	"github.com/shafed/hop/internal/health"
+	"github.com/shafed/hop/internal/ipc"
 	"github.com/shafed/hop/internal/resolver"
 	"github.com/shafed/hop/internal/store"
 	"github.com/shafed/hop/internal/tunnel"
@@ -62,7 +64,7 @@ func withStore(fn func(*store.Store) error) error {
 // узла (§6.7), дозвон живёт в связке, а связке нужна живость, которой нужен
 // пробер. Круг разрывается замыканием — пробер зовёт дозвон лениво, к моменту
 // первой пробы связка уже собрана.
-func run(log *slog.Logger, cl control, tokenFile string, beat time.Duration, p tunnel.Params, physical engine.InterfaceFunc, dialDirect resolver.DialDirectFunc, bypassControl bypass.ControlFunc) error {
+func run(log *slog.Logger, cl control, tokenFile, clientSocket string, beat time.Duration, p tunnel.Params, physical engine.InterfaceFunc, dialDirect resolver.DialDirectFunc, bypassControl bypass.ControlFunc) error {
 	root, err := storeRoot()
 	if err != nil {
 		return err
@@ -114,6 +116,29 @@ func run(log *slog.Logger, cl control, tokenFile string, beat time.Duration, p t
 	defer a.Close()
 
 	a.Start()
+
+	// Сокет клиентов (§3.3) открывается до подъёма туннеля: `hop status` во
+	// время долгого старта — это ровно тот момент, когда он нужен, и агент,
+	// который начинает отвечать только после успешного Up, молчит именно в
+	// фазе waiting (§5.6).
+	//
+	// Отказ слушателя — отказ запуска, а не предупреждение в лог. Агент,
+	// поднявший туннель и недостижимый ни одной командой, — это продукт без
+	// поверхности §5.9: снять туннель можно будет только через сервис.
+	l, err := ipc.Listen(clientSocket, -1)
+	if err != nil {
+		return fmt.Errorf("сокет клиентов %s не открылся: %w", clientSocket, err)
+	}
+	clients := agent.NewClientServer(a, log)
+	defer clients.Close()
+	go func() {
+		if err := clients.Serve(l); err != nil {
+			log.Debug("сокет клиентов закрыт", "err", err)
+		}
+	}()
+	defer l.Close()
+	log.Info("сокет клиентов открыт", "путь", clientSocket)
+
 	if err := a.Up(); err != nil {
 		return err
 	}

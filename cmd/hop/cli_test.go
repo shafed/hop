@@ -13,7 +13,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/shafed/hop/internal/agent"
 	"github.com/shafed/hop/internal/negcheck"
 	"github.com/shafed/hop/internal/policy"
 	"github.com/shafed/hop/internal/store"
@@ -203,7 +205,10 @@ func TestW56ExitCodesTellRefusalFromFailClose(t *testing.T) {
 	// ошибка конфигурации: агент просто не поднят.
 	c, _, _ = testCLI(t)
 	sock := filepath.Join(t.TempDir(), "нет.sock")
-	if code := c.dispatch([]string{"status", "-socket", sock}); code != 2 {
+	// Оба адресата названы явно: `status` спрашивает связку, а сервис — только
+	// когда она молчит, и умолчание клиентского сокета зависело бы от того,
+	// запущен ли агент на машине, где идёт проверка.
+	if code := c.dispatch([]string{"status", "-socket", sock, "-client-socket", sock}); code != 2 {
 		t.Errorf("`hop status` без сокета дал %d, ожидалась 2", code)
 	}
 
@@ -291,9 +296,51 @@ func goldenViews() []struct {
 				`"last_probe_at":"2024-01-01T00:00:00Z"}]}]}`,
 		},
 		{
+			// Ответила связка (§3.3) — половина сервиса пуста. Это нормальный
+			// случай: пока агент отвечает, клиент к привилегированному сервису
+			// не ходит вовсе.
 			name: "status",
-			v:    statusOut{Tunnel: tunnelOut{Phase: "up", Device: "fd", OrphanLeft: "0s"}},
-			want: `{"tunnel":{"phase":"up","device":"fd","orphan_left":"0s"}}`,
+			v: statusOut{Agent: &agent.ClientStatus{
+				Tunnel: "up", Traffic: "proxied",
+				Active: "n1", ActiveState: "alive", ActiveRTTMs: 42,
+				Auto: true, Alive: 2, Nodes: 3,
+				Last: &agent.ClientEvent{
+					At:   time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+					From: "n2", To: "n1", Reason: "dead", Interrupted: 3,
+				},
+			}},
+			want: `{"tunnel":null,"agent":{"tunnel":"up","traffic":"proxied","active":"n1",` +
+				`"active_state":"alive","active_rtt_ms":42,"auto":true,"alive":2,"nodes":3,` +
+				`"last_switch":{"at":"2024-01-01T00:00:00Z","from":"n2","to":"n1",` +
+				`"reason":"dead","interrupted":3}}}`,
+		},
+		{
+			// Связки нет — ответил сервис. null у второй половины значит «этот
+			// не отвечал», а не «показывать нечего».
+			name: "status без связки",
+			v:    statusOut{Tunnel: &tunnelOut{Phase: "orphaned", Device: "fd", DetachReason: "restart", OrphanLeft: "12s"}},
+			want: `{"tunnel":{"phase":"orphaned","device":"fd","detach_reason":"restart",` +
+				`"orphan_left":"12s"},"agent":null}`,
+		},
+		{
+			name: "events",
+			v: eventsOut{Events: []agent.ClientEvent{{
+				At: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+				To: "n1", Reason: "manual",
+			}}},
+			want: `{"events":[{"at":"2024-01-01T00:00:00Z","to":"n1","reason":"manual",` +
+				`"interrupted":0}]}`,
+		},
+		{
+			// Одно событие потока `--follow`: та же схема без обёртки, потому
+			// что у потока нет конца, в который можно было бы её закрыть.
+			name: "событие потока",
+			v: eventOut{agent.ClientEvent{
+				At:   time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+				From: "n1", To: "n2", Reason: "faster", Interrupted: 0,
+			}},
+			want: `{"at":"2024-01-01T00:00:00Z","from":"n1","to":"n2","reason":"faster",` +
+				`"interrupted":0}`,
 		},
 		{
 			name: "probe",
@@ -396,7 +443,7 @@ func TestW58JSONHasOneFormationPoint(t *testing.T) {
 // заставляет автоматику разбирать человеческий текст, после чего текст
 // перестаёт быть человеческим — его правят под регэксп.
 func TestW58EveryReadingCommandTakesJSON(t *testing.T) {
-	reading := []string{"status", "nodes", "routing", "probe"}
+	reading := []string{"status", "nodes", "routing", "probe", "events"}
 	for _, name := range reading {
 		cmd, ok := lookupVerb(name)
 		if !ok {

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/shafed/hop/internal/agent"
 	"github.com/shafed/hop/internal/ipc"
 	"github.com/shafed/hop/internal/outbound"
 	"github.com/shafed/hop/internal/policy"
@@ -27,27 +28,32 @@ import (
 // второго аргумента и до второго глагола над той же сущностью.
 //
 // Бинарь один (§5.9). `hop agent` — фоновый режим, его запускает автозапуск
-// §6.13; остальные подкоманды обязаны стать тонким клиентом к нему через сокет
-// §3.3. Сокета ещё нет, и глаголы, которым без него нечего делать, названы в
-// таблице честно — они отказывают с причиной, а не отсутствуют.
+// §6.13; остальные подкоманды — тонкий клиент к нему через сокет §3.3
+// (`internal/agent`, файл clients.go). Глагол, которого связка не умеет,
+// остаётся в таблице с названной причиной и отказывает: «неизвестная команда»
+// на глагол, который спека обещает, — ложь про продукт.
 
 // options — флаги-модификаторы. Ни один из них не глагол: глаголы стоят в
 // таблице commands.
 type options struct {
 	socket    string
+	client    string
 	ifname    string
 	addr      string
 	mtu       int
 	table     int
 	heartbeat time.Duration
 	tokenFile string
+	node      string
 	debug     bool
+	follow    bool
 	json      bool
 }
 
 func defaultOptions() options {
 	return options{
 		socket:    ipc.DefaultPath,
+		client:    ipc.DefaultClientPath,
 		ifname:    "hop0",
 		addr:      "10.255.0.1/24",
 		mtu:       1400,
@@ -66,11 +72,23 @@ type command struct {
 	sub  string
 	args string
 	help string
+	// argc — сколько позиционных аргументов берёт команда. Ровно столько, не
+	// «не больше»: у каждого глагола §5.9 число аргументов известно точно.
+	//
+	// Поле, а не проверка внутри обработчика. Безаргументные обработчики
+	// молча игнорировали остаток `fs.Args()`, а `flag.FlagSet` перестаёт
+	// разбирать флаги после первого позиционного аргумента, — и
+	// `hop nodes лишнее --json` печатал человеческую таблицу с кодом 0. Ложный
+	// успех на кривом вводе — ровно то, от чего W55 защищает неизвестный
+	// глагол, и защита обязана стоять в одном месте, иначе следующая команда
+	// напишется без неё.
+	argc int
 	// reads — читающая команда, у неё есть `--json` (§5.9).
 	reads bool
-	// waits — почему глагола ещё нет. Непусто ровно у тех, кому нужен сокет
-	// §3.3. Такая команда отказывает с названной причиной: «неизвестная
-	// команда» на глагол, который спека обещает, — это ложь про продукт.
+	// waits — почему глагола ещё нет. Такая команда отказывает с названной
+	// причиной: «неизвестная команда» на глагол, который спека обещает, — это
+	// ложь про продукт. Пустое поле или молчаливый успех вместо отказа — та же
+	// ложь, только незаметная.
 	waits string
 	setup func(*flag.FlagSet, *options)
 	run   func(*cli, *options, []string) error
@@ -104,6 +122,14 @@ var retiredFlags = map[string]string{
 	"status":  "hop status",
 }
 
+// clientFlags — флаги глагола, который ходит в связку через сокет §3.3.
+//
+// Общая функция, а не строка в каждой команде: путь до связки один, и семь
+// его копий разъехались бы на первой же правке умолчания.
+func clientFlags(fs *flag.FlagSet, o *options) {
+	fs.StringVar(&o.client, "client-socket", o.client, "сокет связки (§3.3)")
+}
+
 // commands — грамматика §5.9 целиком.
 //
 // Порядок — читательский: сперва туннель, потом наблюдение, потом ввод узлов,
@@ -113,7 +139,8 @@ var commands = []*command{
 		verb: "agent",
 		help: "фоновый режим: поднять туннель и вести его (§5.9, автозапуск §6.13)",
 		setup: func(fs *flag.FlagSet, o *options) {
-			fs.StringVar(&o.socket, "socket", o.socket, "управляющий сокет сервиса")
+			fs.StringVar(&o.socket, "socket", o.socket, "управляющий сокет сервиса (§3.1)")
+			fs.StringVar(&o.client, "client-socket", o.client, "сокет клиентов, который слушает агент (§3.3)")
 			fs.StringVar(&o.ifname, "ifname", o.ifname, "имя интерфейса")
 			fs.StringVar(&o.addr, "addr", o.addr, "адрес туннеля")
 			fs.IntVar(&o.mtu, "mtu", o.mtu, "MTU")
@@ -125,25 +152,31 @@ var commands = []*command{
 		run: (*cli).runAgent,
 	},
 	{
-		verb:  "up",
-		help:  "поднять туннель",
-		waits: "поднимать туннель умеет только `hop agent`: командой это станет вместе с сокетом клиентов (§3.3)",
+		verb: "up",
+		help: "поднять туннель; --node фиксирует узел (§1/С3)",
+		setup: func(fs *flag.FlagSet, o *options) {
+			clientFlags(fs, o)
+			fs.StringVar(&o.node, "node", "", "зафиксировать узел по id (§1/С3): автопереключение выключается до `hop auto on`")
+		},
+		run: (*cli).runUp,
 	},
 	{
 		verb: "down",
 		help: "снять туннель",
 		setup: func(fs *flag.FlagSet, o *options) {
-			fs.StringVar(&o.socket, "socket", o.socket, "управляющий сокет сервиса")
+			clientFlags(fs, o)
+			fs.StringVar(&o.socket, "socket", o.socket, "управляющий сокет сервиса (§3.1) — путь уборки осиротевшего туннеля")
 			fs.StringVar(&o.tokenFile, "token-file", o.tokenFile, "где лежит attach-token")
 		},
 		run: (*cli).runDown,
 	},
 	{
 		verb:  "status",
-		help:  "состояние туннеля",
+		help:  "обе фазы, активный узел, автоматика, последнее переключение (§1/С5)",
 		reads: true,
 		setup: func(fs *flag.FlagSet, o *options) {
-			fs.StringVar(&o.socket, "socket", o.socket, "управляющий сокет сервиса")
+			clientFlags(fs, o)
+			fs.StringVar(&o.socket, "socket", o.socket, "управляющий сокет сервиса (§3.1) — спрашивается, только когда молчит связка")
 		},
 		run: (*cli).runStatus,
 	},
@@ -155,28 +188,50 @@ var commands = []*command{
 	},
 	{
 		verb:  "events",
-		help:  "журнал переключений",
-		waits: "события живут в кольце связки и рассылаются через сокет клиентов (§3.3), которого ещё нет",
+		help:  "журнал переключений; --follow — поток (§1/С5)",
+		reads: true,
+		setup: func(fs *flag.FlagSet, o *options) {
+			clientFlags(fs, o)
+			fs.BoolVar(&o.follow, "follow", false, "не выходить, а печатать переключения по мере их появления")
+		},
+		run: (*cli).runEvents,
 	},
 	{
 		verb:  "bypass",
+		args:  "on|off",
+		argc:  1,
 		help:  "осознанный выпуск трафика мимо туннеля (§1/С6)",
-		waits: "обход держит связка в памяти (§5.6), и снаружи он достижим только через сокет клиентов (§3.3)",
+		setup: clientFlags,
+		run:   (*cli).runBypass,
 	},
 	{
 		verb:  "auto",
+		args:  "on|off",
+		argc:  1,
 		help:  "автопереключение по живости (§1/С3)",
-		waits: "выбор узла держит связка: команда придёт вместе с сокетом клиентов (§3.3)",
+		setup: clientFlags,
+		run:   (*cli).runAuto,
 	},
 	{
-		verb:  "autoconnect",
-		help:  "автоподключение при входе (§6.13)",
-		waits: "автозапуск ставит инсталлятор, а переключает его связка через сокет клиентов (§3.3)",
+		verb: "autoconnect",
+		args: "on|off",
+		argc: 1,
+		help: "автоподключение при входе (§6.13)",
+		// Единственный глагол §5.9, который сокет §3.3 не открыл: ему нужно
+		// не соединение со связкой, а поле в сторе. §6.13 говорит прямо —
+		// «состояние в сторе», потому что флаг командной строки агента
+		// пришлось бы править в unit-файле или plist, то есть под root, ради
+		// пользовательской настройки. Поля такого в `store.Settings` нет, а
+		// читает его тот, кого тоже ещё нет: автозапуск ставит инсталлятор
+		// (§5.10, §6.13), и инсталляторы — остаток этого же этапа.
+		waits: "состояние автоподключения живёт в сторе (§6.13), поля под него в settings.json нет, " +
+			"и читать его некому: автозапуск ставит инсталлятор, а инсталляторов ещё нет",
 	},
 	{
 		verb: "sub",
 		sub:  "add",
 		args: "<url>",
+		argc: 1,
 		help: "скачать подписку, слить её в группу и выйти (§5.8, §6.16)",
 		setup: func(fs *flag.FlagSet, o *options) {
 			fs.StringVar(&o.ifname, "ifname", o.ifname, "имя интерфейса туннеля (сокет качалки биндится мимо него, §6.8)")
@@ -187,6 +242,7 @@ var commands = []*command{
 		verb: "node",
 		sub:  "add",
 		args: "<ссылка>",
+		argc: 1,
 		help: "добавить один узел в группу manual (Р10)",
 		run:  (*cli).runNodeAdd,
 	},
@@ -194,6 +250,7 @@ var commands = []*command{
 		verb: "node",
 		sub:  "rm",
 		args: "<id>",
+		argc: 1,
 		help: "удалить узел или очистить группу (§1/С8)",
 		run:  (*cli).runNodeRm,
 	},
@@ -338,7 +395,67 @@ func (c *cli) execute(args []string) error {
 	if err := fs.Parse(rest); err != nil {
 		return fmt.Errorf("`hop %s`: %w", cmd.name(), err)
 	}
+	if err := checkArgs(cmd, fs.Args()); err != nil {
+		return err
+	}
 	return cmd.run(c, &opts, fs.Args())
+}
+
+// checkArgs — кардинальность аргументов, одна на всю таблицу.
+//
+// Лишний аргумент отвергается, а не игнорируется, по двум причинам сразу.
+// Первая: `hop nodes лишнее` — это опечатка, и ноль в ответ на неё врёт
+// скрипту так же, как ноль на неизвестный глагол. Вторая измерена:
+// `flag.FlagSet` прекращает разбор флагов на первом позиционном аргументе,
+// поэтому `hop nodes лишнее --json` не просто терпел мусор — он молча
+// печатал человеческую таблицу там, где просили машинный вывод.
+func checkArgs(cmd *command, args []string) error {
+	if len(args) == cmd.argc {
+		return nil
+	}
+	form := strings.TrimSpace("hop " + cmd.name() + " " + cmd.args)
+	// Отдельная подсказка про флаг после аргумента: `flag.FlagSet` его даже не
+	// разбирает, и «лишний аргумент --json» без этой строки читается как
+	// «--json тут не бывает», хотя бывает — только левее.
+	for _, a := range args[min(len(args), cmd.argc):] {
+		if strings.HasPrefix(a, "-") {
+			return fmt.Errorf("`hop %s`: флаг %s стоит после аргумента и потому не разобран — флаги идут перед аргументами: `%s`",
+				cmd.name(), a, strings.TrimSpace("hop "+cmd.name()+" [--флаги] "+cmd.args))
+		}
+	}
+	switch {
+	case cmd.argc == 0:
+		return fmt.Errorf("`hop %s` не берёт аргументов, а получил %d (%s): форма — `%s`",
+			cmd.name(), len(args), strings.Join(args, " "), form)
+	case len(args) < cmd.argc:
+		return fmt.Errorf("`hop %s` берёт %d аргумент(а), а получил %d: форма — `%s`",
+			cmd.name(), cmd.argc, len(args), form)
+	default:
+		return fmt.Errorf("`hop %s` берёт %d аргумент(а), а получил %d (%s): форма — `%s`",
+			cmd.name(), cmd.argc, len(args), strings.Join(args, " "), form)
+	}
+}
+
+// onOff разбирает единственный аргумент глаголов-переключателей.
+//
+// Аргументом, а не флагом `--on`: §5.9 оставляет флагам роль модификаторов, а
+// «включить» и «выключить» — это то, что глагол делает, а не как. §6.13
+// записывает ту же форму прямо: `hop autoconnect on|off`.
+func onOff(cmd string, args []string) (bool, error) {
+	// Кардинальность держит checkArgs, и здесь она не проверяется второй раз;
+	// проверяется только то, что от её отсутствия команда откажет, а не
+	// упадёт с индексом.
+	if len(args) != 1 {
+		return false, fmt.Errorf("`hop %s` берёт ровно одно слово: on или off", cmd)
+	}
+	switch args[0] {
+	case "on":
+		return true, nil
+	case "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("`hop %s` берёт on или off, а не %q", cmd, args[0])
+	}
 }
 
 // lookup находит команду по одному или двум первым аргументам.
@@ -392,7 +509,7 @@ func usage(out io.Writer) {
 	}
 	fmt.Fprintf(out, "  %-16s %s\n", "help", "этот список")
 	fmt.Fprintln(out)
-	fmt.Fprintln(out, "· — глагол §5.9, которому нужен сокет клиентов (§3.3); он ещё не написан")
+	fmt.Fprintln(out, "· — глагол §5.9, который ещё не написан; отказ называет причину")
 	fmt.Fprintln(out, "у читающих команд есть --json, коды возврата: 0 выполнено, 1 ошибка,")
 	fmt.Fprintln(out, "2 фоновая половина недоступна, 3 живых узлов нет (fail-close §5.6)")
 }
@@ -413,31 +530,207 @@ func (c *cli) connect(path string) (*ipc.Client, error) {
 	return cl, nil
 }
 
-func (c *cli) runStatus(o *options, _ []string) error {
-	cl, err := c.connect(o.socket)
+// dialAgent — соединение со связкой (§3.3).
+//
+// Отказ — код 2 по тому же доводу, что и отказ сокета сервиса: фоновой
+// половины продукта нет, чинить в конфигурации нечего. Разница только в том,
+// какой половины: `hop agent` не запущен.
+func (c *cli) dialAgent(o *options) (*agent.Client, error) {
+	cl, err := agent.DialClient(o.client)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("%w: связка не отвечает на %s (`hop agent` не запущен?): %v",
+			errAgentUnavailable, o.client, err)
 	}
-	defer cl.Close()
-
-	st, err := cl.Status()
-	if err != nil {
-		return err
-	}
-	return emit(c.stdout, statusView(st), o.json)
+	return cl, nil
 }
 
-func (c *cli) runDown(o *options, _ []string) error {
-	cl, err := c.connect(o.socket)
+// runStatus — §1/С5 целиком: обе фазы, активный узел с латентностью,
+// автоматика, фиксация, последнее переключение.
+//
+// Спрашивается связка, а не сервис: §3.3 говорит буквально, что клиенты
+// никогда не говорят с привилегированным сервисом напрямую. Сервис остаётся
+// запасным адресатом ровно для того состояния, в котором связки нет по
+// определению, — `orphaned` (§6.2): туннель жив, агента у него больше нет, и
+// остаток до снятия знает только сервис.
+//
+// Код 3 при `traffic: failing` — это §1/С6 буквально: «status показывает no
+// healthy nodes и возвращает код 3». До сокета §3.3 третий код был наблюдаем
+// только на `probe`, потому что фазу трафика знает связка.
+func (c *cli) runStatus(o *options, _ []string) error {
+	v, err := c.statusView(o)
+	if err != nil {
+		return err
+	}
+	// Вывод печатается до кода 3, а не вместо него: мониторинг читает код,
+	// человек читает строки (тот же порядок, что у `probe`).
+	if err := emit(c.stdout, v, o.json); err != nil {
+		return err
+	}
+	if v.Agent != nil && v.Agent.Traffic == string(agent.PhaseFailing) {
+		return fmt.Errorf("%w: живых узлов %d из %d (fail-close §5.6)",
+			errNoLiveNodes, v.Agent.Alive, v.Agent.Nodes)
+	}
+	return nil
+}
+
+func (c *cli) statusView(o *options) (statusOut, error) {
+	cl, agentErr := agent.DialClient(o.client)
+	if agentErr == nil {
+		defer cl.Close()
+		st, err := cl.Status()
+		if err != nil {
+			return statusOut{}, err
+		}
+		return statusOut{Agent: &st}, nil
+	}
+
+	// Связки нет. Туннель при этом может быть жив — ради этого и существует
+	// orphaned, — и спросить о нём больше некого.
+	scl, err := ipc.Connect(o.socket)
+	if err != nil {
+		return statusOut{}, fmt.Errorf("%w: связка на %s (%v) и сервис на %s (%v)",
+			errAgentUnavailable, o.client, agentErr, o.socket, err)
+	}
+	defer scl.Close()
+
+	st, err := scl.Status()
+	if err != nil {
+		return statusOut{}, err
+	}
+	t := tunnelView(st)
+	return statusOut{Tunnel: &t}, nil
+}
+
+// runUp — §1/С3. Туннель поднимает связка: `hop agent` уже держит стор, узлы и
+// живость, и второй процесс, поднимающий туннель мимо него, получил бы отказ
+// стора на замке (§2), а не туннель.
+func (c *cli) runUp(o *options, _ []string) error {
+	cl, err := c.dialAgent(o)
 	if err != nil {
 		return err
 	}
 	defer cl.Close()
 
-	if err := cl.Stop(); err != nil {
+	if err := cl.Up(o.node); err != nil {
 		return err
 	}
+	if o.node != "" {
+		fmt.Fprintf(c.stdout, "туннель поднят, узел %s зафиксирован: автопереключение выключено до `hop auto on`\n", o.node)
+		return nil
+	}
+	fmt.Fprintln(c.stdout, "туннель поднят")
+	return nil
+}
+
+// runDown — §1/С7. Через связку, а не через сервис: снятие туннеля мимо неё
+// оставило бы связку в состоянии «туннель поднят», которого больше нет.
+//
+// Сервис остаётся запасным адресатом для осиротевшего туннеля: агента нет,
+// интерфейс жив, и убрать его иначе нечем.
+func (c *cli) runDown(o *options, _ []string) error {
+	cl, agentErr := agent.DialClient(o.client)
+	if agentErr == nil {
+		defer cl.Close()
+		if err := cl.Down(); err != nil {
+			return err
+		}
+		fmt.Fprintln(c.stdout, "туннель снят")
+		return nil
+	}
+
+	scl, err := ipc.Connect(o.socket)
+	if err != nil {
+		return fmt.Errorf("%w: связка на %s (%v) и сервис на %s (%v)",
+			errAgentUnavailable, o.client, agentErr, o.socket, err)
+	}
+	defer scl.Close()
+
+	if err := scl.Stop(); err != nil {
+		return err
+	}
+	fmt.Fprintln(c.stderr, "связки нет: туннель снят напрямую через сервис (уборка осиротевшего туннеля §6.2)")
 	return removeToken(o.tokenFile)
+}
+
+// runEvents — §1/С5. Без `--follow` печатает кольцо и выходит, с ним не
+// выходит вовсе.
+func (c *cli) runEvents(o *options, _ []string) error {
+	cl, err := c.dialAgent(o)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+
+	if !o.follow {
+		v := eventsOut{Events: []agent.ClientEvent{}}
+		if err := cl.Events(false, func(ev agent.ClientEvent) error {
+			v.Events = append(v.Events, ev)
+			return nil
+		}); err != nil {
+			return err
+		}
+		return emit(c.stdout, v, o.json)
+	}
+
+	// Поток печатается по событию, а не одним значением в конце: конца у него
+	// нет. Значение при этом то же самое, и через ту же единственную точку
+	// формирования — иначе схема потока разъехалась бы со схемой журнала.
+	err = cl.Events(true, func(ev agent.ClientEvent) error {
+		return emit(c.stdout, eventOut{ev}, o.json)
+	})
+	if err != nil {
+		return fmt.Errorf("%w: поток событий оборвался: %v", errAgentUnavailable, err)
+	}
+	return nil
+}
+
+// runBypass — §1/С6. Обход держит связка в памяти и до перезапуска (§5.6):
+// на диск он не пишется, поэтому и включается только через неё.
+func (c *cli) runBypass(o *options, args []string) error {
+	on, err := onOff("bypass", args)
+	if err != nil {
+		return err
+	}
+	cl, err := c.dialAgent(o)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+
+	if err := cl.Bypass(on); err != nil {
+		return err
+	}
+	if on {
+		fmt.Fprintln(c.stdout, "обход включён: трафик идёт мимо туннеля, туннель снят (§5.6);")
+		fmt.Fprintln(c.stdout, "он выключится сам при перезапуске агента — на диск это состояние не пишется")
+		return nil
+	}
+	fmt.Fprintln(c.stdout, "обход выключен: туннель поднят обратно")
+	return nil
+}
+
+// runAuto — §1/С3. Фиксацию узла ставит `hop up --node`, здесь только
+// возврат автоматики и её выключение.
+func (c *cli) runAuto(o *options, args []string) error {
+	on, err := onOff("auto", args)
+	if err != nil {
+		return err
+	}
+	cl, err := c.dialAgent(o)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+
+	if err := cl.Auto(on); err != nil {
+		return err
+	}
+	if on {
+		fmt.Fprintln(c.stdout, "автопереключение включено: узел выбирает живость")
+		return nil
+	}
+	fmt.Fprintln(c.stdout, "автопереключение выключено: активный узел больше не заменяется, даже когда умрёт (§1/С3)")
+	return nil
 }
 
 func (c *cli) runNodes(o *options, _ []string) error {
@@ -461,9 +754,6 @@ func (c *cli) runRouting(o *options, _ []string) error {
 }
 
 func (c *cli) runSubAdd(o *options, args []string) error {
-	if len(args) != 1 {
-		return errors.New("`hop sub add` берёт ровно одну ссылку на подписку")
-	}
 	physical, err := c.newOutbound(o.ifname)
 	if err != nil {
 		return err
@@ -476,18 +766,12 @@ func (c *cli) runSubAdd(o *options, args []string) error {
 }
 
 func (c *cli) runNodeAdd(_ *options, args []string) error {
-	if len(args) != 1 {
-		return errors.New("`hop node add` берёт ровно одну ссылку; для пачки есть `hop sub add`")
-	}
 	return withStore(func(st *store.Store) error {
 		return addNode(st, args[0], c.stdout)
 	})
 }
 
 func (c *cli) runNodeRm(_ *options, args []string) error {
-	if len(args) != 1 {
-		return errors.New("`hop node rm` берёт ровно один id — узла или группы")
-	}
 	return withStore(func(st *store.Store) error {
 		return removeNode(st, args[0], c.stdout)
 	})
@@ -541,7 +825,7 @@ func (c *cli) runAgent(o *options, _ []string) error {
 	}
 	defer physical.Close()
 
-	return run(log, cl, o.tokenFile, o.heartbeat,
+	return run(log, cl, o.tokenFile, o.client, o.heartbeat,
 		tunnelParams(o.ifname, o.addr, o.mtu, o.table),
 		physical.Interface, physical.DialDirect, physical.Control)
 }

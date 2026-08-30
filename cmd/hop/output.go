@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 
+	"time"
+
+	"github.com/shafed/hop/internal/agent"
 	"github.com/shafed/hop/internal/netstack"
 	"github.com/shafed/hop/internal/policy"
 	"github.com/shafed/hop/internal/store"
@@ -99,24 +102,33 @@ func nodesView(st *store.Store) nodesOut {
 	return v
 }
 
-// statusOut — вывод `hop status` (§1/С4).
+// statusOut — вывод `hop status` (§1/С5).
 //
-// Здесь только половина сервиса — фаза туннеля. Второй половины, которую §2
-// требует показывать рядом (traffic_phase, активный узел), нет по двум
-// причинам сразу, и обе стоит назвать.
+// Две половины, и ровно одна из них непуста: та, чей адресат ответил.
 //
-// Первая: её знает связка, а сокета «клиенты ↔ агент» (§3.3) ещё не написано.
-// Пустого поля вместо неё нет намеренно — поле, которое всегда пусто, читается
-// как «трафика нет», а это неправда.
+// Спрашивается связка (§3.3). Она знает обе фазы §2, активный узел, живость и
+// кольцо событий — всё, чего у `hop status` не было, пока сокета не
+// существовало. Стор она при этом уже открыла, и это второй довод, а не
+// первый: стор держит эксклюзивный flock всё время жизни агента, поэтому
+// команда, которая на пути к ответу открывает стор сама, отказывает ровно
+// тогда, когда `status` нужнее всего — при поднятом туннеле.
 //
-// Вторая — замер, а не рассуждение: стор держит эксклюзивный flock всё время
-// жизни (internal/store/lock.go), и связка держит его, пока агент работает.
-// Команда, которая на пути к ответу открывает стор, отказывает ровно тогда,
-// когда `hop status` нужнее всего — при поднятом туннеле. Поэтому склеивать
-// сюда store.StatusView нельзя: правильный владелец этой половины — агент, он
-// стор уже открыл.
+// Сервис (§3.1) остаётся запасным адресатом для одного состояния, и оно
+// названо: `orphaned` (§6.2). Там связки нет по определению — ребро в
+// orphaned и есть смерть её соединения, — а туннель жив, и остаток до снятия
+// знает только сервис. Двух половин сразу поэтому не бывает: пока связка
+// отвечает, клиент к привилегированному сервису не ходит вовсе (§3.3).
+//
+// null у половины означает «этот не отвечал», а не «нечего показать». Пустое
+// поле вместо отсутствующего знания читалось бы как «трафика нет», а это
+// другое утверждение.
 type statusOut struct {
-	Tunnel tunnelOut `json:"tunnel"`
+	// Tunnel — то, что сказал сервис. Непусто, только когда молчит связка.
+	Tunnel *tunnelOut `json:"tunnel"`
+	// Agent — то, что сказала связка. Схема — `agent.ClientStatus`: второй
+	// экземпляр той же структуры здесь разошёлся бы с первым молча, ровно как
+	// перечень полей узла, который `hop nodes` берёт готовым из store.NodeView.
+	Agent *agent.ClientStatus `json:"agent"`
 }
 
 type tunnelOut struct {
@@ -129,6 +141,50 @@ type tunnelOut struct {
 }
 
 func (v statusOut) Text(out io.Writer) {
+	if v.Agent == nil {
+		v.textFromService(out)
+		return
+	}
+	a := v.Agent
+	fmt.Fprintf(out, "туннель: %s\n", a.Tunnel)
+	fmt.Fprintf(out, "трафик:  %s\n", trafficLine(a.Traffic))
+	if a.Active == "" {
+		fmt.Fprintln(out, "активного узла нет")
+	} else {
+		fmt.Fprintf(out, "активный узел: %s (%s", a.Active, a.ActiveState)
+		if a.ActiveRTTMs > 0 {
+			fmt.Fprintf(out, ", %d мс", a.ActiveRTTMs)
+		}
+		fmt.Fprintln(out, ")")
+	}
+	fmt.Fprintf(out, "живых узлов: %d из %d\n", a.Alive, a.Nodes)
+
+	// Фиксация — отдельной строкой, потому что §1/С3 буквальна:
+	// зафиксированный узел не заменяется, даже когда умирает.
+	if a.Pinned != "" {
+		fmt.Fprintf(out, "узел зафиксирован: %s — он не будет заменён, даже если умрёт (§1/С3)\n", a.Pinned)
+	} else if !a.Auto {
+		fmt.Fprintln(out, "автопереключение выключено")
+	}
+	if a.Last != nil {
+		fmt.Fprintf(out, "последнее переключение: %s → %s, причина %s, порвано соединений %d, %s\n",
+			orNone(a.Last.From), a.Last.To, a.Last.Reason, a.Last.Interrupted,
+			a.Last.At.Format(time.RFC3339))
+	}
+	if a.Detached != "" {
+		fmt.Fprintf(out, "связи с сервисом нет: %s\n", a.Detached)
+	}
+}
+
+// textFromService — картина, которую видно без связки.
+//
+// Она заведомо неполная, и команда говорит об этом словами: поле, которого
+// нет, честнее пустого поля, которое читается как «трафика нет».
+func (v statusOut) textFromService(out io.Writer) {
+	if v.Tunnel == nil {
+		fmt.Fprintln(out, "ни связка, ни сервис не ответили")
+		return
+	}
 	fmt.Fprintf(out, "туннель: %s", v.Tunnel.Phase)
 	if v.Tunnel.Device != "" {
 		fmt.Fprintf(out, ", устройство %s", v.Tunnel.Device)
@@ -138,17 +194,65 @@ func (v statusOut) Text(out io.Writer) {
 			v.Tunnel.DetachReason, v.Tunnel.OrphanLeft)
 	}
 	fmt.Fprintln(out)
-	fmt.Fprintln(out, "фаза трафика и активный узел: неизвестны — их знает связка,")
-	fmt.Fprintln(out, "а сокет клиентов (§3.3) ещё не написан")
+	fmt.Fprintln(out, "отвечал сервис, а не связка: фаза трафика, активный узел и")
+	fmt.Fprintln(out, "автоматика ему неизвестны (§3.1) — их знает `hop agent`, а он не отвечает")
 }
 
-func statusView(st tunnel.State) statusOut {
-	return statusOut{Tunnel: tunnelOut{
+// trafficLine — фаза трафика словами. Значения §2 машинам понятны, человеку —
+// не сами по себе: `failing` и `waiting` различаются знанием, а не буквами.
+func trafficLine(p string) string {
+	switch p {
+	case string(agent.PhaseProxied):
+		return "proxied — идёт через активный узел"
+	case string(agent.PhaseWaiting):
+		return "waiting — узлы ещё не проверены, трафик ждёт (стартовый бюджет §5.6)"
+	case string(agent.PhaseFailing):
+		return "failing — живых узлов нет, трафик заблокирован (fail-close §5.6)"
+	case string(agent.PhaseBypass):
+		return "bypass — выпущен мимо туннеля осознанно (§1/С6)"
+	case "":
+		return "неизвестна"
+	default:
+		return p
+	}
+}
+
+func tunnelView(st tunnel.State) tunnelOut {
+	return tunnelOut{
 		Phase:        string(st.Phase),
 		Device:       st.Device,
 		DetachReason: string(st.DetachReason),
 		OrphanLeft:   st.OrphanLeft.String(),
-	}}
+	}
+}
+
+// eventsOut — вывод `hop events` (§1/С5).
+//
+// Журнал одним значением; поток `--follow` печатается по событию (eventOut),
+// потому что конца у него нет и срезом он невыразим. Схема при этом одна: то
+// же значение, та же единственная точка формирования.
+type eventsOut struct {
+	Events []agent.ClientEvent `json:"events"`
+}
+
+func (v eventsOut) Text(out io.Writer) {
+	if len(v.Events) == 0 {
+		fmt.Fprintln(out, "переключений не было")
+		return
+	}
+	for _, ev := range v.Events {
+		eventOut{ev}.Text(out)
+	}
+}
+
+// eventOut — одно событие потока.
+type eventOut struct {
+	agent.ClientEvent
+}
+
+func (v eventOut) Text(out io.Writer) {
+	fmt.Fprintf(out, "%s  %s → %s  причина %s, порвано соединений %d\n",
+		v.At.Format(time.RFC3339), orNone(v.From), v.To, v.Reason, v.Interrupted)
 }
 
 // probeOut — вывод `hop probe` (§5.4, §6.7).
