@@ -189,9 +189,15 @@ func storeWithDeadNode(t *testing.T) {
 // единицей, и 2 с 3 перестают отличаться от 1.
 func TestW56ExitCodesTellRefusalFromFailClose(t *testing.T) {
 	// 0 — выполнено. Читающая команда на пустом сторе законна.
+	//
+	// Сокет связки назван явно по той же причине, что ниже у `status`: с
+	// прохода «nodes через сокет» команда сперва спрашивает связку, и
+	// умолчание пути привело бы её к настоящему агенту разработчика, если тот
+	// запущен, — то есть к чужому стору вместо тестового.
 	withTestStore(t)
 	c, _, errs := testCLI(t)
-	if code := c.dispatch([]string{"nodes"}); code != 0 {
+	noAgent := filepath.Join(t.TempDir(), "связки-нет.sock")
+	if code := c.dispatch([]string{"nodes", "-client-socket", noAgent}); code != 0 {
 		t.Fatalf("`hop nodes` на пустом сторе дал %d, ожидался 0: %s", code, errs.String())
 	}
 
@@ -275,7 +281,7 @@ func goldenViews() []struct {
 	}{
 		{
 			name: "nodes",
-			v: nodesOut{Groups: []groupOut{{
+			v: nodesOut{Groups: []store.GroupNodesView{{
 				Group: store.GroupView{
 					ID: "g1", Name: "подписка", Nodes: 1,
 					LastUpdatedAt: "2024-01-01T00:00:00Z", AutoUpdate: true,

@@ -57,12 +57,66 @@ type StatusView struct {
 	Nodes  int         `json:"nodes"`
 }
 
+// GroupNodesView — группа вместе со своим составом: ровно то, что показывает
+// `hop nodes` (§1/С2).
+//
+// Тип живёт здесь, а не в том, кто печатает, потому что печатающих стало двое:
+// `cmd/hop` читает стор напрямую, пока связки нет, а связка отдаёт то же самое
+// через сокет §3.3 при живом агенте. Два экземпляра этой структуры разошлись
+// бы молча — тот же довод, по которому перечень полей узла живёт в NodeView, а
+// не в команде.
+type GroupNodesView struct {
+	// Group и Nodes рядом, а не встраиванием: у GroupView есть своё поле
+	// nodes — счётчик, — и встраивание молча заслонило бы его списком.
+	Group GroupView  `json:"group"`
+	Nodes []NodeView `json:"nodes"`
+}
+
+// LiveHealth — источник живости свежее диска.
+//
+// Стор хранит СРЕЗ живости (§2): на диск он попадает не чаще раза в
+// healthDebounce, и §2 называет его «тем, чему можно верить после паузы», а не
+// «прямо сейчас». Пока агент жив, «прямо сейчас» знает health.Manager, и
+// показывать вместо него срез получасовой свежести значит показывать
+// устаревшее там, где актуальное есть.
+//
+// nil означает «свежее нечему быть»: стор отвечает сам, как и до сокета §3.3.
+type LiveHealth func(nodeID string) (health.NodeHealth, bool)
+
+// FullView — все группы со своим составом (§1/С2), с живостью из live, если
+// она есть.
+//
+// Одна функция на обоих вызывающих. Второй экземпляр сборки — в `cmd/hop`
+// рядом с печатью — разъехался бы с этим по одному полю за раз, и заметить
+// это можно было бы только сравнив два куска кода глазами.
+func (s *Store) FullView(live LiveHealth) []GroupNodesView {
+	groups := s.Groups()
+	out := make([]GroupNodesView, 0, len(groups))
+	for _, g := range groups {
+		nodes := s.Nodes(g.ID)
+		out = append(out, GroupNodesView{
+			Group: groupView(g, len(nodes)),
+			Nodes: s.nodeViews(nodes, live),
+		})
+	}
+	return out
+}
+
 // NodesView — вывод `hop nodes --json` для группы. Порядок — node_order (Р8).
 func (s *Store) NodesView(groupID string) []NodeView {
-	nodes := s.Nodes(groupID)
+	return s.nodeViews(s.Nodes(groupID), nil)
+}
+
+func (s *Store) nodeViews(nodes []Node, live LiveHealth) []NodeView {
 	out := make([]NodeView, 0, len(nodes))
 	for _, n := range nodes {
-		h, _ := s.Health(n.ID)
+		h, ok := health.NodeHealth{}, false
+		if live != nil {
+			h, ok = live(n.ID)
+		}
+		if !ok {
+			h, _ = s.Health(n.ID)
+		}
 		out = append(out, nodeView(n, h))
 	}
 	return out
@@ -76,13 +130,7 @@ func (s *Store) StatusView(activeID string) StatusView {
 	for _, g := range groups {
 		nodes := s.Nodes(g.ID)
 		v.Nodes += len(nodes)
-		v.Groups = append(v.Groups, GroupView{
-			ID:            g.ID,
-			Name:          g.Name,
-			Nodes:         len(nodes),
-			LastUpdatedAt: formatTime(g.LastUpdatedAt),
-			AutoUpdate:    g.AutoUpdate,
-		})
+		v.Groups = append(v.Groups, groupView(g, len(nodes)))
 	}
 	if n, ok := s.Node(activeID); ok {
 		h, _ := s.Health(activeID)
@@ -90,6 +138,19 @@ func (s *Store) StatusView(activeID string) StatusView {
 		v.Active = &active
 	}
 	return v
+}
+
+// groupView и nodeView — единственные места, где решается, какие поля узла и
+// группы показывать МОЖНО (Р12, §6.14). Их сторожит S33, и обходить их сборкой
+// GroupView руками нельзя ни одному вызывающему.
+func groupView(g Group, nodes int) GroupView {
+	return GroupView{
+		ID:            g.ID,
+		Name:          g.Name,
+		Nodes:         nodes,
+		LastUpdatedAt: formatTime(g.LastUpdatedAt),
+		AutoUpdate:    g.AutoUpdate,
+	}
 }
 
 func nodeView(n Node, h health.NodeHealth) NodeView {

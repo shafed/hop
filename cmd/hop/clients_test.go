@@ -3,15 +3,21 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/shafed/hop/internal/agent"
 	"github.com/shafed/hop/internal/health"
 	"github.com/shafed/hop/internal/ipc"
+	"github.com/shafed/hop/internal/store"
 	"github.com/shafed/hop/internal/tunnel"
+	"golang.org/x/sys/unix"
 )
 
 // Глаголы §5.9 поверх сокета §3.3 — W63, W64.
@@ -27,8 +33,9 @@ import (
 // проверяется в горутине теста, и happens-before между ними идёт через
 // unix-сокет — то есть через ядро, которого детектор гонок не видит.
 type stubAgent struct {
-	snap agent.Snapshot
-	hist []health.SwitchEvent
+	snap  agent.Snapshot
+	hist  []health.SwitchEvent
+	nodes []store.GroupNodesView
 
 	mu sync.Mutex
 	// calls — что глаголы дозвались. Строками, потому что проверяется факт
@@ -52,7 +59,8 @@ func (s *stubAgent) lastCall() string {
 	return s.calls[len(s.calls)-1]
 }
 
-func (s *stubAgent) Snapshot() agent.Snapshot { return s.snap }
+func (s *stubAgent) Snapshot() agent.Snapshot      { return s.snap }
+func (s *stubAgent) Nodes() []store.GroupNodesView { return s.nodes }
 func (s *stubAgent) History() []health.SwitchEvent {
 	return s.hist
 }
@@ -331,4 +339,187 @@ func TestW64ExtraArgumentIsRefused(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	_ = buf
+}
+
+// bigStore — подписка §6.5 рабочего размера: 200 узлов с именами той длины,
+// какой их называют настоящие провайдеры.
+//
+// Форма узла не выдумана под тест: ровно такую даёт `hop sub add` на строке
+// вида `vless://…@nl-Amsterdam-07.nodes.example-provider.net:443?type=ws&
+// security=tls#🇳🇱 nl-Amsterdam-07 | 1.5x`.
+func bigStore(n int) []store.GroupNodesView {
+	flags := []string{"🇳🇱", "🇩🇪", "🇸🇬", "🇯🇵", "🇺🇸"}
+	cc := []string{"nl", "de", "sg", "jp", "us"}
+	city := []string{"Amsterdam", "Frankfurt", "Singapore", "Tokyo", "New-York"}
+
+	nodes := make([]store.NodeView, 0, n)
+	for i := 0; i < n; i++ {
+		k := i % 5
+		host := fmt.Sprintf("%s-%s-%02d.nodes.example-provider.net", cc[k], city[k], i/5)
+		nodes = append(nodes, store.NodeView{
+			ID:          fmt.Sprintf("%032x", i),
+			GroupID:     "sub-0123456789ab",
+			Name:        fmt.Sprintf("%s %s-%s-%02d | 1.5x — премиум", flags[k], cc[k], city[k], i/5),
+			Server:      host,
+			Port:        443,
+			Protocol:    "vless",
+			Transport:   "ws",
+			Security:    "tls",
+			Supported:   true,
+			State:       "alive",
+			RTTMs:       int64(40 + i%200),
+			LastProbeAt: "2026-08-30T12:00:00Z",
+		})
+	}
+	return []store.GroupNodesView{{
+		Group: store.GroupView{
+			ID: "sub-0123456789ab", Name: "провайдер", Nodes: n,
+			LastUpdatedAt: "2026-08-30T11:00:00Z", AutoUpdate: true,
+		},
+		Nodes: nodes,
+	}}
+}
+
+// TestW65NodesStreamThroughTheSocketPastTheFrameLimit — `hop nodes` берёт
+// список у связки, и подписка §6.5 доезжает целиком, хотя в кадр §3.1 она не
+// влезает.
+//
+// Оба утверждения новые и оба нужны. До этого прохода `hop nodes` открывал
+// стор сам и показывал СРЕЗ живости (§2), доходящий до диска раз в тридцать
+// секунд, — то есть при живом агенте отвечал устаревшим там, где актуальное
+// есть у того, кого он не спросил.
+//
+// Второе утверждение — замер, а не оценка: кадр транспорта §3.1 ограничен
+// 65536 байтами (maxFrame, internal/ipc/proto.go), а §6.5 считает цену
+// подписки в 200 узлов. Тест сам проверяет, что одним кадром такой ответ не
+// уходит: без этой проверки он остался бы зелёным на списке из трёх узлов и
+// перестал бы что-либо утверждать, если NodeView однажды похудеет.
+//
+// Краснеет, если ответ перестанет быть потоком: сервер, собравший его в один
+// кадр, упрётся в предел, и клиент получит рваное соединение вместо списка.
+func TestW65NodesStreamThroughTheSocketPastTheFrameLimit(t *testing.T) {
+	const want = 200
+	view := bigStore(want)
+
+	// Предпосылка теста — замер, а не вера: одним кадром это не уходит.
+	whole, err := json.Marshal(nodesOut{Groups: view})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(whole) <= 1<<16 {
+		t.Fatalf("список из %d узлов весит %d байт и влезает в кадр §3.1 (%d): "+
+			"тест перестал проверять то, ради чего написан", want, len(whole), 1<<16)
+	}
+	t.Logf("список из %d узлов: %d байт, предел кадра §3.1 — %d", want, len(whole), 1<<16)
+
+	path := serveStub(t, &stubAgent{nodes: view})
+
+	c, out, errs := testCLI(t)
+	if code := c.dispatch([]string{"nodes", "-client-socket", path, "-json"}); code != 0 {
+		t.Fatalf("`hop nodes --json` дал %d: %s", code, errs.String())
+	}
+
+	var got nodesOut
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("вывод не разобрался: %v\n%s", err, out.String())
+	}
+	if len(got.Groups) != 1 {
+		t.Fatalf("групп %d, ожидалась 1", len(got.Groups))
+	}
+	if n := len(got.Groups[0].Nodes); n != want {
+		t.Fatalf("узлов доехало %d из %d", n, want)
+	}
+	// Не только количество: порванный и заново склеенный поток обязан отдать
+	// те же узлы в том же порядке (Р8 — порядок принадлежит провайдеру).
+	for i, n := range got.Groups[0].Nodes {
+		if n != view[0].Nodes[i] {
+			t.Fatalf("узел %d приехал другим:\nбыло:  %+v\nстало: %+v", i, view[0].Nodes[i], n)
+		}
+	}
+	if got.Groups[0].Group != view[0].Group {
+		t.Errorf("группа приехала другой: %+v", got.Groups[0].Group)
+	}
+}
+
+// TestW65NodesFallBackToTheStoreWithoutAnAgent — без связки `hop nodes` читает
+// стор, а не отказывает кодом 2.
+//
+// Это буквальное исключение §3.3: подписки и узлы правит процесс команды
+// напрямую, потому что `hop sub add` существует раньше `hop up`. Команда,
+// показывающая добавленное, обязана работать там же, где работает добавляющая.
+func TestW65NodesFallBackToTheStoreWithoutAnAgent(t *testing.T) {
+	withTestStore(t)
+	if err := withStore(func(st *store.Store) error {
+		return addNode(st, "vless://"+uuidA+"@a.example:443?type=ws&security=tls#узел", io.Discard)
+	}); err != nil {
+		t.Fatalf("узел не добавился: %v", err)
+	}
+
+	c, out, errs := testCLI(t)
+	sock := filepath.Join(t.TempDir(), "связки-нет.sock")
+	if code := c.dispatch([]string{"nodes", "-client-socket", sock, "-json"}); code != 0 {
+		t.Fatalf("`hop nodes` без связки дал %d, ожидался 0: %s", code, errs.String())
+	}
+	if !strings.Contains(out.String(), `"server": "a.example"`) {
+		t.Errorf("узел из стора не показан:\n%s", out.String())
+	}
+}
+
+// TestW65ReadingCommandDoesNotLieAboutItsOwnSuccess — читающая команда при
+// занятом сторе отвечает и отдаёт ноль, а не печатает ответ и падает следом.
+//
+// Замер на живом бинаре, из-за которого этот тест написан: пока чужой процесс
+// держал `.lock`, `hop nodes` печатал все 201 строку ответа, ждал пять секунд
+// и возвращал код 1. Чтение стора идёт БЕЗ замка (store.load), а Close брал
+// его безусловно — то есть отказ приходил уже после того, как команда сделала
+// своё дело. Для мониторинга вокруг кодов возврата (§5.9) это худший вид
+// ошибки: код говорит «утилита упала», а вывод при этом полон и верен.
+//
+// Замок здесь берётся тем же flock, каким его берёт стор (internal/store,
+// lock_unix.go): дефект межпроцессный, и второй *store.Store в этом же
+// процессе его не воспроизводит.
+func TestW65ReadingCommandDoesNotLieAboutItsOwnSuccess(t *testing.T) {
+	root := withTestStore(t)
+	if err := withStore(func(st *store.Store) error {
+		return addNode(st, "vless://"+uuidA+"@a.example:443?type=ws&security=tls#узел", io.Discard)
+	}); err != nil {
+		t.Fatalf("узел не добавился: %v", err)
+	}
+
+	// Имя файла замка — не догадка, а то, что стор создал: если оно поменяется,
+	// тест обязан покраснеть здесь, а не тихо перестать держать замок.
+	lock := filepath.Join(root, ".lock")
+	if _, err := os.Stat(lock); err != nil {
+		t.Fatalf("файла замка нет по ожидаемому пути %s: %v", lock, err)
+	}
+	f, err := os.OpenFile(lock, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatalf("замок не взялся: %v", err)
+	}
+	defer unix.Flock(int(f.Fd()), unix.LOCK_UN)
+
+	c, out, errs := testCLI(t)
+	sock := filepath.Join(t.TempDir(), "связки-нет.sock")
+
+	done := make(chan int, 1)
+	go func() { done <- c.dispatch([]string{"nodes", "-client-socket", sock}) }()
+
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("`hop nodes` при занятом сторе дал %d, ожидался 0: %s", code, errs.String())
+		}
+	case <-time.After(2 * time.Second): //hop:realtime
+		// Потолок ниже lockTimeout (5 с) намеренно: ждать замок ради одного
+		// чтения команда не имеет права вовсе, и «дождалась и вернула 0» —
+		// тоже дефект.
+		t.Fatalf("`hop nodes` ждёт замок, которого ему не нужно; напечатано:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "a.example") {
+		t.Errorf("узел не показан:\n%s", out.String())
+	}
 }
