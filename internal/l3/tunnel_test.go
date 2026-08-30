@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -148,18 +149,36 @@ func TestT23SlowTearsDown(t *testing.T) {
 //
 // Плюс подпроверка плана: в зазоре трафик отказывался, а не висел — тот же
 // механизм, что в T23-fast, другой исход.
+//
+// Последнее утверждение опирается на живой узел стенда (stand_test.go), и это
+// не украшение. Прежняя редакция сравнивала «отвергается или нет» на пустом
+// сторе и была зелена по чужой причине: стор брался из $HOME разработчика,
+// узлы в нём были, и §5.6 держал трафик открытым первые 30 секунд стартового
+// бюджета Р5. На пустом сторе — то есть в CI — та же проверка обязана была
+// краснеть: fail-close отвергает так же, как респондер сервиса, и по одной
+// ошибке ECONNREFUSED их не различить. Различает их только успех: трафик
+// после реаттача обязан дойти до «интернет-сервера» за узлом.
 func TestT24ReattachWithinDeadline(t *testing.T) {
+	requireNetns(t)
+
+	peer := startPeer(t)
+	defer peer.stop()
+	setupSiteNet(t)
+	addNode(t, storeRoot(t), siteAddr, vlessPort)
+
 	s := startService(t, 30*time.Second)
 	tok := filepath.Join(t.TempDir(), "token")
 	s.startAgent(tok)
 
+	site := net.JoinHostPort(siteAddr, strconv.Itoa(sitePort))
 	idxBefore := linkIndex(t, ifname)
 	killAgentAndWaitOrphaned(t, s)
 
 	// Зазор: отказ, а не ожидание.
-	if err, took := connect("203.0.113.7:80", time.Second); !isUnreachable(err) || took > 500*time.Millisecond {
+	if err, took := connect(site, time.Second); !isUnreachable(err) || took > 500*time.Millisecond {
 		t.Fatalf("в зазоре трафик висел вместо отказа: %v за %v", err, took)
 	}
+	seen := len(peer.counts(t).SiteConns)
 
 	s.startAgent(tok) // тот же токен: реаттач, а не новый туннель
 
@@ -174,9 +193,21 @@ func TestT24ReattachWithinDeadline(t *testing.T) {
 	}
 	// Отказ снят: устройство снова читает агент, а не респондер сервиса.
 	// Иначе оба процесса делили бы один дескриптор и растащили бы пакеты.
-	if err, _ := connect("203.0.113.7:80", 500*time.Millisecond); isUnreachable(err) {
-		t.Fatalf("после реаттача трафик всё ещё отвергается сервисом: %v", err)
-	}
+	// Успех соединения и приход на тот конец — одно условие, а не два подряд:
+	// стек терминирует TCP у себя и отвечает SYN-ACK раньше, чем релей дойдёт
+	// до узла, поэтому connect возвращается до того, как пир что-то увидел
+	// (замерено: первая же проверка счётчика после успешного connect давала
+	// ноль). Ждать надо обоих.
+	waitUntil(t, 10*time.Second, "трафика через туннель после реаттача", func() bool {
+		c, err := net.DialTimeout("tcp", site, time.Second)
+		if err != nil {
+			return false
+		}
+		defer c.Close()
+		_, _ = c.Write([]byte("после реаттача\n"))
+		time.Sleep(200 * time.Millisecond) //hop:realtime
+		return len(peer.counts(t).SiteConns) > seen
+	})
 }
 
 // Мусорный токен не продлевает окно и не забирает туннель: иначе локальный

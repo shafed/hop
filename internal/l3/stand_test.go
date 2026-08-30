@@ -8,13 +8,33 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+
+	xlog "github.com/xtls/xray-core/common/log"
+	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/infra/conf/serial"
+
+	// Регистрация обработчиков Xray для узла стенда. Список уже, чем у
+	// продукта (internal/engine): узлу нужны только VLESS-инбаунд и
+	// freedom-выход. app/dns — ради раздела "dns" конфига: без него Xray
+	// принимает конфигурацию и молча не заводит статическую таблицу имён.
+	_ "github.com/xtls/xray-core/app/dispatcher"
+	_ "github.com/xtls/xray-core/app/dns"
+	_ "github.com/xtls/xray-core/app/log"
+	_ "github.com/xtls/xray-core/app/policy"
+	_ "github.com/xtls/xray-core/app/proxyman/inbound"
+	_ "github.com/xtls/xray-core/app/proxyman/outbound"
+	_ "github.com/xtls/xray-core/proxy/freedom"
+	_ "github.com/xtls/xray-core/proxy/vless/inbound"
+	_ "github.com/xtls/xray-core/transport/internet/tagged/taggedimpl"
 
 	"github.com/shafed/hop/internal/dnsmsg"
 	"github.com/shafed/hop/internal/dnstest"
@@ -106,6 +126,7 @@ func startSiteSide() {
 	listenTCP(net.JoinHostPort(siteAddr, strconv.Itoa(sitePort)), &stand.SiteConns)
 	listenDNS(net.JoinHostPort(siteAddr, strconv.Itoa(dnsPort)), siteAnswer, &stand.SiteDNS)
 	listenDNS(net.JoinHostPort(decoyAddr, strconv.Itoa(dnsPort)), decoyAnswer, &stand.DecoyDNS)
+	startNode()
 }
 
 // listenTCP принимает соединения и записывает адрес источника.
@@ -301,4 +322,113 @@ func tunPackets(t *testing.T, dev string) int {
 	}
 	t.Fatalf("/proc/net/dev: интерфейса %s нет", dev)
 	return 0
+}
+
+// --- живой узел стенда (T26) ---
+
+// Настоящий VLESS-инбаунд на стороне пира, отдельным портом от «узла» T25:
+// там нужен адрес источника из accept, здесь — работающее рукопожатие, и одно
+// с другим не совмещается.
+const (
+	vlessPort = 9444
+	// probePort — «интернет» для проб §5.4. Три хостнейма probeURLs
+	// (cmd/hop/prober.go) в netns не резолвятся и никуда не ведут; узел
+	// разрешает их сам, статической таблицей своего Xray, в адрес пира.
+	// Иначе узел никогда не оживёт, а без живого узла DNS §5.7 отказывает
+	// по fail-close и до апстрима не доходит — то есть вторую половину T26
+	// («запрос виден на резолвере за узлом») проверять было бы не на чем.
+	probePort = 80
+)
+
+// probeHosts — хостнеймы из cmd/hop/prober.go. Копия, и это осознанно: пакет
+// l3 проверяет собранные бинари как чёрный ящик и в cmd/hop не заглядывает.
+// Расхождение видно сразу — узел не оживает, и T26 краснеет.
+var probeHosts = []string{
+	"cp.cloudflare.com",
+	"www.gstatic.com",
+	"connectivitycheck.gstatic.com",
+}
+
+// startNode поднимает узел: VLESS-инбаунд с freedom-выходом и статической
+// таблицей имён.
+//
+// domainStrategy UseIP обязателен: с AsIs freedom отдал бы имя системному
+// резолверу netns пира, которого там нет, и «hosts» не спросили бы вовсе.
+func startNode() {
+	// Лог Xray — в stderr: stdout несёт управляющий протокол пира, и
+	// предупреждение о конфигурации, напечатанное туда, сломало бы разбор
+	// «ready» (та же ловушка, что поймал проход CLI на `hop probe --json`).
+	xlog.RegisterHandler(stderrXrayLog{})
+
+	hosts := map[string]any{}
+	for _, h := range probeHosts {
+		hosts[h] = siteAddr
+	}
+	cfg := map[string]any{
+		"log": map[string]any{"loglevel": "none"},
+		"dns": map[string]any{"hosts": hosts},
+		"inbounds": []map[string]any{{
+			"tag":      "in",
+			"listen":   siteAddr,
+			"port":     vlessPort,
+			"protocol": "vless",
+			"settings": map[string]any{
+				"clients":    []map[string]any{{"id": standUUID}},
+				"decryption": "none",
+			},
+			"streamSettings": map[string]any{"network": "raw", "security": "none"},
+		}},
+		"outbounds": []map[string]any{{
+			"protocol": "freedom",
+			"tag":      "direct",
+			"settings": map[string]any{"domainStrategy": "UseIP"},
+		}},
+	}
+
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "пир: конфиг узла:", err)
+		os.Exit(1)
+	}
+	c, err := serial.LoadJSONConfig(strings.NewReader(string(b)))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "пир: Xray не принял конфиг узла:", err)
+		os.Exit(1)
+	}
+	inst, err := core.New(c)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "пир: инстанс узла не собрался:", err)
+		os.Exit(1)
+	}
+	if err := inst.Start(); err != nil {
+		fmt.Fprintln(os.Stderr, "пир: инстанс узла не запустился:", err)
+		os.Exit(1)
+	}
+
+	// «Интернет» за узлом: 204 на всё, как generate_204 (§5.4).
+	ln, err := net.Listen("tcp4", net.JoinHostPort(siteAddr, strconv.Itoa(probePort)))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "пир: listen 204:", err)
+		os.Exit(1)
+	}
+	go http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+}
+
+// stderrXrayLog уводит глобальный лог Xray со stdout.
+type stderrXrayLog struct{}
+
+func (stderrXrayLog) Handle(m xlog.Message) { fmt.Fprintln(os.Stderr, "узел:", m.String()) }
+
+// writeUpstreams кладёт в стор settings.json с единственным апстримом §5.7.
+//
+// Файлом, а не командой: `hop routing` только читает, а апстрим — это то, что
+// человек правит руками (комментарий к settingsFile в internal/store).
+func writeUpstreams(t *testing.T, root, addrPort string) {
+	t.Helper()
+	body := fmt.Sprintf(`{"version":1,"dns_upstreams":[%q]}`, addrPort)
+	if err := os.WriteFile(filepath.Join(root, "settings.json"), []byte(body), 0o644); err != nil {
+		t.Fatalf("settings.json: %v", err)
+	}
 }
