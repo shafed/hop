@@ -64,6 +64,14 @@
   },
   "queue": [
     {
+      "task": "`hop up` внутри окна orphaned отказывает состоянием, а не смыслом",
+      "provenance": "Reported by a parallel session running the binaries live under unshare -Urn; NOT reproduced by the controller. The mechanism was confirmed by reading, the reproduction was not run — keep those apart (see measurement_vs_inference).",
+      "what": "Kill the agent while the tunnel is up, without `hop down` (Detach, not Stop — the interface is meant to survive, T24). The next `hop up` fails with `tunnel: операция недопустима в текущем состоянии: orphaned, ожидалось down`.",
+      "mechanism_read_not_measured": "cmd/hop/transport.go `acquire` tries Attach by token first and falls back to `Start` (§6.2, T24). internal/tunnel/tunnel.go:215 lets Attach in only from Orphaned; Start refuses unless the phase is down. So the failure needs BOTH halves: the reattach lost its token (a fresh token file, e.g. what the L3 stand hands each agent) AND the tunnel is still inside its orphan deadline. Once orphan_deadline expires the tunnel is torn down and Start works again.",
+      "why_it_is_a_defect_anyway": "The user is shown a state-machine sentence about a phase they have no verb to observe or clear. §5.6 requires a refusal to say what it is: within the orphan window with the token gone, the honest answer names the deadline and offers the way out, and the way out has to exist. Decide whether `hop up` should wait out the deadline, whether a verb should drop an orphan deliberately, or whether the token should be recoverable — that decision is the task.",
+      "size": "small in code, and the whole of it is the decision"
+    },
+    {
       "task": "macOS dataplane",
       "detail": "utun via AF_SYSTEM, SIOCAIFADDR, PF_ROUTE",
       "note": "Two Linux-shaped mechanisms must be re-answered there, not ported: bypass_rebind compares interface NAMES, so outbound.Selector on macOS/Windows must publish the same thing (internal/outbound/selector_other.go is the stub), and ipv6_block is an `ip -6 rule` — the other platforms need their own way to refuse IPv6 while the tunnel is up, and refusing is not optional (§5.6)."
