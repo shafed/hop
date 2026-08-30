@@ -228,7 +228,7 @@ func TestAttachWithWrongTokenIsRejected(t *testing.T) {
 	if ph := s.phase(); ph != "orphaned" {
 		t.Fatalf("до попытки phase = %q", ph)
 	}
-	tryAttach(t, s.sock, bad)
+	tryAttach(t, s.sock, s.client, bad)
 	if ph := s.phase(); ph != "orphaned" {
 		t.Fatalf("после мусорного Attach phase = %q, ожидалось orphaned", ph)
 	}
@@ -404,9 +404,9 @@ func killAgentAndWaitOrphaned(t *testing.T, s *service) {
 	})
 }
 
-func tryAttach(t *testing.T, sock, tokenFile string) {
+func tryAttach(t *testing.T, sock, clientSock, tokenFile string) {
 	t.Helper()
-	cmd := commandAgent(t, sock, tokenFile)
+	cmd := commandAgent(t, sock, clientSock, tokenFile)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}

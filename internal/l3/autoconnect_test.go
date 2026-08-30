@@ -50,7 +50,7 @@ func TestW68AutoconnectOffSkipsInitialUp(t *testing.T) {
 	})
 
 	offToken := filepath.Join(t.TempDir(), "token-off")
-	cmd := commandAgent(t, s.sock, offToken)
+	cmd := commandAgent(t, s.sock, s.client, offToken)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("запуск hop agent: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestW68AutoconnectOffSkipsInitialUp(t *testing.T) {
 	// не годится в свидетели: он пишется только внутри Up(), то есть был бы
 	// пуст и при живом агенте, и при мёртвом — не тот сигнал.
 	waitUntil(t, 10*time.Second, "агент открыл сокет клиентов", func() bool {
-		err := exec.Command(hopAgent(t), "status", "--json").Run()
+		err := exec.Command(hopAgent(t), "status", "-client-socket", s.client, "--json").Run()
 		if err == nil {
 			return true
 		}
@@ -91,7 +91,7 @@ func TestW68AutoconnectOffSkipsInitialUp(t *testing.T) {
 	}
 
 	// --- 3. агент жив и способен: поднимаем вручную ---
-	if out, err := exec.Command(hopAgent(t), "up").CombinedOutput(); err != nil {
+	if out, err := exec.Command(hopAgent(t), "up", "-client-socket", s.client).CombinedOutput(); err != nil {
 		t.Fatalf("`hop up` на живом агенте с выключенным автоподключением: %v: %s", err, out)
 	}
 	waitLink(t, ifname, true)

@@ -69,6 +69,7 @@ type service struct {
 	t      *testing.T
 	cmd    *exec.Cmd
 	sock   string
+	client string
 	before netstate.Snapshot
 	src    netstate.Source
 	agents []*agent
@@ -91,6 +92,14 @@ func startService(t *testing.T, deadline time.Duration) *service {
 	dir := t.TempDir()
 	sock := filepath.Join(dir, "hop.sock")
 	ready := filepath.Join(dir, "ready")
+	// client — сокет связки §3.3, свой на каждый тест по той же причине, что
+	// HOP_STORE: unshare -Urn изолирует сеть, а не $XDG_RUNTIME_DIR, и без
+	// этого все агенты L3 на машине садятся на один и тот же глобальный путь
+	// (ipc.DefaultClientPath). Имя короче, чем у сервисного сокета, — путь
+	// unix-сокета ограничен ~108 байтами, а t.TempDir() кладёт его под длинное
+	// имя теста; измерено на TestBypassMDNSReachesPhysicalInterfaceAndReturnsViaNAT
+	// (самое длинное имя в пакете) — с "c.sock" укладывается с запасом.
+	client := filepath.Join(dir, "c.sock")
 
 	cmd := exec.Command(hopd(t),
 		"-socket", sock,
@@ -109,7 +118,7 @@ func startService(t *testing.T, deadline time.Duration) *service {
 		t.Fatalf("запуск hopd: %v", err)
 	}
 
-	s := &service{t: t, cmd: cmd, sock: sock, before: before, src: src}
+	s := &service{t: t, cmd: cmd, sock: sock, client: client, before: before, src: src}
 	t.Cleanup(s.cleanup)
 	waitFile(t, ready)
 	return s
@@ -196,10 +205,16 @@ type agent struct {
 }
 
 // commandAgent собирает команду агента, но не запускает её.
-func commandAgent(t *testing.T, sock, tokenFile string) *exec.Cmd {
+//
+// clientSock обязателен, а не берётся умолчанием ipc.DefaultClientPath:
+// умолчание — один и тот же путь на всю машину, и на нём сходятся все
+// параллельные прогоны L3 (найдено приёмкой при слиянии — см.
+// implementation-notes.md, «Этап 9 — W68»).
+func commandAgent(t *testing.T, sock, clientSock, tokenFile string) *exec.Cmd {
 	t.Helper()
 	cmd := exec.Command(hopAgent(t), "agent",
 		"-socket", sock,
+		"-client-socket", clientSock,
 		"-ifname", ifname,
 		"-addr", addr,
 		"-table", fmt.Sprint(table),
@@ -214,7 +229,7 @@ func commandAgent(t *testing.T, sock, tokenFile string) *exec.Cmd {
 
 func (s *service) startAgent(tokenFile string) *agent {
 	s.t.Helper()
-	cmd := commandAgent(s.t, s.sock, tokenFile)
+	cmd := commandAgent(s.t, s.sock, s.client, tokenFile)
 	if err := cmd.Start(); err != nil {
 		s.t.Fatalf("запуск hop: %v", err)
 	}
@@ -257,14 +272,19 @@ func (a *agent) kill() {
 // здесь стоял снятый флаг `-status`, и стенд молча перестал спрашивать вообще.
 func (s *service) phase() string {
 	s.t.Helper()
-	return phaseAt(s.t, s.sock)
+	return phaseAt(s.t, s.sock, s.client)
 }
 
 // phaseAt — то же, но по сокету: нужен там, где сервис спрашивают до того, как
 // у теста есть *service, и там, где отказ команды сам является ответом.
-func phaseAt(t *testing.T, sock string) string {
+//
+// client — сокет связки §3.3 этого же теста, а не умолчание: без него
+// `hop status` мог бы достучаться до чужого агента на общем пути
+// (ipc.DefaultClientPath) и ответить его данными, а не отказом с откатом на
+// сервис — то есть ровно молчаливый успех, который скрывал дефект изоляции.
+func phaseAt(t *testing.T, sock, client string) string {
 	t.Helper()
-	out, err := exec.Command(hopAgent(t), "status", "-socket", sock, "--json").Output()
+	out, err := exec.Command(hopAgent(t), "status", "-socket", sock, "-client-socket", client, "--json").Output()
 	// Код 3 — не отказ команды, а ответ про живость: §5.9 отдаёт его, когда
 	// живых узлов нет (§5.6). В стенде L3 это штатное состояние — T27 на нём
 	// стоит целиком, — а фаза туннеля в машинном выводе при этом есть.
