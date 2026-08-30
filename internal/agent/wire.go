@@ -523,6 +523,30 @@ func (a *Agent) supportedNodes() []store.Node {
 	return out
 }
 
+// Nodes — состав стора с живостью связки (§1/С2, граница §3.3).
+//
+// Живость берётся у health.Manager, а не из стора, и это не украшение. Стор
+// хранит СРЕЗ (§2): на диск он попадает не чаще раза в healthDebounce, а
+// persistHealth пишет его раз в healthPersistEvery — тридцать секунд в обоих
+// случаях. Клиент, читающий стор при живом агенте, поэтому видит состояние
+// получасовой давности ровно в тот момент, когда актуальное состояние есть у
+// того, кого он не спросил.
+//
+// Снимок живости снимается ОДИН раз на весь ответ по тому же доводу, по
+// которому status() не спрашивает связку дважды: картина, собранная из двух
+// обращений, не существовала ни в один момент времени.
+func (a *Agent) Nodes() []store.GroupNodesView {
+	snap := a.hm.Snapshot()
+	live := make(map[string]health.NodeHealth, len(snap.Nodes))
+	for _, n := range snap.Nodes {
+		live[n.NodeID] = n
+	}
+	return a.st.FullView(func(id string) (health.NodeHealth, bool) {
+		h, ok := live[id]
+		return h, ok
+	})
+}
+
 // Start запускает фоновые петли: события живости, сохранение среза, надзор за
 // сервисом.
 func (a *Agent) Start() {

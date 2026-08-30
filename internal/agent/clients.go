@@ -56,6 +56,7 @@ import (
 	"github.com/shafed/hop/internal/health"
 	"github.com/shafed/hop/internal/ipc"
 	"github.com/shafed/hop/internal/policy"
+	"github.com/shafed/hop/internal/store"
 )
 
 // ClientStatus — картина, которую §1/С5 требует от `hop status`.
@@ -80,8 +81,13 @@ type ClientStatus struct {
 	// Active — id активного узла; пусто, когда его нет.
 	Active string `json:"active,omitempty"`
 	// ActiveState и ActiveRTTMs — живость активного узла. С5 требует
-	// «активный узел с латентностью», и латентность приезжает отсюда, а не
-	// из стора: стор держит эксклюзивный flock всё время жизни агента.
+	// «активный узел с латентностью», и латентность приезжает отсюда, а не из
+	// стора: стор хранит СРЕЗ живости (§2), доходящий до диска не чаще раза в
+	// тридцать секунд, — «прямо сейчас» знает только связка.
+	//
+	// Довод здесь переписан: раньше на этом месте стояло «стор держит
+	// эксклюзивный flock всё время жизни агента». Замер это опроверг —
+	// см. implementation-notes.md, «Замер: держит ли агент flock всю жизнь».
 	ActiveState string `json:"active_state,omitempty"`
 	ActiveRTTMs int64  `json:"active_rtt_ms,omitempty"`
 	// Auto — автопереключение (§1/С3).
@@ -130,6 +136,7 @@ type clientOp string
 const (
 	opStatus clientOp = "Status"
 	opEvents clientOp = "Events"
+	opNodes  clientOp = "Nodes"
 	opUp     clientOp = "Up"
 	opDown   clientOp = "Down"
 	opBypass clientOp = "Bypass"
@@ -151,6 +158,10 @@ type clientResponse struct {
 	Error  string        `json:"error,omitempty"`
 	Status *ClientStatus `json:"status,omitempty"`
 	Event  *ClientEvent  `json:"event,omitempty"`
+	// Group и Node — кадры потока `Nodes`. По кадру на группу и по кадру на
+	// узел: см. doc пакета про предел кадра §3.1.
+	Group *store.GroupView `json:"group,omitempty"`
+	Node  *store.NodeView  `json:"node,omitempty"`
 	// End закрывает поток истории: без него клиент, дочитавший события, не
 	// отличает «история кончилась» от «сервер задумался».
 	End bool `json:"end,omitempty"`
@@ -163,6 +174,9 @@ type clientResponse struct {
 // бы проверять сборку вместо разбора аргументов.
 type ClientAPI interface {
 	Snapshot() Snapshot
+	// Nodes — состав стора с живостью связки (§1/С2). Спрашивается у связки, а
+	// не читается из стора клиентом: см. doc пакета.
+	Nodes() []store.GroupNodesView
 	Events(buf int) ([]health.SwitchEvent, <-chan health.SwitchEvent)
 	Unsubscribe(c <-chan health.SwitchEvent)
 	History() []health.SwitchEvent
@@ -289,8 +303,14 @@ func (s *ClientServer) handle(c ipc.Conn) {
 			}
 			continue
 		}
-		if req.Op == opEvents {
+		switch req.Op {
+		case opEvents:
 			if !s.stream(c, req) {
+				return
+			}
+			continue
+		case opNodes:
+			if !s.streamNodes(c) {
 				return
 			}
 			continue
@@ -440,6 +460,69 @@ func (s *ClientServer) stream(c ipc.Conn, req clientRequest) bool {
 	}
 }
 
+// streamNodes — `hop nodes` (§1/С2): состав стора кадр за кадром.
+//
+// # Почему поток, а не один кадр — замер, а не оценка
+//
+// Кадр транспорта §3.1 ограничен 65536 байтами (`maxFrame` в
+// internal/ipc/proto.go): предел стоит, чтобы недоверенная длина не
+// превратилась в аллокацию на гигабайт. §6.5 при этом считает цену подписки
+// «в 200 узлов» — это рабочий размер, а не потолок.
+//
+// Замер на настоящем сторе с 200 узлами (записан в implementation-notes.md):
+// ответ целиком весит **64912 байт** — на 624 байта, то есть на один процент,
+// меньше предела. Кадр переполняется на 202 узлах той же формы, а если удлинить
+// имя каждого узла на десять символов — уже на 200. То есть одним кадром
+// обещание §6.5 держится ровно до опечатки, и держится случайно.
+//
+// # Почему поток, а не постраничная отдача
+//
+// Страница требует курсора, то есть смещения в списке, который между запросами
+// меняется: обновление подписки §5.8 переставляет состав, и вторая страница
+// приезжает из другого состава, чем первая. Картина, собранная из двух
+// обращений, не существовала ни в один момент времени — тот самый довод,
+// ради которого существуют Snapshot и status(). Поток снимает состав ОДИН раз
+// и режет на кадры уже снятое: сколько бы кадров ни ехало, они из одного
+// состава.
+//
+// Форма взята у `Events`: последовательность кадров, закрытая End. Второй
+// формы потока в этом протоколе поэтому не появилось.
+//
+// Гранулярность — кадр на узел, а не пачка узлов в кадре: у пачки есть размер,
+// который придётся пересчитывать всякий раз, когда в NodeView добавится поле,
+// и который однажды разъедется с пределом молча. У кадра на узел константы
+// нет: один узел — 325 байт по тому же замеру, двести кадров запаса до предела.
+func (s *ClientServer) streamNodes(c ipc.Conn) bool {
+	for _, g := range s.api.Nodes() {
+		group := g.Group
+		if err := s.send(c, clientResponse{Group: &group}); err != nil {
+			return s.abortStream(c, err)
+		}
+		for _, n := range g.Nodes {
+			node := n
+			if err := s.send(c, clientResponse{Node: &node}); err != nil {
+				return s.abortStream(c, err)
+			}
+		}
+	}
+	return s.send(c, clientResponse{End: true}) == nil
+}
+
+// abortStream говорит клиенту, почему поток кончился, если сказать ещё можно.
+//
+// Кадр на узел уводит предел §3.1 далеко за §6.5, но не отменяет его: узел с
+// именем в шестьдесят килобайт остаётся выразимым, потому что имя приходит из
+// чужой подписки. Замер показал, чем такой отказ выглядит снаружи без этой
+// попытки: `hop nodes` печатает `EOF` и код 1 — то есть §5.6 «отказ с названной
+// причиной» не выполняется, а причина при этом известна ровно здесь.
+//
+// Кадр отказа крошечный и уходит по тому же соединению; если и он не ушёл,
+// соединения больше нет и сказать нечего.
+func (s *ClientServer) abortStream(c ipc.Conn, cause error) bool {
+	_ = s.send(c, clientResponse{Error: "список узлов не уместился в поток: " + cause.Error()})
+	return false
+}
+
 // claimSub берёт право на живую подписку.
 //
 // При включённой политике право есть всегда: §3.3 требует рассылки всем
@@ -517,6 +600,45 @@ func (cl *Client) Bypass(on bool) error {
 func (cl *Client) Auto(on bool) error {
 	_, err := cl.call(clientRequest{Op: opAuto, On: &on})
 	return err
+}
+
+// Nodes — состав стора глазами связки (§1/С2).
+//
+// Срезом, а не колбэком, в отличие от Events: поток `Nodes` конечен, и `hop
+// nodes` всё равно печатает его одним значением через единственную точку
+// формирования вывода (§5.9). Кадры — способ пройти предел §3.1, а не форма
+// ответа команды.
+func (cl *Client) Nodes() ([]store.GroupNodesView, error) {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+
+	if err := cl.send(clientRequest{Op: opNodes}); err != nil {
+		return nil, err
+	}
+	var out []store.GroupNodesView
+	for {
+		resp, err := cl.recv()
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case resp.End:
+			return out, nil
+		case resp.Group != nil:
+			out = append(out, store.GroupNodesView{Group: *resp.Group})
+		case resp.Node != nil:
+			if len(out) == 0 {
+				// Узел раньше своей группы означает, что поток порвался или
+				// собран не тем: молчаливо приписать его несуществующей
+				// группе — худший ответ, чем отказ.
+				return nil, errors.New("связка прислала узел раньше группы")
+			}
+			last := &out[len(out)-1]
+			last.Nodes = append(last.Nodes, *resp.Node)
+		default:
+			return nil, errors.New("связка прислала пустой кадр списка узлов")
+		}
+	}
 }
 
 // Events отдаёт события в fn: сперва накопленное, затем — при follow — всё,
