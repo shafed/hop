@@ -50,6 +50,21 @@
   },
   "queue": [
     {
+      "task": "Автозапуск §6.13 — юниты и dev-install по принятому решению",
+      "decided_already": "autostart_decision above, four answers: scope (units + dev-install now, packages later), declarative registration by files, `systemctl --global enable` for the user unit, group `hop` created with $SUDO_USER added. Do not re-open them; implement them.",
+      "what_to_build": "A packaging/ directory that does not exist yet: a system unit for hopd (WantedBy=multi-user.target; hopd is foreground, handles SIGTERM and verifies the network snapshot on exit — decide Restart= and the readiness protocol on their merits, hopd has -ready-file today and no sd_notify), a user unit for the agent, and one install/uninstall script doing exactly what a future postinst will do: create group `hop`, add $SUDO_USER, put the binaries and units in place, enable --now the service, `systemctl --global enable` the agent unit.",
+      "verification": "autostart_decision.verification_available_here: `systemd-analyze verify` for the units (no root, no install), a staging DESTDIR for the script's layout, and the REAL install (sudo, enable --now, is-active, then removal and a check that the machine came back) only as a CI job on a disposable runner — unverified locally, and it must say so, the way l3-macos.yml and l3-windows.yml already do. NOTHING is to be installed on the developer's own machine.",
+      "do_not_claim": "I1–I5 (§8.5) stay unimplemented: they are about a real package installed the standard way, and there is no package. A guard over unit files is tooling, not a registry row — name it by substance, the way the L3 grammar guard is named.",
+      "size": "medium; the decision is already made, what remains is files and one honest test"
+    },
+    {
+      "task": "Агент не переживает недоступный сервис",
+      "measured": "`hop agent` with no hopd: «фоновая половина hop недоступна: сокет /run/hop.sock: dial unix /run/hop.sock: connect: no such file or directory», exit 2, immediately — no wait, no retry (measured this round, see autostart_decision.facts_that_shaped_it).",
+      "why_it_matters_now": "Harmless while the agent is started by hand; a restart loop the moment §6.13's third third is real — a user not yet in group `hop`, or a login racing hopd at boot, gets an agent that dies at every start.",
+      "shape_question": "§5.6 says fail-close is a normal state, not a breakdown, and §5.9 gives code 2 its own meaning — «агент недоступен». The same argument says the agent must stay alive with the service missing, serve `hop status`, and attach when it appears. Decide where that lives: retry inside newTransport/acquire (cmd/hop/transport.go), or the internal/supervisor docs/not-yet-written.md already names. Whichever wins, the line in not-yet-written.md must be kept honest — it is red in both directions.",
+      "size": "small in code, and it needs an L3 test: start the agent BEFORE hopd and require it alive when hopd arrives"
+    },
+    {
       "task": "macOS dataplane",
       "detail": "utun via AF_SYSTEM, SIOCAIFADDR, PF_ROUTE",
       "note": "Two Linux-shaped mechanisms must be re-answered there, not ported: bypass_rebind compares interface NAMES, so outbound.Selector on macOS/Windows must publish the same thing (internal/outbound/selector_other.go is the stub), and ipv6_block is an `ip -6 rule` — the other platforms need their own way to refuse IPv6 while the tunnel is up, and refusing is not optional (§5.6)."
@@ -58,11 +73,6 @@
       "task": "Windows dataplane",
       "detail": "Wintun + wintun.dll delivery — §7 already resolved: pull from the official archive at build time, verify SHA-256 and vendor signature.",
       "note": "platform.New() explicitly errors on both OSes today — correct behavior; a silent stub would give a green L3 with nothing actually checked. The .github/workflows/l3-macos.yml and l3-windows.yml jobs are skeletons that build and vet, and say so."
-    },
-    {
-      "task": "Автозапуск самого сервиса и агента (§6.13, вторая и третья трети)",
-      "why": "§6.13 describes three mechanisms in one line and only the third — autoconnect of the tunnel — is written (W67, W68). The autostart of the service and of the agent belongs to an installer, and there is no installer in this repository. This is a task about deciding what an installer is here, not about a missing field.",
-      "size": "large, and mostly a decision"
     }
   ],
   "gate": {
@@ -85,5 +95,21 @@
       "what_is_not_a_flake": "cmd/hop/measure_test.go compares against time in exactly one place — `hop nodes` must return 0 — and the margin there is three orders of magnitude. A refusal in that test is a regression, not load. The 'longest held' numbers it logs are not assertions and move freely on a busy machine."
     },
     "rule": "every new policy must ship with a test that is red without it"
+  },
+  "in_flight": {
+    "note": "Two passes were started from 811c5f2 and are NOT merged. Worktrees: /home/shafed/github/hop-orphan-up (pass/orphan-up), /home/shafed/github/hop-flakes (pass/flakes). Zones were divided per-file before the start; the controller resolves the implementation-notes.md tail by hand and re-runs the whole gate, plus the L3 suite twice, on the MERGED tree.",
+    "pass/orphan-up": "the next_task below: the `hop up` refusal inside the orphan window. Numbers W69, W70 handed out. Zone: cmd/hop non-test sources, internal/tunnel, a new internal/l3 test, docs/verification-agent.md.",
+    "pass/flakes": "the two known flakes named in gate.notes.flake. No registry number — it repairs a guard, it asserts nothing new. Zone: internal/l2, internal/health, internal/clock (flagged: everyone consumes it).",
+    "autostart_is_decided_but_not_started": "§6.13's second and third thirds: the decision is taken and written down in autostart_decision below; no pass runs it yet. The queue item is `Автозапуск §6.13 — юниты и dev-install по принятому решению`."
+  },
+  "autostart_decision": {
+    "what_was_decided": "§6.13's second and third thirds (autostart of the SERVICE and of the AGENT). Decided by the human this round, after the facts below were gathered. The decision is recorded here and NOT yet implemented: the pass that takes it implements it, it does not re-open it.",
+    "facts_that_shaped_it": "(1) Nothing about packaging exists in the repo: no Makefile, no scripts, no unit/plist/wxs, dist/ is gitignored. (2) hopd has no service-manager integration at all — flags -socket /run/hop.sock, -group hop, -ready-file, foreground, SIGTERM → teardown + snapshot verify; no sd_notify, no socket activation, no SCM. (3) MEASURED this round: `hop agent` does not wait for the service and does not retry — with no hopd it prints «фоновая половина hop недоступна: сокет /run/hop.sock: dial unix …: connect: no such file or directory» and exits 2, immediately. (4) macOS and Windows dataplanes are honest errors from platform.New(), so an installer for them cannot be tested here.",
+    "decision_1_scope": "Units + a dev-install script NOW; .deb/.rpm/.pkg/MSI stay queued. PLAN §9 promises the packages in this stage, so this is a deliberate deferral and must be recorded as such: the packages arrive with the platforms that can be tested. PLAN already allows exactly this shape («До этого этапа допустим только локальный dev-install»).",
+    "decision_2_registration": "Declarative: unit files (and later a plist) shipped as FILES; nothing in the product knows about systemd. No `hop service install` verb — it would mean editing §5.9 in SPEC.md (cmd/hop reads the verb list FROM the spec) and a second source of truth about the unit. The asymmetry is deliberate and expected: Windows SCM has no declarative form, so registration there arrives as code inside hopd together with the Windows dataplane.",
+    "decision_3_agent_at_login": "`systemctl --global enable hop-agent.service` — the package (today: the dev-install script) enables the user unit for every user session. That is what §8.5 I1 requires after a standard install, with no second action from the human.",
+    "decision_4_group": "The install creates group `hop` and adds $SUDO_USER to it, printing loudly what it did and that membership carries the right to raise the tunnel (§6.1 authorizes the control socket by group). The person running the installer is by definition the machine's admin, and §5.10 promises a single sudo for the product's whole life. Membership takes effect at the next login — which is when the agent starts anyway.",
+    "what_this_exposes_and_does_NOT_fix": "Fact (3) above is a product defect that autostart at login turns into a restart loop: a user not yet in group `hop`, or a login racing hopd, gets an agent that dies at once. The fix belongs to the product (the agent must survive an unreachable service: stay up, answer `hop status` with code 2, attach when the service appears) and is NOT in the autostart pass — it touches cmd/hop and internal/agent, which the orphan-up pass holds this round. It is the queue item `агент не переживает недоступный сервис` below. docs/not-yet-written.md already names internal/supervisor («надзор за сервисом») — if that fix introduces the package, the line must go, the list is red in both directions.",
+    "verification_available_here": "`systemd-analyze verify` exists on this machine (systemd 261) and needs no root and no installation. There is NO container runtime (no docker, no podman) — systemd-nspawn exists but has no rootfs. So the honest split is: unit files verified by systemd-analyze; the install script verified against a staging DESTDIR; and the REAL install (`sudo`, enable --now, is-active, then removal) only in a CI job on a disposable runner, which is unverified locally and must say so — the same status the l3-macos.yml and l3-windows.yml skeletons already carry. Nothing is to be installed on the developer's own machine."
   }
 }
