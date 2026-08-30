@@ -74,7 +74,7 @@ jobs:
           go build -o /tmp/hopd ./cmd/hopd
           go build -o /tmp/hop ./cmd/hop
           go test -c -o /tmp/l3.test ./internal/l3
-      - name: T21, T22, T23-fast, T23-slow, T23b, T24, T29
+      - name: T21, T22, T23-fast, T23-slow, T23b, T24, T25, T26, T27, T28, T29, T31
         run: |
           sudo -E env \
             HOP_L3=1 \
