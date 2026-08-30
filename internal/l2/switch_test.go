@@ -91,10 +91,11 @@ func TestT10SlowNodeKeepsConnectionAlive(t *testing.T) {
 	h.node[active].inj.SetSlow(250 * time.Millisecond)
 	h.node[active].inj.SetMode(faultinject.ModeSlow)
 
-	h.waitActive(spare, 15*time.Second)
-
-	if last := lastEvent(t, h); last.Reason != health.ReasonFaster {
-		t.Fatalf("причина %v, ожидалась faster: медленный узел не мёртв", last.Reason)
+	// Ждём именно событие перехода, а не снимок: утверждение теста — о причине
+	// ЭТОГО переключения, а «последнее собранное» событие в этот момент вполне
+	// может быть ещё стартовым выбором (см. waitSwitchTo).
+	if ev := h.waitSwitchTo(spare, 15*time.Second); ev.Reason != health.ReasonFaster {
+		t.Fatalf("причина %v, ожидалась faster: медленный узел не мёртв", ev.Reason)
 	}
 	if got := h.interruptCount() - interruptsBefore; got != 0 {
 		t.Errorf("соединения рвали %d раз, ожидалось 0", got)
