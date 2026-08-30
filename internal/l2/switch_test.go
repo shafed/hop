@@ -285,18 +285,34 @@ func TestProbeTargetBlockedByOneURL(t *testing.T) {
 	h := newHarness(t, options{})
 	active := h.waitAnyActive(budget)
 
-	// Подменять пробер на живом менеджере нельзя, поэтому проверяем сведение
-	// на самом MultiProber — тем же путём, через движок.
+	// Сначала — что заблокированный URL вообще доезжает через движок и что он
+	// действительно отвечает отказом. Отдельной пробой, ОДНИМ этим URL: в
+	// MultiProber цели идут параллельно, первый успех отменяет остальные
+	// (multi.go, «ждать остальных незачем»), поэтому счётчик запросов у
+	// проигравшей цели — гонка по построению. Раньше эта половина проверки
+	// стояла после совместной пробы и держалась на том, кто успеет: под
+	// нагрузкой она краснела четырьмя прогонами из пяти («заблокированный URL
+	// не опрашивался — стенд собран не так»).
+	only := &health.MultiProber{Targets: []health.Target{
+		&health.HTTPTarget{URL: blocked.URL(), Dial: h.dialFunc()},
+	}}
+	if res := only.Probe(context.Background(), active); res.Err == nil {
+		t.Error("заблокированный URL ответил успехом — стенд собран не так")
+	}
+	if blocked.Requests() == 0 {
+		t.Error("заблокированный URL не опрашивался — стенд собран не так")
+	}
+
+	// И только теперь — само утверждение T5: с двумя URL проба успешна,
+	// потому что второй жив. Подменять пробер на живом менеджере нельзя,
+	// поэтому сведение проверяется на самом MultiProber — тем же путём, через
+	// движок.
 	p := &health.MultiProber{Targets: []health.Target{
 		&health.HTTPTarget{URL: blocked.URL(), Dial: h.dialFunc()},
 		&health.HTTPTarget{URL: h.tgt.URL(), Dial: h.dialFunc()},
 	}}
-	res := p.Probe(context.Background(), active)
-	if res.Err != nil {
+	if res := p.Probe(context.Background(), active); res.Err != nil {
 		t.Errorf("проба провалилась при живом втором URL: %v", res.Err)
-	}
-	if blocked.Requests() == 0 {
-		t.Error("заблокированный URL не опрашивался — стенд собран не так")
 	}
 }
 
