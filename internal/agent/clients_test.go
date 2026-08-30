@@ -298,3 +298,122 @@ func TestW62EventsWithoutFollowEndOnTheirOwn(t *testing.T) {
 		t.Fatal("`events` без --follow не вернулся")
 	}
 }
+
+// TestW66NodesCarryLiveHealthNotTheDiskSlice — `hop nodes` через сокет §3.3
+// показывает живость связки, а не срез с диска.
+//
+// Это и есть настоящая причина, по которой список узлов уехал за сокет, — и
+// она не та, которую называл прежний HANDOFF. Замер (implementation-notes.md,
+// «Замер: держит ли агент flock всю жизнь») показал, что стор читается БЕЗ
+// замка и `hop nodes` при живом агенте не отказывает. Отказа нет, а вот
+// устаревание есть и оно измерено: на диск живость попадает не чаще раза в
+// healthDebounce и переписывается тикером healthPersistEvery — по тридцать
+// секунд, — так что клиент, читающий стор напрямую, видит состояние
+// получасовой давности ровно тогда, когда актуальное есть у того, кого он не
+// спросил.
+//
+// Проверяется на настоящей связке, а не на заглушке: предмет проверки —
+// откуда связка берёт живость, и заглушка отвечала бы за неё сама.
+//
+// Краснеет, если Agent.Nodes вернётся к живости стора: тогда обе картины
+// совпадут, и «свежая» перестанет отличаться от «лежащей на диске».
+func TestW66NodesCarryLiveHealthNotTheDiskSlice(t *testing.T) {
+	r := newRig(t, "n1", "n2")
+	r.prob.set("n1", health.Result{RTT: 42 * time.Millisecond})
+	r.prob.set("n2", health.Result{RTT: 77 * time.Millisecond})
+	r.start()
+
+	// На диске — срез, записанный до последних проб: узлы там мертвы, и
+	// латентность у них другая. Срез кладётся руками, а не вылёживается
+	// тридцать секунд фейкового времени, по той же причине, по которой стенд
+	// кладёт узлы через seedStore: проверяется не тикер, а то, у КОГО связка
+	// спрашивает живость. Состояние это штатное — ровно так стор и выглядит
+	// весь промежуток между записями (§2, healthDebounce).
+	r.st.PutHealth([]health.NodeHealth{
+		{NodeID: "n1", State: health.Dead, RTT: 999 * time.Millisecond},
+		{NodeID: "n2", State: health.Dead, RTT: 999 * time.Millisecond},
+	})
+	onDisk := map[string]string{}
+	onDiskRTT := map[string]int64{}
+	for _, g := range r.st.FullView(nil) {
+		for _, n := range g.Nodes {
+			onDisk[n.ID], onDiskRTT[n.ID] = n.State, n.RTTMs
+		}
+	}
+	for _, id := range []string{"n1", "n2"} {
+		if onDisk[id] != health.Dead.String() || onDiskRTT[id] != 999 {
+			t.Fatalf("срез на диске не лёг: узел %s = %q, %d мс", id, onDisk[id], onDiskRTT[id])
+		}
+	}
+
+	live := map[string]int64{}
+	states := map[string]string{}
+	groups := r.a.Nodes()
+	if len(groups) != 1 {
+		t.Fatalf("групп %d, ожидалась 1", len(groups))
+	}
+	for _, n := range groups[0].Nodes {
+		live[n.ID] = n.RTTMs
+		states[n.ID] = n.State
+	}
+
+	for id, want := range map[string]int64{"n1": 42, "n2": 77} {
+		if states[id] != health.Alive.String() {
+			t.Errorf("узел %s: связка отдала состояние %q, живость знает %q",
+				id, states[id], health.Alive)
+		}
+		if live[id] != want {
+			t.Errorf("узел %s: связка отдала %d мс, проба измерила %d мс", id, live[id], want)
+		}
+		// Вторая половина утверждения: на диске в этот момент лежит другое.
+		// Без неё тест был бы зелен и тогда, когда связка читает стор, —
+		// достаточно было бы стору успеть записать ту же живость.
+		if onDisk[id] == states[id] {
+			t.Errorf("узел %s: диск и связка говорят одно и то же (%q) — "+
+				"сравнивать нечего, проверка стала пустой", id, onDisk[id])
+		}
+	}
+}
+
+// TestW66NodesReachTheClientThroughTheSocket — список узлов доезжает до
+// клиента §3.3 целиком и в порядке Р8.
+//
+// Отдельно от W65 (`cmd/hop`), потому что это другая половина: там
+// проверяется команда и её `--json`, здесь — что кадры потока склеиваются
+// обратно в те же группы с тем же составом. Порядок принадлежит провайдеру
+// (Р8), и поток, перепутавший узлы местами, был бы зелен по количеству.
+func TestW66NodesReachTheClientThroughTheSocket(t *testing.T) {
+	r := newRig(t, "n1", "n2", "n3")
+	r.start()
+
+	path := serveClients(t, r.a)
+	cl, err := DialClient(path)
+	if err != nil {
+		t.Fatalf("клиент не подключился: %v", err)
+	}
+	defer cl.Close()
+
+	got, err := cl.Nodes()
+	if err != nil {
+		t.Fatalf("список узлов не приехал: %v", err)
+	}
+	want := r.a.Nodes()
+	if len(got) != len(want) {
+		t.Fatalf("групп приехало %d, у связки %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].Group != want[i].Group {
+			t.Errorf("группа %d приехала другой:\nбыло:  %+v\nстало: %+v", i, want[i].Group, got[i].Group)
+		}
+		if len(got[i].Nodes) != len(want[i].Nodes) {
+			t.Fatalf("в группе %s узлов приехало %d, у связки %d",
+				want[i].Group.ID, len(got[i].Nodes), len(want[i].Nodes))
+		}
+		for j := range want[i].Nodes {
+			if got[i].Nodes[j] != want[i].Nodes[j] {
+				t.Errorf("узел %d группы %s приехал другим:\nбыло:  %+v\nстало: %+v",
+					j, want[i].Group.ID, want[i].Nodes[j], got[i].Nodes[j])
+			}
+		}
+	}
+}
