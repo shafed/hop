@@ -8,12 +8,14 @@ package store
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"sync"
 	"testing"
-	"time" //hop:realtime — шаг прокрутки фейковых часов во втором процессе
+	"time" //hop:realtime — шаг прокрутки фейковых часов во втором процессе и предел ожидания в S47
 
 	"github.com/shafed/hop/internal/clock"
 )
@@ -160,4 +162,92 @@ func TestS28Helper(t *testing.T) {
 	// В режиме refuse закрытие снова упрётся в замок — это ожидаемо, и его
 	// ошибка ничего не добавляет к уже проверенному.
 	_ = s.Close()
+}
+
+// TestS47OpenDoesNotWaitForTheSweepLock — S47.
+//
+// Уборка мусора при Open не имеет права ждать замок. Временный файл живёт
+// ровно столько, сколько идёт чужая запись, поэтому читатель, попавший в это
+// окно, принимал живой файл писателя за мусор от убитого процесса и вставал в
+// очередь за замком — худший `hop nodes` из сорока доходил до 2 с при медиане
+// 4 мс (cmd/hop/measure_test.go, TestS47MeasureSweepLockUnderALiveWriter).
+//
+// Проверка идёт в одном процессе: flock конфликтует у разных описаний
+// открытого файла, поэтому второй *Store на том же каталоге упирается в замок
+// первого так же, как упёрся бы чужой процесс.
+func TestS47OpenDoesNotWaitForTheSweepLock(t *testing.T) {
+	s, dir := newStore(t)
+	seed(t, s, Group{ID: "g", Name: "подписка"}, node("n1", "g", "a.example"))
+	if err := s.Flush(); err != nil {
+		t.Fatalf("первая запись не прошла: %v", err)
+	}
+
+	// Чужая запись идёт прямо сейчас: замок держат, и в каталоге лежит её
+	// временный файл. От мусора убитого процесса он отличим ровно замком.
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	held := make(chan error, 1)
+	go func() {
+		held <- s.transact(func() error {
+			close(locked)
+			<-release
+			return nil
+		})
+	}()
+	<-locked
+	var once sync.Once
+	unhold := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(unhold)
+
+	alive := filepath.Join(dir, nodesFile+tempSuffix+"идущаязапись")
+	if err := os.WriteFile(alive, []byte("наполовину"), secretPerm); err != nil {
+		t.Fatalf("не подложить временный файл идущей записи: %v", err)
+	}
+
+	// Часы второго стора стоят: ожидание замка идёт по ним, поэтому «дождался»
+	// здесь означает «не вернулся никогда». Предел ожидания ниже — по
+	// НАСТОЯЩЕМУ времени, и иначе нельзя: проверяется отсутствие ожидания, и
+	// модельные часы, которыми его мерить, — те самые, что стоят. Две секунды
+	// вместо десятиминутного таймаута go test.
+	clk := clock.NewFake(testEpoch)
+	type opened struct {
+		s   *Store
+		err error
+	}
+	done := make(chan opened, 1)
+	go func() {
+		s2, err := Open(dir, clk)
+		done <- opened{s2, err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("Open отказал рядом с идущей чужой записью: %v", got.err)
+		}
+		t.Cleanup(func() { _ = got.s.Close() })
+	case <-time.After(2 * time.Second): //hop:realtime — см. довод выше
+		// Застрявшую горутину надо отпустить, иначе красный превратится в
+		// зависание пакета: часы стоят, и сама она не выйдет никогда.
+		unhold()
+		clk.Advance(2 * lockTimeout)
+		<-done
+		t.Fatal("Open ждёт замок ради уборки: читатель стоит, пока идёт чужая запись")
+	}
+
+	// Уборка пропущена, а не выполнена: временный файл живого писателя цел.
+	// Снести его было бы хуже ожидания — чужая запись потеряла бы содержимое.
+	if _, err := os.Stat(alive); err != nil {
+		t.Errorf("Open снёс временный файл идущей чужой записи: %v", err)
+	}
+
+	// И не забыта: со свободным замком мусор убирается, как требует S26.
+	unhold()
+	if err := <-held; err != nil {
+		t.Fatalf("транзакция, державшая замок, отказала: %v", err)
+	}
+	openStore(t, dir)
+	if _, err := os.Stat(alive); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("мусор пережил Open со свободным замком: %v", err)
+	}
 }

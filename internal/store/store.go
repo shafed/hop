@@ -134,6 +134,20 @@ func Open(root string, clk clock.Clock) (*Store, error) {
 // Open обязан что-то изменить — создать недостающие файлы или убрать мусор от
 // убитого процесса; иначе `hop nodes` при работающем агенте ждал бы замок ради
 // одного чтения.
+//
+// И даже тогда ЖДЁТ его только запись. Уборка замок пробует и, если занят,
+// уходит ни с чем: временный файл живёт ровно столько, сколько идёт чужая
+// запись, и занятый замок — это и есть доказательство, что владелец файла жив,
+// а файл не мусор. Ждать здесь значило бы принимать чужую запись за мусор от
+// убитого процесса и стоять из-за неё. Замерено на живом писателе без пауз
+// (cmd/hop/measure_test.go, TestS47MeasureSweepLockUnderALiveWriter): худший
+// `hop nodes` из сорока — от 457 мс до 2.063 с в пяти прогонах при медиане
+// 4 мс, то есть выброс, а не общее замедление; после — 6 мс. Платил и сам
+// писатель: его худший Flush — 51 мс, ровно круг опроса lockRetry, потерянный
+// в пользу подметающего читателя; после — 1.1 мс.
+//
+// Пропущенная уборка ничего не теряет: мусор доживёт до следующего Open, у
+// которого замок свободен (S26, S47).
 func (s *Store) load() error {
 	if err := s.readGroups(); err != nil {
 		return err
@@ -153,22 +167,32 @@ func (s *Store) load() error {
 	if err != nil {
 		return err
 	}
+	if missing != 0 {
+		// Ради недостающих файлов замок ждут: это запись, а не уборка. Стор
+		// без файлов невозможно проверить на права (§6.14), и случается это
+		// один раз за жизнь каталога, а не на каждом чтении.
+		return s.transact(func() error {
+			if err := s.w.sweep(); err != nil {
+				return err
+			}
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.dirty |= missing
+			return s.writeDirtyLocked()
+		})
+	}
+
 	garbage, err := s.hasTempGarbage()
 	if err != nil {
 		return err
 	}
-	if missing == 0 && !garbage {
+	if !garbage {
 		return nil
 	}
-	return s.transact(func() error {
-		if err := s.w.sweep(); err != nil {
-			return err
-		}
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		s.dirty |= missing
-		return s.writeDirtyLocked()
-	})
+	// Не состоялась — и хорошо: занятый замок означает живого писателя, чей
+	// временный файл трогать нельзя (см. комментарий к load).
+	_, err = s.tryTransact(s.w.sweep)
+	return err
 }
 
 func (s *Store) readGroups() error {
@@ -303,6 +327,30 @@ func (s *Store) transact(fn func() error) error {
 		defer s.lock.release()
 	}
 	return fn()
+}
+
+// tryTransact — та же транзакция, но без ожидания: замок пробуется один раз,
+// и занятый означает «не состоялась», а не ошибку. Отданный false — это
+// «сейчас работает кто-то другой», и звать fn в этом случае нельзя.
+//
+// Существует ради уборки в load: ей нужен замок не для того, чтобы дождаться
+// своей очереди, а для того, чтобы отличить брошенный временный файл от чужого
+// живого.
+func (s *Store) tryTransact(fn func() error) (bool, error) {
+	s.txMu.Lock()
+	defer s.txMu.Unlock()
+
+	if s.lockOn {
+		ok, err := s.lock.try()
+		if err != nil {
+			return false, fmt.Errorf("store: не взять замок %s: %w", s.lock.path, err)
+		}
+		if !ok {
+			return false, nil
+		}
+		defer s.lock.release()
+	}
+	return true, fn()
 }
 
 // Groups отдаёт группы в том порядке, в котором они лежат в сторе.
