@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
 	"path/filepath"
@@ -16,17 +17,23 @@ import (
 // что человек и должен править руками.
 const settingsFile = "settings.json"
 
-// Settings — настройки продукта, лежащие рядом с узлами: списки §6.10 и
-// апстримы §5.7.
+// Settings — настройки продукта, лежащие рядом с узлами: списки §6.10,
+// апстримы §5.7 и автоподключение §6.13.
 //
-// Оба поля необязательны, и nil у каждого значит «умолчания», а не «пусто»:
+// Все поля необязательны, и nil у каждого значит «умолчания», а не «пусто»:
 // netstack.resolveRouting и agent.wire трактуют пустое поле именно так, и
 // формат обязан уметь выразить ту же разницу. Отсюда указатель у Routing:
 // раздела нет — умолчания §6.10; раздел есть и пуст — пустые списки, то есть
 // человек убрал обнаружение служб (§6.10 разрешает: это умолчание, а не пол).
+//
+// Autoconnect — тем же приёмом и по той же причине: §6.13 включает
+// автоподключение по умолчанию, а нулевое значение bool — false. Без указателя
+// «поля никогда не было» (умолчание — включено) и «человек явно выключил» были
+// бы неразличимы.
 type Settings struct {
 	Routing      *netstack.Routing
 	DNSUpstreams []netip.AddrPort
+	Autoconnect  *bool
 }
 
 func (s Settings) clone() Settings {
@@ -37,7 +44,18 @@ func (s Settings) clone() Settings {
 		}
 	}
 	s.DNSUpstreams = slices.Clone(s.DNSUpstreams)
+	if s.Autoconnect != nil {
+		v := *s.Autoconnect
+		s.Autoconnect = &v
+	}
 	return s
+}
+
+// AutoconnectOn — состояние §6.13 с учётом умолчания. Поле не заведено ни
+// разу (стор свежий или settings.json не упоминает его) — включено, ровно как
+// говорит спека; заведено — то, что явно выбрал `hop autoconnect on|off`.
+func (s Settings) AutoconnectOn() bool {
+	return s.Autoconnect == nil || *s.Autoconnect
 }
 
 // Settings отдаёт настройки, прочитанные при Open.
@@ -51,12 +69,45 @@ func (s *Store) Settings() Settings {
 	return s.settings.clone()
 }
 
+// SetAutoconnect записывает §6.13 и кладёт его на диск синхронно.
+//
+// Единственное поле settings.json, которое правит глагол, а не рука человека:
+// §5.9 отдаёт остальные настройки файлу нарочно («вторая грамматика рядом с
+// файлом» — довод из самой спеки), но §6.13 требует ровно обратного —
+// `hop autoconnect on|off` — и объясняет почему: настройка пользовательская, а
+// правка агентским флагом означала бы правку unit-файла или plist под root.
+//
+// Синхронно, в отличие от PutHealth: там дебаунс — это про частоту при
+// известном источнике истины (health), а здесь команда обязана знать, что её
+// решение легло на диск, прежде чем напечатать пользователю «включено».
+// Отказ записи не выбрасывает решение: секция остаётся грязной и уйдёт с
+// следующим Flush или Close, но вызывающий должен увидеть ошибку сейчас.
+func (s *Store) SetAutoconnect(on bool) error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return errors.New("store: стор закрыт")
+	}
+	s.settings.Autoconnect = &on
+	s.dirty |= sectionSettings
+	s.mu.Unlock()
+
+	return s.transact(func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.writeDirtyLocked()
+	})
+}
+
 type diskSettings struct {
 	Version int          `json:"version"`
 	Routing *diskRouting `json:"routing,omitempty"`
 	// DNSUpstreams — «адрес:порт» строками, а не парой полей: файл читают
 	// глазами, и «1.1.1.1:53» узнаётся мгновенно.
 	DNSUpstreams []string `json:"dns_upstreams,omitempty"`
+	// Autoconnect — §6.13. Указатель, а не bool: отсутствие ключа обязано
+	// остаться отличимым от явного false (см. Settings.AutoconnectOn).
+	Autoconnect *bool `json:"autoconnect,omitempty"`
 }
 
 type diskRouting struct {
@@ -113,6 +164,7 @@ func encodeSettings(s Settings) ([]byte, error) {
 	for _, up := range s.DNSUpstreams {
 		d.DNSUpstreams = append(d.DNSUpstreams, up.String())
 	}
+	d.Autoconnect = s.Autoconnect
 	return marshal(d)
 }
 
@@ -172,6 +224,7 @@ func decodeSettings(raw []byte) (Settings, error) {
 		}
 		set.DNSUpstreams = append(set.DNSUpstreams, ap)
 	}
+	set.Autoconnect = d.Autoconnect
 	return set, nil
 }
 

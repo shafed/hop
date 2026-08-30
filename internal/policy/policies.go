@@ -734,6 +734,18 @@ var (
 			{Pkg: "./internal/resolver", Test: "^TestD16SwitchMidResolveRetriesOnce$"},
 		},
 	}
+
+	// AutoconnectState — состояние §6.13 в сторе гейтит первый `a.Up()` при
+	// старте `hop agent` (cmd/hop/main.go, shouldAutoUp). Выключение
+	// возвращает поведение, которое было в продукте до этого прохода: агент
+	// поднимает туннель безусловно, что бы ни лежало в settings.json.
+	AutoconnectState = &Policy{
+		Name: "autoconnect_state",
+		Doc:  "автоподключение при старте агента читает store.Settings, а не поднимает туннель безусловно (§6.13, W67)",
+		Guards: []Guard{
+			{Pkg: "./cmd/hop", Test: "^TestW67AutoconnectSettingGatesInitialUp$"},
+		},
+	}
 )
 
 // All — полный список политик продукта.
@@ -786,6 +798,7 @@ func All() []*Policy {
 		DNSNegativeCache,
 		DNSSingleFlight,
 		DNSSwitchRetry,
+		AutoconnectState,
 	}
 }
 
