@@ -41,7 +41,7 @@ source only; a copy here would drift from what passes actually run.
 
 ## Subagents
 
-Running passes as subagents in separate worktrees is expected, and choosing the
+Use subagents, if needed. Running passes as subagents in separate worktrees is expected, and choosing the
 model per task is expected with it — a heavier model where the pass has to make an
 architectural decision, a lighter one for local mechanical work. Divide zones
 per-file and hand out registry numbers before the passes start:
