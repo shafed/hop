@@ -96,6 +96,32 @@ func TestInstallRefusesBeforeWritingAnythingWhenAPayloadFileIsMissing(t *testing
 	}
 }
 
+// TestRealInstallRefusesWithoutRootBeforeTouchingAnything — отказ обязан быть
+// отказом ПРОДУКТА, а не ядра.
+//
+// Без проверки права в начале скрипт падал бы первым же `install -D` в
+// /usr/bin с «Permission denied»: человек узнавал бы про sudo от ls, а не от
+// инсталлятора, и узнавал бы это после того, как часть работы уже сделана.
+//
+// Тест не под root по построению — и пропускается, если гейт всё-таки запущен
+// из-под root: настоящая установка на машину, где идёт `go test`, запрещена
+// решением §6.13, и молча делать её здесь нельзя ни при каких условиях.
+func TestRealInstallRefusesWithoutRootBeforeTouchingAnything(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("гейт запущен из-под root: настоящую установку здесь делать нельзя, проверка НЕ выполнена")
+	}
+	mark := filepath.Join(t.TempDir(), "calls")
+
+	out, err := runScript(t, stubEnv(t, mark), "install", "-bindir", fakeBinDir(t))
+	if err == nil {
+		t.Fatalf("install без -destdir и без root не отказал:\n%s", out)
+	}
+	if !strings.Contains(out, "root") {
+		t.Errorf("отказ не называет, чего не хватает:\n%s", out)
+	}
+	assertNoMachineCommands(t, mark, "install без root")
+}
+
 // stubEnv — окружение, в котором машиноменяющие команды подменены заглушками.
 func stubEnv(t *testing.T, mark string) []string {
 	t.Helper()

@@ -106,6 +106,13 @@ do_install() {
 	while IFS='|' read -r src dst mode; do
 		[ -f "$src" ] || die "нет файла $src (собрать: go build -o $bindir/hop ./cmd/hop и то же для hopd)"
 	done <"$list"
+
+	# Право проверяется здесь, а не там, где оно впервые понадобится: без этой
+	# строки запуск без sudo падал бы первым же `install -D` в /usr/bin с
+	# «Permission denied» — отказом ядра вместо отказа продукта, и человек
+	# узнавал бы про root не от того, кто про него знает.
+	[ -n "$destdir" ] || [ "$(id -u)" = 0 ] || die "настоящая установка требует root (запуск: sudo $0 install)"
+
 	# Отдельным проходом: отказ обязан случиться ДО первой записи, иначе
 	# половина поставки остаётся на машине.
 	while IFS='|' read -r src dst mode; do
@@ -119,8 +126,6 @@ do_install() {
 		say "  группа $GROUP не заведена, юниты не включены, systemctl не звался."
 		return
 	fi
-
-	[ "$(id -u)" = 0 ] || die "настоящая установка требует root (запуск: sudo $0 install)"
 
 	if getent group "$GROUP" >/dev/null 2>&1; then
 		say "группа $GROUP уже есть"
