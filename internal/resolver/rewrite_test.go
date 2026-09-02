@@ -28,11 +28,16 @@ func parseTest(t *testing.T, raw []byte) dnsmsg.Msg {
 // на одном адресе. Фаза всегда proxied: gate (заглушка З7) её пока не
 // смотрит, но значение обязано быть таким, при котором настоящий gate тоже
 // пропустит запрос — иначе тест начнёт молча проверять чужую заглушку.
-func newRewriteTestResolver(t *testing.T) (r *Resolver, up *dnstest.Upstream, addr netip.AddrPort) {
+//
+// clk и fake ходят наружу вместе с резолвером: негативный контроль D45
+// (HOP_DISABLE=dns_aaaa_nodata) уводит запрос наверх вместо синтеза, и без
+// прокрутки фейковых часов тест висит до -timeout вместо падения по
+// утверждению.
+func newRewriteTestResolver(t *testing.T) (r *Resolver, up *dnstest.Upstream, addr netip.AddrPort, clk *dnstest.Clock, fake *clock.Fake) {
 	t.Helper()
-	clk := clock.NewFake(time.Unix(0, 0))
-	dclk := dnstest.NewClock(clk)
-	up = dnstest.New(dclk)
+	fake = clock.NewFake(time.Unix(0, 0))
+	clk = dnstest.NewClock(fake)
+	up = dnstest.New(clk)
 	addr = netip.MustParseAddrPort("203.0.113.53:53")
 
 	var err error
@@ -42,27 +47,71 @@ func newRewriteTestResolver(t *testing.T) (r *Resolver, up *dnstest.Upstream, ad
 		Dial:       up.Dial,
 		DialDirect: up.DialDirect,
 		Phase:      func() phase.Traffic { return phase.Proxied },
-		Clock:      dclk,
+		Clock:      clk,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { r.Close() })
-	return r, up, addr
+	return r, up, addr, clk, fake
+}
+
+// queryRacingAttemptTimeout запускает r.Query асинхронно и доводит фейковые
+// часы до таймаута попытки наверх (AttemptTimeout, askUDP), если запрос до
+// него дошёл.
+//
+// Обращений к часам в худшем случае два: бюджет клиента (withBudget, всегда
+// первое) и таймаут попытки (askUDP, только когда синтеза не было и апстрим
+// не запрограммирован). В штатном режиме политика отвечает раньше второго
+// обращения — ветка часов тогда не выбирается вовсе, и функция возвращается
+// по готовому ответу. Нужна ровно для D45: под HOP_DISABLE=dns_aaaa_nodata
+// синтеза нет, запрос уходит наверх, апстрим молчит, и без прокрутки этих
+// часов горутина резолвера висит до -timeout, а не падает по утверждению.
+func queryRacingAttemptTimeout(t *testing.T, r *Resolver, query []byte, clk *dnstest.Clock, fake *clock.Fake) queryResult {
+	t.Helper()
+
+	ch := make(chan queryResult, 1)
+	go func() {
+		resp, err := r.Query(query, netip.AddrPort{}, netip.AddrPort{})
+		ch <- queryResult{resp: resp, err: err}
+	}()
+
+	afterTwo := make(chan struct{})
+	go func() {
+		clk.WaitAfterCalls(2)
+		close(afterTwo)
+	}()
+
+	select {
+	case res := <-ch:
+		return res
+	case <-afterTwo:
+		fake.Advance(AttemptTimeout)
+	case <-time.After(testWatchdog): //hop:realtime сторож
+		t.Fatal("резолвер не ответил и не встал в ожидание за сторожевой срок")
+	}
+
+	select {
+	case res := <-ch:
+		return res
+	case <-time.After(testWatchdog): //hop:realtime сторож
+		t.Fatal("резолвер не ответил за сторожевой срок после таймаута попытки")
+	}
+	return queryResult{}
 }
 
 // D45. Запрос типа AAAA — NOERROR с пустым ANSWER, наверх не ушло ничего
 // (Р19, флаг dns_aaaa_nodata).
 func TestD45AAAAIsSynthesizedNodata(t *testing.T) {
-	r, up, _ := newRewriteTestResolver(t)
+	r, up, _, clk, fake := newRewriteTestResolver(t)
 
 	query := dnstest.BuildQuery(dnstest.QueryOpts{ID: 0xBEEF, Name: "example.com", Type: dnstest.TypeAAAA})
-	resp, err := r.Query(query, netip.AddrPort{}, netip.AddrPort{})
-	if err != nil {
-		t.Fatalf("Query: %v", err)
+	res := queryRacingAttemptTimeout(t, r, query, clk, fake)
+	if res.err != nil {
+		t.Fatalf("Query: %v", res.err)
 	}
 
-	got := parseTest(t, resp)
+	got := parseTest(t, res.resp)
 	if !got.Header.Response() {
 		t.Fatal("QR не поднят")
 	}
@@ -90,7 +139,7 @@ func TestD45AAAAIsSynthesizedNodata(t *testing.T) {
 // есть ответ на AAAA не был NXDOMAIN, который стаб клиента вправе
 // распространить на все типы разом (Р19, флаг dns_aaaa_nodata).
 func TestD46AAAANodataKeepsAWorking(t *testing.T) {
-	r, up, addr := newRewriteTestResolver(t)
+	r, up, addr, _, _ := newRewriteTestResolver(t)
 	const name = "example.com"
 
 	aaaaQuery := dnstest.BuildQuery(dnstest.QueryOpts{ID: 1, Name: name, Type: dnstest.TypeAAAA})
