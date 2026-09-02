@@ -956,6 +956,29 @@ func TestA33ProberIsCalledWithNodeID(t *testing.T) {
 	}
 }
 
+// A36: отказ пробера до истечения таймаута — это Fail, а не Timeout.
+// probe() отменяет контекст на выходе безусловно (уборка ресурсов), поэтому
+// ctx.Err() != nil верно и для настоящего таймаута, и для пробы, вернувшейся
+// сама. Классификация обязана различать эти случаи, а не читать общий признак
+// отмены (§5.9: `hop status` показывает LastError как есть).
+func TestA36ProbeDistinguishesFailFromTimeout(t *testing.T) {
+	f := newFixture(t, nodes("A", "B"), nil)
+	f.prober.setRTT("A", 100*ms)
+	f.prober.setRTT("B", 200*ms)
+	f.startAndSettle()
+
+	f.prober.setFailing("A", true)
+	f.advanceRound(DefaultActiveInterval)
+
+	h, _ := f.mgr.Snapshot().Node("A")
+	if len(h.Window) == 0 || h.Window[len(h.Window)-1] != Fail {
+		t.Errorf("окно A = %v, ожидался Fail последним (узел ответил отказом до таймаута)", h.Window)
+	}
+	if h.LastError != errProbe.Error() {
+		t.Errorf("LastError = %q, ожидалась причина отказа пробера %q", h.LastError, errProbe.Error())
+	}
+}
+
 // --- вспомогательное ---------------------------------------------------
 
 // testTarget — тестовый URL для MultiProber.

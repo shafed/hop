@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"errors"
 	"hash/fnv"
 	"sort"
 	"sync"
@@ -505,9 +506,15 @@ func (m *Manager) runDue() {
 	wg.Wait()
 }
 
+// errProbeReturned — причина отмены контекста при штатном завершении Probe.
+// probe() отменяет ctx на каждом выходе, чтобы освободить таймер (After);
+// без отдельной причины эта уборочная отмена неотличима от отмены по
+// настоящему таймауту через один и тот же ctx.Err() != nil (A36).
+var errProbeReturned = errors.New("health: проба вернулась сама, отмена — не причина")
+
 // probe выполняет одну пробу узла и применяет результат.
 func (m *Manager) probe(s *nodeState) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancelCause(context.Background())
 	// After регистрируется синхронно — до входа в Probe, поэтому фейковые
 	// часы не могут проскочить мимо этого ожидающего.
 	timeout := m.clk.After(m.cfg.ProbeTimeout)
@@ -515,16 +522,16 @@ func (m *Manager) probe(s *nodeState) {
 	go func() {
 		select {
 		case <-timeout:
-			cancel()
+			cancel(context.DeadlineExceeded)
 		case <-stop:
 		case <-m.done:
-			cancel()
+			cancel(context.Canceled)
 		}
 	}()
 
 	res := m.prober.Probe(ctx, s.node.ID)
 	close(stop)
-	cancel()
+	cancel(errProbeReturned)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -538,7 +545,10 @@ func (m *Manager) probe(s *nodeState) {
 		// Успешная проба гасит подозрение, накопленное из трафика (Р2), но
 		// не стирает историю проб.
 		s.traffic = 0
-	case ctx.Err() != nil:
+	case !errors.Is(context.Cause(ctx), errProbeReturned):
+		// Первая причина отмены побеждает (context.Cause): если Probe
+		// вернулась сама, до неё успевает дойти только errProbeReturned из
+		// уборки ниже, а настоящий таймаут или m.done — раньше.
 		s.record(Timeout, m.n)
 		s.lastErr = "timeout"
 	default:
