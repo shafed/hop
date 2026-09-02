@@ -1,0 +1,105 @@
+name: install-linux
+
+# §8.5 I1/I3 в той части, которая вообще исполнима сегодня: НАСТОЯЩАЯ установка
+# — sudo, groupadd, systemctl enable --now — на одноразовом раннере.
+#
+# Почему только здесь. Локально этот путь не проверен и проверен быть не может:
+# ставить продукт на машину разработчика запрещено решением §6.13
+# (HANDOFF.json → autostart_decision.verification_available_here), контейнерного
+# рантайма на ней нет, а systemd-analyze разбирает синтаксис, а не последствия.
+# Всё, что можно проверить без установки, проверяет обычный гейт —
+# internal/packaging. Здесь проверяется ровно остаток.
+#
+# Это НЕ I1–I5. Настоящий I1 — «установка штатным способом», то есть пакет
+# (.deb/.rpm), а пакетов пока нет намеренно (HANDOFF.json →
+# autostart_decision.decision_1_scope). Тест поставки, гоняющий не то, чем
+# ставит пользователь, проверяет не поставку — §8.5 говорит это прямо, и
+# считать эту задачу за I1 значило бы соврать в регистре.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '10 4 * * *'
+  pull_request:
+    paths:
+      - 'packaging/**'
+      - 'internal/packaging/**'
+      - '.github/workflows/install-linux.yml'
+
+env:
+  GO_VERSION: '1.26'
+
+jobs:
+  install-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '${{ env.GO_VERSION }}' }
+
+      # Сборка до sudo: под sudo `go build` уходит в кеш root и лезет в сеть за
+      # модулями (тот же довод стоит у задачи l3-linux в ci.yml).
+      - name: Собрать hop и hopd
+        run: |
+          go build -o dist/hop ./cmd/hop
+          go build -o dist/hopd ./cmd/hopd
+
+      # Снапшот той же формы, что снимает сам hopd (internal/netstate/linux.go):
+      # §8.5 I3 требует, чтобы после удаления сеть совпала с доустановочной.
+      - name: Снапшот сети до установки
+        run: |
+          for s in "link show" "addr show" "route show table all" "rule show" "-6 rule show"; do
+            echo "== ip -o $s"; ip -o $s
+          done | sort > /tmp/net-before.txt
+
+      - name: Установка
+        run: sudo packaging/install.sh install
+
+      - name: I1 — сервис зарегистрирован и запущен, агент включён при логине
+        run: |
+          systemctl is-enabled hopd.service
+          systemctl is-active hopd.service
+          # --global: unit включён для КАЖДОЙ будущей сессии, а не для текущей.
+          systemctl --global is-enabled hop-agent.service
+          getent group hop
+          # Членство даёт право поднимать туннель (§6.1); действует со
+          # следующего логина, но в /etc/group видно сразу.
+          id -nG "$USER" | tr ' ' '\n' | grep -qx hop
+          test -x /usr/bin/hop && test -x /usr/bin/hopd
+
+      # Сервис обязан пережить рестарт: это ближайшее, что раннер даёт к I2
+      # («перезагрузка»), — перезагрузить сам раннер нельзя.
+      - name: Рестарт сервиса
+        run: |
+          sudo systemctl restart hopd.service
+          systemctl is-active hopd.service
+
+      - name: Установка поверх той же версии (I4 в исполнимой части)
+        run: |
+          sudo packaging/install.sh install
+          systemctl is-active hopd.service
+
+      - name: Удаление
+        run: sudo packaging/install.sh uninstall
+
+      - name: I3 — снято с регистрации, файлы удалены
+        run: |
+          ! systemctl is-active hopd.service
+          ! test -e /usr/lib/systemd/system/hopd.service
+          ! test -e /usr/lib/systemd/user/hop-agent.service
+          ! test -e /usr/bin/hop
+          ! test -e /usr/bin/hopd
+          # Группа оставлена намеренно (её gid может стоять на файлах) —
+          # решение записано в packaging/install.sh и здесь закреплено, чтобы
+          # молчаливая смена поведения краснела.
+          getent group hop
+
+      - name: I3 — снапшот сети совпал с доустановочным
+        run: |
+          for s in "link show" "addr show" "route show table all" "rule show" "-6 rule show"; do
+            echo "== ip -o $s"; ip -o $s
+          done | sort > /tmp/net-after.txt
+          diff -u /tmp/net-before.txt /tmp/net-after.txt
+
+      - name: Журнал сервиса
+        if: always()
+        run: sudo journalctl -u hopd.service --no-pager || true
