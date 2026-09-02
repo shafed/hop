@@ -2,11 +2,13 @@ package dnstest
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
 	"sync"
+	"syscall"
 )
 
 // RealServer — настоящий UDP+TCP DNS-апстрим на 127.0.0.1: та же
@@ -33,23 +35,43 @@ type RealServer struct {
 // NewRealServer поднимает UDP- и TCP-слушатели на одном порте 127.0.0.1:0:
 // настоящий DNS-апстрим слушает оба протокола на одном порту (RFC 1035
 // §4.2.2), и стенд обязан быть его двойником, а не парой независимых портов.
+//
+// Порт для обеих сторон берёт ОС (:0), а не только для UDP: под конкурентной
+// нагрузкой чужой процесс может успеть занять TCP-номер, который только что
+// освободила UDP-сторона, в промежутке между двумя ListenUDP/Listen. Поэтому
+// при коллизии перепривязывается пара целиком — держать UDP-порт и повторять
+// только TCP-bind недостаточно, тот же порт может быть занят и на UDP-стороне
+// к следующей попытке.
 func NewRealServer() (*RealServer, error) {
-	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		return nil, fmt.Errorf("dnstest: udp: %w", err)
-	}
-	port := udp.LocalAddr().(*net.UDPAddr).Port
-	tcp, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
-	if err != nil {
-		udp.Close()
-		return nil, fmt.Errorf("dnstest: tcp: %w", err)
-	}
+	const maxAttempts = 20
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			return nil, fmt.Errorf("dnstest: udp: %w", err)
+		}
+		port := udp.LocalAddr().(*net.UDPAddr).Port
+		tcp, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			udp.Close()
+			if isAddrInUse(err) {
+				lastErr = err
+				continue
+			}
+			return nil, fmt.Errorf("dnstest: tcp: %w", err)
+		}
 
-	s := &RealServer{udp: udp, tcp: tcp}
-	s.wg.Add(2)
-	go s.serveUDP()
-	go s.serveTCP()
-	return s, nil
+		s := &RealServer{udp: udp, tcp: tcp}
+		s.wg.Add(2)
+		go s.serveUDP()
+		go s.serveTCP()
+		return s, nil
+	}
+	return nil, fmt.Errorf("dnstest: tcp: %d попыток подряд заняты: %w", maxAttempts, lastErr)
+}
+
+func isAddrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE)
 }
 
 // Addr — адрес сервера, годный и для Config.Upstreams резолвера, и для
