@@ -78,6 +78,14 @@ type service struct {
 
 func startService(t *testing.T, deadline time.Duration) *service {
 	t.Helper()
+	return startServiceIn(t, deadline, t.TempDir())
+}
+
+// startServiceIn — то же, но в заданном каталоге: нужен там, где путь сокета
+// известен ДО того, как сервис запущен (W71 стартует агента раньше hopd и
+// обязан назвать ему сокет, которого ещё нет).
+func startServiceIn(t *testing.T, deadline time.Duration, dir string) *service {
+	t.Helper()
 	requireNetns(t)
 
 	// lo должен быть поднят: без него ядро ведёт себя странно с локальными
@@ -90,8 +98,7 @@ func startService(t *testing.T, deadline time.Duration) *service {
 		t.Fatalf("снапшот: %v", err)
 	}
 
-	dir := t.TempDir()
-	sock := filepath.Join(dir, "hop.sock")
+	sock := serviceSock(dir)
 	ready := filepath.Join(dir, "ready")
 	// client — сокет связки §3.3, свой на каждый тест по той же причине, что
 	// HOP_STORE: unshare -Urn изолирует сеть, а не $XDG_RUNTIME_DIR, и без
@@ -100,7 +107,7 @@ func startService(t *testing.T, deadline time.Duration) *service {
 	// unix-сокета ограничен ~108 байтами, а t.TempDir() кладёт его под длинное
 	// имя теста; измерено на TestBypassMDNSReachesPhysicalInterfaceAndReturnsViaNAT
 	// (самое длинное имя в пакете) — с "c.sock" укладывается с запасом.
-	client := filepath.Join(dir, "c.sock")
+	client := clientSock(dir)
 
 	cmd := exec.Command(hopd(t),
 		"-socket", sock,
@@ -124,6 +131,12 @@ func startService(t *testing.T, deadline time.Duration) *service {
 	waitFile(t, ready)
 	return s
 }
+
+// serviceSock и clientSock — пути сокетов внутри каталога стенда. Функциями, а
+// не склейкой по месту: W71 называет их агенту до того, как сервис запущен, и
+// разъехавшийся путь дал бы тест, который проверяет опечатку, а не механизм.
+func serviceSock(dir string) string { return filepath.Join(dir, "hop.sock") }
+func clientSock(dir string) string  { return filepath.Join(dir, "c.sock") }
 
 // kill убивает сервис так, как это делает T29: без шанса убрать за собой.
 func (s *service) kill() {

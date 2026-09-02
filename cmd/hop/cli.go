@@ -898,11 +898,17 @@ func (c *cli) runAgent(o *options, _ []string) error {
 	}
 	log := slog.New(slog.NewTextHandler(c.stderr, &slog.HandlerOptions{Level: level}))
 
-	cl, err := c.connect(o.socket)
-	if err != nil {
-		return err
-	}
-	defer cl.Close()
+	// Соединение с сервисом добывается лениво, а не здесь: сокета §3.1 может
+	// ещё не быть — логин обгоняет hopd, — и отказ на этой строке был бы
+	// выходом кодом 2 вместо агента (lazyControl, cmd/hop/transport.go).
+	svc := newLazyControl(func() (controlConn, error) {
+		cl, err := c.connect(o.socket)
+		if err != nil {
+			return nil, err
+		}
+		return cl, nil
+	}, log)
+	defer svc.close()
 
 	physical, err := outbound.New(o.ifname)
 	if err != nil {
@@ -910,7 +916,7 @@ func (c *cli) runAgent(o *options, _ []string) error {
 	}
 	defer physical.Close()
 
-	return run(log, cl, o.tokenFile, o.client, o.heartbeat,
+	return run(log, svc, o.tokenFile, o.client, o.heartbeat,
 		tunnelParams(o.ifname, o.addr, o.mtu, o.table),
 		physical.Interface, physical.DialDirect, physical.Control)
 }
