@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -342,10 +343,36 @@ func (r *rig) waitRound(n uint64) {
 // Дожидается обязательно: Start назначает все узлы на now, поэтому первый
 // раунд идёт немедленно и в своей горутине. Проверка состояния без этого
 // ожидания сравнивает снимок с гонкой, а не с ожиданием.
+//
+// Раунд — НЕ конец старта. За обходом идёт стартовое переключение со своими
+// четырьмя реакциями (Р33), последняя из которых пишет живость в стор
+// (persistNow, wire.go). Тест, который после start() кладёт в стор что-то своё,
+// гонится с этой записью — см. waitReaction и разбор в implementation-notes.md.
 func (r *rig) start() {
 	r.t.Helper()
 	r.a.Start()
 	r.waitRound(1)
+}
+
+// waitReaction ждёт, пока связка не отметит названную реакцию Р33.
+//
+// По журналу реакций, а не по паузе: пауза калибруется под машину, на которой
+// её написали, и краснеет на чужой под нагрузкой. Журнал — то же наблюдение,
+// которым пользуется W11, и он говорит именно «связка уже это сделала».
+func (r *rig) waitReaction(want string) {
+	r.t.Helper()
+
+	deadline := time.After(watchdog) //hop:realtime
+	for {
+		if slices.Contains(r.a.Reactions(), want) {
+			return
+		}
+		select {
+		case <-deadline:
+			r.t.Fatalf("реакция %q не наступила за %v; журнал: %v", want, watchdog, r.a.Reactions())
+		case <-time.After(time.Millisecond): //hop:realtime
+		}
+	}
 }
 
 // runRound двигает часы и ждёт очередного раунда. Порядок — как в стенде
