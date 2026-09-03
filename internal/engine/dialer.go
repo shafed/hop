@@ -9,6 +9,7 @@ import (
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/transport/internet"
+	"google.golang.org/protobuf/proto"
 )
 
 // Перехват системного диалера Xray — единственный слой, где «не дозвонились до
@@ -162,11 +163,26 @@ func (d *nodeDialer) Dial(ctx context.Context, src xnet.Address, dest xnet.Desti
 
 	// Чужой SocketConfig не меняется: транспорт может переиспользовать его в
 	// параллельных дозвонах. Xray сам переводит Interface в опцию нужной ОС.
+	//
+	// proto.Clone, а не `copy := *sockopt`. Присваивание копировало значение
+	// вместе с внутренним состоянием protobuf (protoimpl.MessageState, внутри
+	// — sync.Mutex и указатель на собственный адрес для быстрого пути), и
+	// `go vet` называл это copylocks. Три раунда подряд эта находка числилась
+	// «известной краснотой, которую не чиним», и из-за неё CI был красным на
+	// каждом пуше: шаг test на macOS, l3-macos и l3-windows падали ровно на
+	// ней. Чинится она в одну строку, а не подавляется: копировать
+	// сообщение protobuf по значению нельзя по его же документации, и
+	// подавления у vet построчного всё равно нет.
+	//
+	// Что копия остаётся полной и что чужой конфиг не меняется — утверждает
+	// TestW36NodeDialBindsCurrentPhysicalInterface: он проверяет и что
+	// original.Interface остался пустым, и что TcpKeepAliveIdle пережил
+	// копирование. Различить proto.Clone и прежнее присваивание этот тест не
+	// может — их различает только `go vet`, и потому vet стоит в гейте.
 	if sockopt == nil {
 		sockopt = &internet.SocketConfig{}
 	} else {
-		copy := *sockopt
-		sockopt = &copy
+		sockopt = proto.Clone(sockopt).(*internet.SocketConfig)
 	}
 	sockopt.Interface = iface
 

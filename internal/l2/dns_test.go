@@ -158,7 +158,7 @@ func (d *dnsHarness) resolve(t *testing.T, name string) netip.Addr {
 // резолвер его обработал (§5.7в).
 func (d *dnsHarness) waitCacheFlushed(t *testing.T, before uint64) {
 	t.Helper()
-	deadline := time.After(budget) //hop:realtime
+	deadline := time.After(budget)               //hop:realtime
 	tick := time.NewTicker(5 * time.Millisecond) //hop:realtime
 	defer tick.Stop()
 	for {

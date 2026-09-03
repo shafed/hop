@@ -1,3 +1,16 @@
+// Тесты настоящего сервера dnstest: настоящие сокеты, настоящее ядро.
+//
+// Три `SetReadDeadline(time.Now()…)` ниже помечены `//hop:realtime`
+// намеренно. Дедлайн ставится ядру на настоящем сокете, и подменять здесь
+// время нечем: `internal/clock` управляет ожиданиями продукта, а не тем,
+// когда ядро отпустит `read`. Тест, который вместо этого ждал бы фейковых
+// часов, повис бы — фейковые часы никто не двигает, а сокет настоящий.
+//
+// Пометка, а не исключение в линтере: `realtimelint` сам предлагает её своим
+// сообщением, и она стоит в строке, которую объясняет. Пока эти три строки
+// были непомечены, `realtimelint` в CI падал на каждом пуше, и весь прогон
+// был красным — то есть «известный шум» съедал сигнал всего пайплайна.
+
 package dnstest
 
 import (
@@ -29,7 +42,7 @@ func TestRealServerAnswersUDP(t *testing.T) {
 	if _, err := conn.Write(query); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second)) //hop:realtime
 	buf := make([]byte, 512)
 	n, err := conn.Read(buf)
 	if err != nil {
@@ -69,7 +82,7 @@ func TestRealServerAnswersTCP(t *testing.T) {
 	conn.Write(hdr[:])
 	conn.Write(query)
 
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second)) //hop:realtime
 	respHdr := make([]byte, 2)
 	if _, err := readFull(conn, respHdr); err != nil {
 		t.Fatalf("читаем префикс: %v", err)
@@ -101,7 +114,7 @@ func TestRealServerSilentBehaviorDoesNotAnswer(t *testing.T) {
 	}
 	defer conn.Close()
 	conn.Write(BuildQuery(QueryOpts{ID: 1, Name: "silent.example", Type: TypeA}))
-	conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond)) //hop:realtime
 	buf := make([]byte, 512)
 	if _, err := conn.Read(buf); err == nil {
 		t.Fatal("незапрограммированный сервер ответил — ожидалось молчание")

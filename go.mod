@@ -7,6 +7,7 @@ require (
 	github.com/vishvananda/netlink v1.3.1
 	github.com/xtls/xray-core v1.260327.0
 	golang.org/x/sys v0.47.0
+	google.golang.org/protobuf v1.36.11
 	gvisor.dev/gvisor v0.0.0-20260807002324-2ed5e670b9b9
 )
 
@@ -42,7 +43,6 @@ require (
 	golang.zx2c4.com/wireguard v0.0.0-20250521234502-f333402bd9cb // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260401024825-9d38bb4040a9 // indirect
 	google.golang.org/grpc v1.80.0 // indirect
-	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
