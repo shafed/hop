@@ -64,7 +64,7 @@ func withStore(fn func(*store.Store) error) error {
 // узла (§6.7), дозвон живёт в связке, а связке нужна живость, которой нужен
 // пробер. Круг разрывается замыканием — пробер зовёт дозвон лениво, к моменту
 // первой пробы связка уже собрана.
-func run(log *slog.Logger, cl control, tokenFile, clientSocket string, beat time.Duration, p tunnel.Params, physical engine.InterfaceFunc, dialDirect resolver.DialDirectFunc, bypassControl bypass.ControlFunc) error {
+func run(log *slog.Logger, svc *lazyControl, tokenFile, clientSocket string, beat time.Duration, p tunnel.Params, physical engine.InterfaceFunc, dialDirect resolver.DialDirectFunc, bypassControl bypass.ControlFunc) error {
 	root, err := storeRoot()
 	if err != nil {
 		return err
@@ -84,7 +84,7 @@ func run(log *slog.Logger, cl control, tokenFile, clientSocket string, beat time
 		Interrupt: func() int { return a.InterruptConnections() },
 	})
 
-	tr := newTransport(cl, tokenFile, beat, log)
+	tr := newTransport(svc, tokenFile, beat, log)
 	defer tr.close()
 
 	cfg := agent.Config{
@@ -139,21 +139,31 @@ func run(log *slog.Logger, cl control, tokenFile, clientSocket string, beat time
 	defer l.Close()
 	log.Info("сокет клиентов открыт", "путь", clientSocket)
 
+	// Сигналы ловятся ДО автоподключения, а не после: ниже стоит ожидание
+	// сервиса, у которого нет дедлайна, и агент, не слышащий SIGTERM в этом
+	// окне, висел бы на `systemctl stop` до таймаута юнита.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
 	// §6.13: автоподключение решает сам агент, читая стор при старте —
 	// инсталлятора, которому спека отдаёт автозапуск СЕРВИСА, в репозитории
 	// нет, а решение «поднимать ли туннель, раз агент уже запущен» его и не
 	// касается. shouldAutoUp — cmd/hop/autoconnect.go.
+	//
+	// Ожидание сервиса стоит внутри этой ветки, а не выше: агент с выключенным
+	// автоподключением сервису ничего не должен, пока не пришёл `hop up`, и
+	// ждать ему нечего. Отказ ожидания — только SIGTERM, и тогда подниматься
+	// уже незачем: ниже <-ctx.Done() вернётся сразу.
 	if shouldAutoUp(st) {
-		if err := a.Up(); err != nil {
-			return err
+		if err := svc.wait(ctx, serviceRetry); err == nil {
+			if err := a.Up(); err != nil {
+				return err
+			}
+			log.Info("туннель поднят", "интерфейс", p.Name)
 		}
-		log.Info("туннель поднят", "интерфейс", p.Name)
 	} else {
 		log.Info("автоподключение выключено (§6.13): туннель не поднят, ждём `hop up`")
 	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
 
 	// Наблюдаемость до этапа 9: без неё «трафик пошёл» и «трафик в никуда»
 	// выглядят в логе одинаково — молчанием.

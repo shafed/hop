@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -36,6 +37,149 @@ type control interface {
 	Heartbeat() error
 	Detach(r tunnel.Reason) error
 	Status() (tunnel.State, error)
+}
+
+// controlConn — управляющее соединение: control плюс закрытие, ровно как
+// agentDevice — устройство плюс закрытие. Соединением владеет тот, кто его
+// открыл, и отпустить его обязан он же.
+type controlConn interface {
+	control
+	Close() error
+}
+
+// lazyControl — управляющее соединение, которого может ещё не быть.
+//
+// До этого прохода `hop agent` соединялся с сервисом первой же строкой
+// runAgent и выходил кодом 2, если сокета нет. Автозапуск §6.13 превращает это
+// в цикл перезапусков: `systemctl --global enable hop-agent.service` поднимает
+// агента при каждом логине, а логин обгоняет hopd. Агент, переживающий смерть
+// сервиса (watchService, Р34), обязан пережить и его отсутствие — иначе
+// «сервиса нет» значит разное до первого соединения и после него.
+//
+// Соединение одно на всю жизнь агента и переустановке НЕ подлежит: его обрыв —
+// это ребро §6.2, сервис по нему решает, что агент ушёл, и второй dial поверх
+// уже осиротевшего туннеля означал бы новый сеанс, ничего не знающий о старом.
+// Поэтому здесь ленивость, а не переподключение: соединяемся один раз, когда
+// сервис появится.
+type lazyControl struct {
+	dial func() (controlConn, error)
+	log  *slog.Logger
+
+	mu   sync.Mutex
+	conn controlConn
+	// waited — отказ dial назван в логе один раз. Ожидание сервиса измеряется
+	// логинами, и строка на каждую попытку залила бы журнал.
+	waited bool
+}
+
+// serviceRetry — как часто ожидающий агент пробует соединиться.
+//
+// Проба, а не подписка на появление файла: сокет §3.1 на Windows — именованная
+// труба, у которой каталога нет вовсе, и удавшийся dial — единственный признак
+// «сервис готов», общий для трёх ОС. Число выбрано как незаметное человеку и
+// бесплатное машине: гонка «логин обогнал hopd» измеряется секундами.
+const serviceRetry = 500 * time.Millisecond
+
+func newLazyControl(dial func() (controlConn, error), log *slog.Logger) *lazyControl {
+	return &lazyControl{dial: dial, log: log}
+}
+
+// get отдаёт соединение, устанавливая его при первом обращении.
+func (l *lazyControl) get() (control, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.conn != nil {
+		return l.conn, nil
+	}
+	conn, err := l.dial()
+	if err != nil {
+		return nil, err
+	}
+	l.conn = conn
+	return conn, nil
+}
+
+// wait ждёт, пока сервис появится, и возвращается, как только соединение
+// установлено. Отказ — только отмена ctx: своего дедлайна у ожидания нет
+// намеренно, потому что нет и правильного числа. hop-agent.service тоже не
+// держит о нём мнения (packaging/systemd/hop-agent.service), а агент, сдавшийся
+// по таймеру, вернул бы ровно тот отказ, ради которого проход и был начат.
+func (l *lazyControl) wait(ctx context.Context, every time.Duration) error {
+	for {
+		_, err := l.get()
+		if err == nil {
+			return nil
+		}
+		l.mu.Lock()
+		first := !l.waited
+		l.waited = true
+		l.mu.Unlock()
+		if first {
+			l.log.Info("сервиса пока нет, ждём его, туннель не поднимаем", "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-clock.System{}.After(every):
+		}
+	}
+}
+
+func (l *lazyControl) close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.conn == nil {
+		return nil
+	}
+	return l.conn.Close()
+}
+
+func (l *lazyControl) Start(p tunnel.Params) (ipc.Result, error) {
+	c, err := l.get()
+	if err != nil {
+		return ipc.Result{}, err
+	}
+	return c.Start(p)
+}
+
+func (l *lazyControl) Attach(t tunnel.Token) (ipc.Result, error) {
+	c, err := l.get()
+	if err != nil {
+		return ipc.Result{}, err
+	}
+	return c.Attach(t)
+}
+
+func (l *lazyControl) Stop() error {
+	c, err := l.get()
+	if err != nil {
+		return err
+	}
+	return c.Stop()
+}
+
+func (l *lazyControl) Heartbeat() error {
+	c, err := l.get()
+	if err != nil {
+		return err
+	}
+	return c.Heartbeat()
+}
+
+func (l *lazyControl) Detach(r tunnel.Reason) error {
+	c, err := l.get()
+	if err != nil {
+		return err
+	}
+	return c.Detach(r)
+}
+
+func (l *lazyControl) Status() (tunnel.State, error) {
+	c, err := l.get()
+	if err != nil {
+		return tunnel.State{}, err
+	}
+	return c.Status()
 }
 
 // transport — реализация agent.Transport поверх управляющего соединения.

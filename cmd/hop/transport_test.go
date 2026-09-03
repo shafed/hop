@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -24,6 +25,7 @@ type fakeControl struct {
 	stopped   int
 	detached  int
 	startErr  error
+	closed    int
 	attachErr error
 }
 
@@ -215,4 +217,138 @@ func unwritableTokenPath(t *testing.T) string {
 		t.Fatalf("подготовка непригодного каталога: %v", err)
 	}
 	return filepath.Join(blocker, "attach-token")
+}
+
+func (f *fakeControl) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed++
+	return nil
+}
+
+func (f *fakeControl) closes() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closed
+}
+
+// TestW71ControlWaitsForTheServiceAndKeepsTheOneConnection — агент не выходит,
+// пока сервиса нет, и берёт его, как только он появился.
+//
+// До этого прохода `hop agent` соединялся с сервисом первой строкой runAgent:
+// без hopd — «фоновая половина hop недоступна», код 2, за 11 мс, ни одной
+// попытки. Автозапуск §6.13 (`systemctl --global enable hop-agent.service`)
+// превращает это в цикл перезапусков на каждом логине, обогнавшем hopd.
+//
+// Проверяются три утверждения, и третье — не педантизм. (1) Пока dial
+// отказывает, ожидание не кончается и агента не роняет. (2) Как только dial
+// проходит, соединение установлено и им можно пользоваться. (3) Дальше dial
+// БОЛЬШЕ НЕ ЗОВЁТСЯ: обрыв управляющего соединения — это ребро §6.2, сервис по
+// нему решает, что агент ушёл, и переподключение поверх осиротевшего туннеля
+// означало бы второй сеанс, ничего не знающий о первом (ipc.Client тоже
+// говорит об этом прямо). Без (3) «ждёт сервис» неотличимо от «дозванивается
+// заново на каждый вызов».
+func TestW71ControlWaitsForTheServiceAndKeepsTheOneConnection(t *testing.T) {
+	fc := &fakeControl{fd: -1}
+	var mu sync.Mutex
+	dials, alive := 0, false
+	svc := newLazyControl(func() (controlConn, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		dials++
+		if !alive {
+			return nil, errors.New("сокет /run/hop.sock: connect: no such file or directory")
+		}
+		return fc, nil
+	}, quietLog())
+
+	// (1) Сервиса нет: обращение отказывает, но ожидание не сдаётся.
+	if _, err := svc.Status(); err == nil {
+		t.Fatal("Status прошёл при отсутствующем сервисе")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- svc.wait(ctx, time.Millisecond) }() //hop:realtime
+	select {
+	case err := <-done:
+		t.Fatalf("ожидание кончилось, хотя сервиса нет: %v — агент вышел бы кодом 2", err)
+	case <-time.After(50 * time.Millisecond): //hop:realtime
+	}
+
+	// (2) Сервис появился — тот же процесс его берёт, без перезапуска.
+	mu.Lock()
+	alive = true
+	mu.Unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("сервис появился, а ожидание отказало: %v", err)
+		}
+	case <-time.After(5 * time.Second): //hop:realtime
+		cancel()
+		t.Fatal("сервис появился, а ожидание не кончилось")
+	}
+	cancel()
+
+	mu.Lock()
+	afterWait := dials
+	mu.Unlock()
+
+	// (3) Соединение одно: следующие вызовы идут по нему, а не дозваниваются.
+	for i := 0; i < 3; i++ {
+		if _, err := svc.Status(); err != nil {
+			t.Fatalf("Status по установленному соединению: %v", err)
+		}
+	}
+	mu.Lock()
+	total := dials
+	mu.Unlock()
+	if total != afterWait {
+		t.Errorf("dial позван ещё %d раз после того, как соединение установлено: "+
+			"обрыв соединения — ребро §6.2, и второй сеанс поверх осиротевшего туннеля "+
+			"о первом ничего не знает", total-afterWait)
+	}
+
+	// Закрытие — обязанность того, кто соединение открыл: до этого прохода его
+	// закрывал `defer cl.Close()` в runAgent, и вместе с ранним dial ушёл бы и он.
+	if err := svc.close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if got := fc.closes(); got != 1 {
+		t.Errorf("соединение закрыто %d раз, ожидался 1", got)
+	}
+}
+
+// TestW71WaitEndsOnSignalNotOnItsOwnDeadline — ожидание сервиса обрывается
+// только сигналом.
+//
+// Своего дедлайна у него нет намеренно: hop-agent.service тоже не держит о нём
+// мнения, а агент, сдавшийся по таймеру, вернул бы ровно тот отказ, ради
+// которого проход и был начат. Но обрываться он ОБЯЗАН: run() ловит SIGTERM до
+// этой ветки, и агент, не слышащий сигнала, висел бы на `systemctl stop` до
+// таймаута юнита.
+func TestW71WaitEndsOnSignalNotOnItsOwnDeadline(t *testing.T) {
+	svc := newLazyControl(func() (controlConn, error) {
+		return nil, errors.New("сервиса нет и не будет")
+	}, quietLog())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- svc.wait(ctx, time.Millisecond) }() //hop:realtime
+
+	select {
+	case err := <-done:
+		t.Fatalf("ожидание кончилось само: %v", err)
+	case <-time.After(100 * time.Millisecond): //hop:realtime
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("ожидание вернуло %v, ожидалась отмена ctx", err)
+		}
+	case <-time.After(5 * time.Second): //hop:realtime
+		t.Fatal("ожидание не услышало отмены — `systemctl stop` висел бы до таймаута юнита")
+	}
 }
