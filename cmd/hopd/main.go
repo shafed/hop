@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -75,7 +76,12 @@ func run(log *slog.Logger, sock, readyFile string, gid int, cfg tunnel.Config) e
 		return fmt.Errorf("снапшот сети: %w", err)
 	}
 
-	m := tunnel.New(clk, platform.New(log), cfg)
+	// Платформенный слой держится отдельной переменной, а не строится по
+	// месту: после teardown у него спрашивается собственный след (Footprint),
+	// а tunnel.Net такого метода не знает и знать не должен — машина
+	// состояний о платформе не осведомлена вовсе.
+	pl := platform.New(log)
+	m := tunnel.New(clk, pl, cfg)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -106,12 +112,42 @@ func run(log *slog.Logger, sock, readyFile string, gid int, cfg tunnel.Config) e
 
 	// Штатный выход обязан вернуть сеть в исходное состояние — тот же контракт
 	// §8.4, что проверяют T22 и T23-slow.
-	if err := m.Stop(); err != nil {
-		log.Error("teardown", "err", err)
+	//
+	// Но «в исходное» здесь — про НАШИ изменения, а не про всю машину, и
+	// сравнение с netns'ным стендом тут расходится с продуктом. §8.4 говорит
+	// «любое расхождение — падение ТЕСТА», и на стенде это верно буквально:
+	// менять сеть в отдельном netns некому. Как загрузочный сервис hopd живёт
+	// часами рядом с DHCP, NetworkManager и чужими интерфейсами, и штатный
+	// `systemctl stop` возвращал ненулевой код за чужую работу. Замер и разбор
+	// — implementation-notes.md, «hopd и чужие сети».
+	//
+	// Порядок здесь значим: расхождение считается ДО возврата ошибки
+	// teardown, чтобы в журнал попали оба факта, а не первый из них.
+	stopErr := m.Stop()
+
+	after, err := src.Capture()
+	if err != nil {
+		return fmt.Errorf("снапшот сети: %w", err)
 	}
-	if err := netstate.Verify(before, src); err != nil {
-		return err
+	mine, foreign := netstate.Classify(before.Diff(after), pl.Footprint())
+
+	// Чужое — не отказ hop, но и не молчание: без этой строки исчезнет
+	// единственное место, где видно, что сеть под сервисом менялась.
+	if len(foreign) > 0 {
+		log.Info("сеть машины менялась не нами — на код выхода не влияет",
+			"строк", len(foreign), "расхождение", strings.Join(foreign, "; "))
 	}
-	log.Info("hopd остановлен, снапшот сети совпал")
+
+	// Неполный откат — отказ, и до сих пор он им не был: ошибка m.Stop() шла
+	// в журнал и терялась, а код выхода определяло расхождение снапшота, то
+	// есть ровно та половина, которая нам не принадлежит. Обе половины
+	// поменяны местами намеренно.
+	if stopErr != nil {
+		return fmt.Errorf("teardown: %w", stopErr)
+	}
+	if len(mine) > 0 {
+		return fmt.Errorf("наш след остался в сети после teardown:\n  %s", strings.Join(mine, "\n  "))
+	}
+	log.Info("hopd остановлен, свой след снят", "чужих расхождений", len(foreign))
 	return nil
 }

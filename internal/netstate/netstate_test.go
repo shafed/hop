@@ -187,3 +187,63 @@ func TestDiff(t *testing.T) {
 		t.Fatalf("порядок строк повлиял на сравнение: %v", a.Diff(shuffled))
 	}
 }
+
+// W72: Classify делит расхождение по следу, и пустой след означает «всё
+// чужое», а не «всё наше».
+//
+// Направление ошибки проверяется отдельно от самого деления: строка, попавшая
+// не в ту половину, у Classify — это либо ложный отказ штатной остановки,
+// либо пропущенная течь, и это разные беды.
+func TestW72ClassifySplitsByFootprint(t *testing.T) {
+	diff := []string{
+		"addrs: +2: hop0    inet 10.255.0.1/24 scope global hop0",
+		"addrs: +1: lo    inet 10.99.0.1/32 scope global lo",
+		"rules: +31000:\tfrom all to 10.0.0.0/8 lookup main",
+		"routes: -local 10.98.0.1 dev lo table local",
+	}
+	marks := []string{"hop0", "31000:"}
+
+	mine, foreign := Classify(diff, marks)
+	if want := []string{diff[0], diff[2]}; !sameLines(mine, want) {
+		t.Errorf("своим сочтено %v, ожидалось %v", mine, want)
+	}
+	if want := []string{diff[1], diff[3]}; !sameLines(foreign, want) {
+		t.Errorf("чужим сочтено %v, ожидалось %v", foreign, want)
+	}
+}
+
+// W72: без следа своего нет. Так выглядит сервис, простоявший без единого
+// `up`, и так же — платформа, где Up ещё не написан (Unsupported.Footprint).
+func TestW72ClassifyWithoutFootprintClaimsNothing(t *testing.T) {
+	diff := []string{"addrs: +2: hop0 inet 10.255.0.1/24", "routes: +default dev hop0 table 8420"}
+	for _, marks := range [][]string{nil, {}, {""}} {
+		mine, foreign := Classify(diff, marks)
+		if len(mine) != 0 {
+			t.Errorf("marks=%v: своим сочтено %v", marks, mine)
+		}
+		if len(foreign) != len(diff) {
+			t.Errorf("marks=%v: чужих %d, ожидалось %d", marks, len(foreign), len(diff))
+		}
+	}
+}
+
+// W72: совпадение снапшотов — по-прежнему обе половины пустые. Отдельным
+// утверждением, потому что штатный выход hopd опирается именно на это.
+func TestW72ClassifyOfEmptyDiffIsEmpty(t *testing.T) {
+	mine, foreign := Classify(nil, []string{"hop0"})
+	if len(mine) != 0 || len(foreign) != 0 {
+		t.Fatalf("на пустом расхождении получили %v / %v", mine, foreign)
+	}
+}
+
+func sameLines(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}

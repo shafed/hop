@@ -148,11 +148,29 @@ func (s *service) kill() {
 // stop останавливает сервис штатно и ждёт выхода.
 func (s *service) stop() {
 	s.t.Helper()
+	s.stopExit()
+}
+
+// stopExit — то же, но возвращает код выхода. Отдельным именем, потому что
+// код выхода штатной остановки — сам по себе утверждение (W72): systemd
+// разводит по нему `inactive` и `failed`, и ненулевой код за чужую работу
+// красит юнит в failed на ровном месте.
+func (s *service) stopExit() int {
+	s.t.Helper()
 	if s.cmd.Process == nil {
-		return
+		return -1
 	}
 	_ = s.cmd.Process.Signal(syscall.SIGTERM)
-	_ = s.cmd.Wait()
+	err := s.cmd.Wait()
+	if err == nil {
+		return 0
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	s.t.Fatalf("ожидание hopd: %v", err)
+	return -1
 }
 
 func (s *service) cleanup() {

@@ -35,3 +35,9 @@ func (Unsupported) Up(tunnel.Params) (tunnel.Device, error) { return nil, errUns
 func (Unsupported) Reject() error                           { return errUnsupported }
 func (Unsupported) Restore() error                          { return errUnsupported }
 func (Unsupported) Down() error                             { return nil }
+
+// Footprint — след в снапшоте сети (§8.4). Пуст, потому что Up на этой ОС
+// всегда отказывает: раскладывать нечего, значит и своим в снапшоте ничего
+// быть не может. Вместе с платформенным слоем сюда приедет свой список — на
+// macOS и Windows смерть сервиса переживают ещё и настройки DNS (T29).
+func (Unsupported) Footprint() []string { return nil }
